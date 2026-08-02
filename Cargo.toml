@@ -1,0 +1,39 @@
+[package]
+name = "flowfile"
+version = "0.1.0"
+edition = "2024"
+description = "A multi-pane macOS file manager built with Rust and GPUI"
+
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+chrono = "0.4.45"
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+image = { version = "0.25.10", default-features = false, features = ["avif", "gif", "jpeg", "png", "rayon", "webp"] }
+kamadak-exif = "0.6"
+lru = "0.16"
+md5 = "0.8"
+notify = "8.2"
+open = "5.4"
+rayon = "1.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smallvec = "1.15"
+tokio = { version = "1", features = ["full"] }
+trash = "5.2"
+walkdir = "2.5"
+
+[package.metadata.bundle]
+name = "FlowFile"
+identifier = "com.flowfile.app"
+icon = ["resources/FlowFile.icns"]
+version = "0.1.0"
+category = "Utility"
+short_description = "A high-performance multi-pane file manager for macOS"
+long_description = "FlowFile combines one to four file panes, Spotlight search, Quick Look, and an embedded terminal."
+copyright = "Copyright © 2026 FlowFile contributors"
+osx_minimum_system_version = "11.0"
+osx_info_plist_exts = ["resources/Info.plist.ext"]
+
+[dev-dependencies]
+tempfile = "3"

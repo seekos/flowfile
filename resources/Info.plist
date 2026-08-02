@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleDisplayName</key>
+    <string>FlowFile</string>
+    <key>CFBundleExecutable</key>
+    <string>flowfile</string>
+    <key>CFBundleIconFile</key>
+    <string>FlowFile</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.flowfile.app</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>FlowFile</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>FlowFile 需要访问“桌面”文件夹，以浏览和管理其中的文件。</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>FlowFile 需要访问“文稿”文件夹，以浏览和管理其中的文件。</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>FlowFile 需要访问“下载”文件夹，以浏览和管理其中的文件。</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>FlowFile 需要访问网络卷，以在面板中浏览和管理远程文件。</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>FlowFile 需要访问移动卷，以在面板中浏览和管理外置存储设备。</string>
+</dict>
+</plist>

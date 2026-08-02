@@ -1,0 +1,59 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- 背景深色渐变 -->
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#242838"/>
+      <stop offset="100%" stop-color="#0F111A"/>
+    </linearGradient>
+
+    <!-- 贯穿的 Flow 霓虹流线渐变 (青蓝 -> 紫罗兰) -->
+    <linearGradient id="flow-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00F2FE"/>
+      <stop offset="50%" stop-color="#38EF7D"/>
+      <stop offset="100%" stop-color="#7F00FF"/>
+    </linearGradient>
+
+    <!-- 毛玻璃面板渐变描边 -->
+    <linearGradient id="panel-stroke" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.05"/>
+    </linearGradient>
+
+    <!-- 霓虹发光外阴影 -->
+    <filter id="neon-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="12" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- macOS 标准 Icon 圆角底座 -->
+  <rect x="32" y="32" width="448" height="448" rx="100" fill="url(#bg-grad)"/>
+  <rect x="32" y="32" width="448" height="448" rx="100" stroke="url(#panel-stroke)" stroke-width="2"/>
+
+  <!-- 背景微弱阴影网格底衬 -->
+  <g opacity="0.15">
+    <line x1="256" y1="112" x2="256" y2="400" stroke="#FFFFFF" stroke-width="2" stroke-dasharray="8 8"/>
+    <line x1="112" y1="256" x2="400" y2="256" stroke="#FFFFFF" stroke-width="2" stroke-dasharray="8 8"/>
+  </g>
+
+  <!-- 4 个分屏毛玻璃窗格 (Panes) -->
+  <!-- Pane 1: 左上 -->
+  <rect x="112" y="112" width="132" height="132" rx="16" fill="#FFFFFF" fill-opacity="0.06" stroke="url(#panel-stroke)" stroke-width="1.5"/>
+  <!-- Pane 2: 右上 -->
+  <rect x="268" y="112" width="132" height="132" rx="16" fill="#FFFFFF" fill-opacity="0.06" stroke="url(#panel-stroke)" stroke-width="1.5"/>
+  <!-- Pane 3: 左下 -->
+  <rect x="112" y="268" width="132" height="132" rx="16" fill="#FFFFFF" fill-opacity="0.06" stroke="url(#panel-stroke)" stroke-width="1.5"/>
+  <!-- Pane 4: 右下 -->
+  <rect x="268" y="268" width="132" height="132" rx="16" fill="#FFFFFF" fill-opacity="0.06" stroke="url(#panel-stroke)" stroke-width="1.5"/>
+
+  <!-- Flow 贯穿光束 (像一个穿透 4 格视窗的丝滑 S 曲线/波浪) -->
+  <path d="M 130 350 C 180 350, 180 160, 256 256 C 330 350, 330 160, 380 160" 
+        stroke="url(#flow-grad)" 
+        stroke-width="16" 
+        stroke-linecap="round" 
+        filter="url(#neon-glow)"/>
+
+  <!-- 光束头部与尾部的流光节点 -->
+  <circle cx="130" cy="350" r="10" fill="#00F2FE" filter="url(#neon-glow)"/>
+  <circle cx="380" cy="160" r="10" fill="#7F00FF" filter="url(#neon-glow)"/>
+</svg>

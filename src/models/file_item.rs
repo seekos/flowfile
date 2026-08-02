@@ -1,0 +1,133 @@
+use chrono::{DateTime, Local};
+use serde::{Deserialize, Serialize};
+use std::{
+    cmp::Ordering,
+    fs::Metadata,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FileKind {
+    Folder,
+    Document,
+    Image,
+    Archive,
+    Audio,
+    Video,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SortMode {
+    #[default]
+    Name,
+    Size,
+    Modified,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileItem {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_dir: bool,
+    pub extension: Option<String>,
+    pub size: u64,
+    pub modified_unix: i64,
+    pub modified: String,
+    pub is_hidden: bool,
+    pub kind: FileKind,
+}
+
+impl FileItem {
+    pub fn from_metadata(path: PathBuf, name: String, metadata: Metadata, is_hidden: bool) -> Self {
+        let is_dir = metadata.is_dir();
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_lowercase);
+        let modified_time = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let modified_unix = modified_time
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_default();
+
+        Self {
+            kind: Self::kind_for(is_dir, extension.as_deref()),
+            path,
+            name,
+            is_dir,
+            extension,
+            size: if is_dir { 0 } else { metadata.len() },
+            modified_unix,
+            modified: format_modified_time(modified_time),
+            is_hidden,
+        }
+    }
+
+    fn kind_for(is_dir: bool, extension: Option<&str>) -> FileKind {
+        if is_dir {
+            return FileKind::Folder;
+        }
+
+        match extension.unwrap_or_default() {
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "avif" | "svg" | "tif" | "tiff"
+            | "bmp" => FileKind::Image,
+            "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "dmg" => FileKind::Archive,
+            "mp3" | "wav" | "aac" | "m4a" | "flac" => FileKind::Audio,
+            "mp4" | "mov" | "mkv" | "avi" | "webm" => FileKind::Video,
+            "txt" | "md" | "rtf" | "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
+            | "rs" | "go" | "js" | "ts" | "json" | "toml" | "yaml" | "yml" => FileKind::Document,
+            _ => FileKind::Other,
+        }
+    }
+
+    pub fn formatted_size(&self) -> String {
+        if self.is_dir {
+            return "—".to_string();
+        }
+
+        const KB: f64 = 1024.0;
+        const MB: f64 = KB * 1024.0;
+        const GB: f64 = MB * 1024.0;
+        let size = self.size as f64;
+
+        if size >= GB {
+            format!("{:.1} GB", size / GB)
+        } else if size >= MB {
+            format!("{:.1} MB", size / MB)
+        } else if size >= KB {
+            format!("{:.1} KB", size / KB)
+        } else {
+            format!("{} B", self.size)
+        }
+    }
+
+    pub fn sort_items(items: &mut [Self], mode: SortMode) {
+        items.sort_by(|left, right| {
+            right.is_dir.cmp(&left.is_dir).then_with(|| match mode {
+                SortMode::Name => natural_name_cmp(left, right),
+                SortMode::Size => left
+                    .size
+                    .cmp(&right.size)
+                    .then_with(|| natural_name_cmp(left, right)),
+                SortMode::Modified => right
+                    .modified_unix
+                    .cmp(&left.modified_unix)
+                    .then_with(|| natural_name_cmp(left, right)),
+            })
+        });
+    }
+}
+
+fn natural_name_cmp(left: &FileItem, right: &FileItem) -> Ordering {
+    left.name
+        .to_lowercase()
+        .cmp(&right.name.to_lowercase())
+        .then_with(|| left.name.cmp(&right.name))
+}
+
+fn format_modified_time(time: SystemTime) -> String {
+    let local: DateTime<Local> = time.into();
+    local.format("%Y-%m-%d %H:%M").to_string()
+}

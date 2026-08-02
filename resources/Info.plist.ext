@@ -1,0 +1,10 @@
+<key>NSDesktopFolderUsageDescription</key>
+<string>FlowFile 需要访问“桌面”文件夹，以浏览和管理其中的文件。</string>
+<key>NSDocumentsFolderUsageDescription</key>
+<string>FlowFile 需要访问“文稿”文件夹，以浏览和管理其中的文件。</string>
+<key>NSDownloadsFolderUsageDescription</key>
+<string>FlowFile 需要访问“下载”文件夹，以浏览和管理其中的文件。</string>
+<key>NSNetworkVolumesUsageDescription</key>
+<string>FlowFile 需要访问网络卷，以在面板中浏览和管理远程文件。</string>
+<key>NSRemovableVolumesUsageDescription</key>
+<string>FlowFile 需要访问移动卷，以在面板中浏览和管理外置存储设备。</string>
