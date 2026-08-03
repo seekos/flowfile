@@ -6,8 +6,13 @@ use crate::{
 };
 use gpui::{
     AnyElement, Context, Edges, Entity, FontWeight, IntoElement, MouseButton, Pixels, Point,
-    Render, Window, anchored, deferred, div, point, prelude::*, px,
+    Render, Size, Window, anchored, deferred, div, point, prelude::*, px,
 };
+
+const CONTEXT_MENU_WIDTH: Pixels = px(268.0);
+const OPEN_WITH_SUBMENU_WIDTH: Pixels = px(254.0);
+const SUBMENU_GAP: Pixels = px(6.0);
+const WINDOW_MARGIN: Pixels = px(8.0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContextMenuTarget {
@@ -413,6 +418,7 @@ impl ContextMenuView {
     fn open_with_submenu(
         &self,
         menu_position: Point<Pixels>,
+        viewport_size: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let open_with = self.open_with.clone()?;
@@ -474,7 +480,7 @@ impl ContextMenuView {
             .id("open-with-submenu")
             .flex()
             .flex_col()
-            .w(px(254.0))
+            .w(OPEN_WITH_SUBMENU_WIDTH)
             .max_h(px(420.0))
             .py_1()
             .overflow_y_scroll()
@@ -486,17 +492,43 @@ impl ContextMenuView {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .children(children);
-        let submenu_position = point(menu_position.x + px(274.0), menu_position.y + px(33.0));
+        let submenu_position = Self::open_with_submenu_position(menu_position, viewport_size);
         Some(
             deferred(
                 anchored()
                     .position(submenu_position)
-                    .snap_to_window_with_margin(Edges::all(px(8.0)))
+                    .snap_to_window_with_margin(Edges::all(WINDOW_MARGIN))
                     .child(submenu),
             )
             .with_priority(110)
             .into_any_element(),
         )
+    }
+
+    fn open_with_submenu_position(
+        menu_position: Point<Pixels>,
+        viewport_size: Size<Pixels>,
+    ) -> Point<Pixels> {
+        // The main menu is snapped into the viewport by `anchored`. Resolve the
+        // same horizontal position here so the submenu never uses the stale
+        // pointer coordinate after the main menu has moved away from an edge.
+        let max_menu_x = viewport_size.width - WINDOW_MARGIN - CONTEXT_MENU_WIDTH;
+        let menu_x = if menu_position.x < WINDOW_MARGIN {
+            WINDOW_MARGIN
+        } else if menu_position.x > max_menu_x {
+            max_menu_x
+        } else {
+            menu_position.x
+        };
+        let right_x = menu_x + CONTEXT_MENU_WIDTH + SUBMENU_GAP;
+        let submenu_x = if right_x + OPEN_WITH_SUBMENU_WIDTH + WINDOW_MARGIN <= viewport_size.width
+        {
+            right_x
+        } else {
+            menu_x - SUBMENU_GAP - OPEN_WITH_SUBMENU_WIDTH
+        };
+
+        point(submenu_x, menu_position.y + px(33.0))
     }
 
     fn submenu_message(message: &'static str) -> AnyElement {
@@ -662,7 +694,7 @@ impl ContextMenuView {
 }
 
 impl Render for ContextMenuView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(state) = self.state.clone() else {
             return div().into_any_element();
         };
@@ -681,13 +713,13 @@ impl Render for ContextMenuView {
             }
             ContextMenuTarget::Background => self.background_menu(can_paste, cx),
         };
-        let open_with_submenu = self.open_with_submenu(state.position, cx);
+        let open_with_submenu = self.open_with_submenu(state.position, window.viewport_size(), cx);
 
         let menu = div()
             .id("flowfile-context-menu")
             .flex()
             .flex_col()
-            .w(px(268.0))
+            .w(CONTEXT_MENU_WIDTH)
             .py_1()
             .rounded_lg()
             .border_1()
@@ -717,12 +749,35 @@ impl Render for ContextMenuView {
                 deferred(
                     anchored()
                         .position(state.position)
-                        .snap_to_window_with_margin(Edges::all(px(8.0)))
+                        .snap_to_window_with_margin(Edges::all(WINDOW_MARGIN))
                         .child(menu),
                 )
                 .with_priority(100),
             )
             .when_some(open_with_submenu, |overlay, submenu| overlay.child(submenu))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::size;
+
+    #[test]
+    fn open_with_submenu_avoids_the_main_menu_at_the_right_edge() {
+        let viewport = size(px(1200.0), px(800.0));
+
+        let right_edge =
+            ContextMenuView::open_with_submenu_position(point(px(1180.0), px(100.0)), viewport);
+        let snapped_menu_x = viewport.width - WINDOW_MARGIN - CONTEXT_MENU_WIDTH;
+        assert_eq!(
+            right_edge.x + OPEN_WITH_SUBMENU_WIDTH + SUBMENU_GAP,
+            snapped_menu_x
+        );
+
+        let left_side =
+            ContextMenuView::open_with_submenu_position(point(px(100.0), px(100.0)), viewport);
+        assert_eq!(left_side.x, px(100.0) + CONTEXT_MENU_WIDTH + SUBMENU_GAP);
     }
 }
