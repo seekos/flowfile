@@ -1,4 +1,4 @@
-use crate::models::FileItem;
+use crate::models::{FileItem, FileKind};
 use anyhow::{Context as _, Result, bail};
 use gpui::{Context, RenderImage};
 use image::{DynamicImage, GenericImage, ImageBuffer, Rgba, imageops::FilterType};
@@ -78,8 +78,8 @@ impl ThumbnailEngine {
     }
 
     pub fn key_for(item: &FileItem) -> Option<ThumbnailKey> {
-        let is_app_bundle = item.extension.as_deref() == Some("app");
-        (!item.is_dir || is_app_bundle).then(|| ThumbnailKey::for_item(item))
+        (!item.is_dir && !matches!(item.kind, FileKind::Application | FileKind::Executable))
+            .then(|| ThumbnailKey::for_item(item))
     }
 
     /// Records the exact viewport set for one pane and cancels work that is no
@@ -304,7 +304,7 @@ fn thumbnail_cache_directory() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{THUMBNAIL_EDGE, ThumbnailKey, render_raster};
+    use super::{THUMBNAIL_EDGE, ThumbnailEngine, ThumbnailKey, render_raster};
     use crate::models::{FileItem, FileKind};
     use image::{ImageBuffer, Rgba};
     use std::path::PathBuf;
@@ -329,6 +329,20 @@ mod tests {
             ThumbnailKey::for_item(&item(1)),
             ThumbnailKey::for_item(&item(2))
         );
+    }
+
+    #[test]
+    fn program_icons_are_not_replaced_by_generated_thumbnails() {
+        let mut application = item(1);
+        application.is_dir = true;
+        application.extension = Some("app".to_string());
+        application.kind = FileKind::Application;
+        let mut executable = item(1);
+        executable.extension = None;
+        executable.kind = FileKind::Executable;
+
+        assert!(ThumbnailEngine::key_for(&application).is_none());
+        assert!(ThumbnailEngine::key_for(&executable).is_none());
     }
 
     #[test]

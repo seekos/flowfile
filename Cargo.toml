@@ -37,3 +37,9 @@ osx_info_plist_exts = ["resources/Info.plist.ext"]
 
 [dev-dependencies]
 tempfile = "3"
+
+[patch.crates-io]
+# block 0.1.6 models Objective-C's opaque Class as an uninhabited enum. New
+# Rust versions reject extern statics of that type, so use the API-compatible
+# local copy with an inhabited opaque FFI representation.
+block = { path = "vendor/block" }

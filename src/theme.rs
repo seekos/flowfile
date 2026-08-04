@@ -96,3 +96,11 @@ pub fn file_green() -> Hsla {
 pub fn file_purple() -> Hsla {
     rgb(0x8268b0).into()
 }
+
+pub fn terminal_background() -> Hsla {
+    rgb(if dark() { 0x0e1319 } else { 0x202833 }).into()
+}
+
+pub fn terminal_foreground() -> Hsla {
+    rgb(0x78d69f).into()
+}

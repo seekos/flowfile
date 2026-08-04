@@ -1,9 +1,10 @@
-use crate::models::{FileItem, SortMode};
+use super::quick_look::is_text_extension;
+use crate::models::{FileItem, FileKind, SortMode};
 use anyhow::{Context as _, Result};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
 };
 use tokio::runtime::{Handle, Runtime};
@@ -71,7 +72,13 @@ impl FileEngine {
     pub async fn open_path(&self, path: PathBuf) -> Result<()> {
         self.runtime
             .spawn_blocking(move || {
-                open::that(&path).with_context(|| format!("无法打开 {}", path.display()))
+                if is_unix_executable(&path) {
+                    run_unix_executable(&path)
+                } else if let Some(application) = preferred_text_application(&path) {
+                    open_path_with_application(&path, &application)
+                } else {
+                    open::that(&path).with_context(|| format!("无法打开 {}", path.display()))
+                }
             })
             .await
             .context("打开文件任务异常终止")?
@@ -86,20 +93,34 @@ impl FileEngine {
 
     pub async fn open_path_with(&self, path: PathBuf, application: PathBuf) -> Result<()> {
         self.runtime
-            .spawn_blocking(move || {
-                let status = Command::new("/usr/bin/open")
-                    .arg("-a")
-                    .arg(&application)
-                    .arg(&path)
-                    .status()
-                    .with_context(|| format!("无法启动 {}", application.display()))?;
-                if !status.success() {
-                    anyhow::bail!("无法使用 {} 打开 {}", application.display(), path.display());
-                }
-                Ok(())
-            })
+            .spawn_blocking(move || open_path_with_application(&path, &application))
             .await
             .context("指定应用打开文件任务异常终止")?
+    }
+
+    pub async fn open_path_as_text(&self, path: PathBuf) -> Result<()> {
+        self.runtime
+            .spawn_blocking(move || {
+                if !is_text_or_unknown_path(&path) {
+                    anyhow::bail!("该文件不是文本或未知格式：{}", path.display());
+                }
+                let application =
+                    installed_text_editor_application().context("未找到可用的文本编辑器")?;
+                open_path_with_application(&path, &application)
+            })
+            .await
+            .context("文本打开任务异常终止")?
+    }
+
+    pub fn supports_text_opening(path: &Path) -> bool {
+        is_text_or_unknown_path(path)
+    }
+
+    pub async fn choose_open_with_application(&self) -> Result<Option<PathBuf>> {
+        self.runtime
+            .spawn_blocking(choose_open_with_application)
+            .await
+            .context("应用选择任务异常终止")?
     }
 
     pub(crate) fn runtime_handle(&self) -> Handle {
@@ -120,6 +141,36 @@ function run(argv) {
 }
 "#;
 
+const CHOOSE_OPEN_WITH_APPLICATION_SCRIPT: &str = r#"
+try
+    set selectedApplication to choose file with prompt "选择用于打开该文件的应用程序" of type {"com.apple.application-bundle"} default location (path to applications folder)
+    return POSIX path of selectedApplication
+on error number -128
+    return ""
+end try
+"#;
+
+fn choose_open_with_application() -> Result<Option<PathBuf>> {
+    let output = Command::new("/usr/bin/osascript")
+        .args(["-e", CHOOSE_OPEN_WITH_APPLICATION_SCRIPT])
+        .output()
+        .context("无法显示应用选择器")?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!("应用选择失败：{message}");
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(path);
+    if !path.is_dir() || path.extension().and_then(|extension| extension.to_str()) != Some("app") {
+        anyhow::bail!("请选择 macOS 应用程序（.app）");
+    }
+    Ok(Some(path))
+}
+
 fn query_applications_for_path(path: &Path) -> Result<Vec<OpenWithApplication>> {
     let output = Command::new("/usr/bin/osascript")
         .args([
@@ -138,19 +189,112 @@ fn query_applications_for_path(path: &Path) -> Result<Vec<OpenWithApplication>> 
     }
     let mut applications = parse_open_with_applications(&String::from_utf8_lossy(&output.stdout))?;
     ensure_text_editor(&mut applications);
+    if is_text_or_unknown_path(path)
+        && let Some(notepad_path) = installed_notepad_application()
+    {
+        promote_notepad_application(&mut applications, notepad_path);
+    }
     Ok(applications)
 }
 
-fn ensure_text_editor(applications: &mut Vec<OpenWithApplication>) {
-    const TEXT_EDIT_PATHS: [&str; 2] = [
-        "/System/Applications/TextEdit.app",
-        "/Applications/TextEdit.app",
-    ];
-    let Some(path) = TEXT_EDIT_PATHS
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_dir())
+fn open_path_with_application(path: &Path, application: &Path) -> Result<()> {
+    let status = Command::new("/usr/bin/open")
+        .arg("-a")
+        .arg(application)
+        .arg(path)
+        .status()
+        .with_context(|| format!("无法启动 {}", application.display()))?;
+    if !status.success() {
+        anyhow::bail!("无法使用 {} 打开 {}", application.display(), path.display());
+    }
+    Ok(())
+}
+
+fn is_unix_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn run_unix_executable(path: &Path) -> Result<()> {
+    let mut command = Command::new(path);
+    if let Some(parent) = path.parent() {
+        command.current_dir(parent);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("无法运行 Unix 可执行程序：{}", path.display()))?;
+    Ok(())
+}
+
+fn preferred_text_application(path: &Path) -> Option<PathBuf> {
+    is_text_path(path)
+        .then(installed_notepad_application)
+        .flatten()
+}
+
+fn is_text_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| is_text_extension(&extension.to_ascii_lowercase()))
+        .unwrap_or(false)
+}
+
+fn is_text_or_unknown_path(path: &Path) -> bool {
+    let Some(extension) = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
     else {
+        return true;
+    };
+    is_text_extension(&extension) || FileItem::kind_for(false, Some(&extension)) == FileKind::Other
+}
+
+fn installed_notepad_application() -> Option<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/Applications/Notepad--.app"),
+        PathBuf::from("/System/Applications/Notepad--.app"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join("Applications/Notepad--.app"));
+    }
+    candidates.into_iter().find(|path| path.is_dir())
+}
+
+fn installed_text_edit_application() -> Option<PathBuf> {
+    [
+        PathBuf::from("/System/Applications/TextEdit.app"),
+        PathBuf::from("/Applications/TextEdit.app"),
+    ]
+    .into_iter()
+    .find(|path| path.is_dir())
+}
+
+fn installed_text_editor_application() -> Option<PathBuf> {
+    installed_notepad_application().or_else(installed_text_edit_application)
+}
+
+fn promote_notepad_application(applications: &mut Vec<OpenWithApplication>, path: PathBuf) {
+    applications.retain(|application| {
+        application.path != path && !application.name.eq_ignore_ascii_case("Notepad--")
+    });
+    applications.insert(
+        0,
+        OpenWithApplication {
+            name: "Notepad--".to_string(),
+            path,
+        },
+    );
+}
+
+fn ensure_text_editor(applications: &mut Vec<OpenWithApplication>) {
+    let Some(path) = installed_text_edit_application() else {
         return;
     };
 
@@ -274,10 +418,11 @@ pub async fn fetch_dir_entries_with_options(
 mod tests {
     use super::{
         OpenWithApplication, discover_volume_paths, ensure_text_editor, fetch_dir_entries,
-        fetch_dir_entries_with_options, parse_open_with_applications,
+        fetch_dir_entries_with_options, is_text_or_unknown_path, is_text_path, is_unix_executable,
+        parse_open_with_applications, promote_notepad_application,
     };
     use crate::models::SortMode;
-    use std::{fs, path::PathBuf};
+    use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf};
 
     #[tokio::test]
     async fn reads_metadata_hides_dot_files_and_sorts_folders_first() {
@@ -359,5 +504,49 @@ mod tests {
             applications[0].path,
             PathBuf::from("/System/Applications/TextEdit.app")
         );
+    }
+
+    #[test]
+    fn notepad_is_promoted_for_text_and_unknown_files() {
+        let notepad_path = PathBuf::from("/Applications/Notepad--.app");
+        let mut applications = vec![
+            OpenWithApplication {
+                name: "TextEdit".to_string(),
+                path: "/System/Applications/TextEdit.app".into(),
+            },
+            OpenWithApplication {
+                name: "Notepad--".to_string(),
+                path: notepad_path.clone(),
+            },
+        ];
+
+        assert!(is_text_path(std::path::Path::new("notes.MD")));
+        assert!(!is_text_path(std::path::Path::new("photo.png")));
+        assert!(is_text_or_unknown_path(std::path::Path::new("README")));
+        assert!(is_text_or_unknown_path(std::path::Path::new("data.custom")));
+        assert!(!is_text_or_unknown_path(std::path::Path::new("photo.png")));
+        promote_notepad_application(&mut applications, notepad_path.clone());
+
+        assert_eq!(applications[0].name, "Notepad--");
+        assert_eq!(applications[0].path, notepad_path);
+        assert_eq!(applications.len(), 2);
+    }
+
+    #[test]
+    fn unix_execute_bits_mark_a_file_as_directly_runnable() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let executable = directory.path().join("tool");
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("create executable");
+        let mut permissions = fs::metadata(&executable)
+            .expect("executable metadata")
+            .permissions();
+
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions.clone()).expect("set executable mode");
+        assert!(is_unix_executable(&executable));
+
+        permissions.set_mode(0o644);
+        fs::set_permissions(&executable, permissions).expect("clear executable mode");
+        assert!(!is_unix_executable(&executable));
     }
 }

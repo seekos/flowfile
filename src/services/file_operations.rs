@@ -105,25 +105,7 @@ impl FileOperationEngine {
 
     pub async fn rename(&self, source: PathBuf, new_name: String) -> Result<PathBuf> {
         self.runtime
-            .spawn(async move {
-                validate_file_name(&new_name)?;
-                let parent = source.parent().context("无法确定文件所在目录")?;
-                let destination = parent.join(new_name);
-                if source == destination {
-                    return Ok(source);
-                }
-                if fs::try_exists(&destination).await? {
-                    bail!("目标名称已存在：{}", destination.display());
-                }
-                fs::rename(&source, &destination).await.with_context(|| {
-                    format!(
-                        "无法将 {} 重命名为 {}",
-                        source.display(),
-                        destination.display()
-                    )
-                })?;
-                Ok(destination)
-            })
+            .spawn(rename_path(source, new_name))
             .await
             .context("重命名任务异常终止")?
     }
@@ -185,6 +167,26 @@ impl FileOperationEngine {
             .await
             .context("显示简介任务异常终止")?
     }
+}
+
+async fn rename_path(source: PathBuf, new_name: String) -> Result<PathBuf> {
+    validate_file_name(&new_name)?;
+    let parent = source.parent().context("无法确定文件所在目录")?;
+    let destination = parent.join(new_name);
+    if source == destination {
+        return Ok(source);
+    }
+    if fs::try_exists(&destination).await? {
+        bail!("目标名称已存在：{}", destination.display());
+    }
+    fs::rename(&source, &destination).await.with_context(|| {
+        format!(
+            "无法将 {} 重命名为 {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(destination)
 }
 
 struct TransferPlan {
@@ -478,7 +480,7 @@ fn validate_file_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConflictPolicy, TransferMode, available_path, execute_transfer};
+    use super::{ConflictPolicy, TransferMode, available_path, execute_transfer, rename_path};
     use std::fs;
 
     #[tokio::test]
@@ -568,5 +570,37 @@ mod tests {
 
         assert_ne!(destinations[0], destinations[1]);
         assert!(destinations.iter().all(|path| path.exists()));
+    }
+
+    #[tokio::test]
+    async fn regular_files_can_be_renamed() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let source = directory.path().join("before.txt");
+        fs::write(&source, b"flowfile").expect("write source");
+
+        let destination = rename_path(source.clone(), "after.txt".to_string())
+            .await
+            .expect("rename file");
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination).unwrap(), b"flowfile");
+    }
+
+    #[tokio::test]
+    async fn folders_can_be_renamed() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let source = directory.path().join("before");
+        fs::create_dir(&source).expect("create source folder");
+        fs::write(source.join("inside.txt"), b"flowfile").expect("write nested file");
+
+        let destination = rename_path(source.clone(), "after".to_string())
+            .await
+            .expect("rename folder");
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(destination.join("inside.txt")).unwrap(),
+            b"flowfile"
+        );
     }
 }

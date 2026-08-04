@@ -10,6 +10,8 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FileKind {
     Folder,
+    Application,
+    Executable,
     Document,
     Image,
     Archive,
@@ -52,8 +54,14 @@ impl FileItem {
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or_default();
 
+        let kind = if has_unix_execute_bit(&metadata) {
+            FileKind::Executable
+        } else {
+            Self::kind_for(is_dir, extension.as_deref())
+        };
+
         Self {
-            kind: Self::kind_for(is_dir, extension.as_deref()),
+            kind,
             path,
             name,
             is_dir,
@@ -65,9 +73,13 @@ impl FileItem {
         }
     }
 
-    fn kind_for(is_dir: bool, extension: Option<&str>) -> FileKind {
+    pub(crate) fn kind_for(is_dir: bool, extension: Option<&str>) -> FileKind {
         if is_dir {
-            return FileKind::Folder;
+            return if extension == Some("app") {
+                FileKind::Application
+            } else {
+                FileKind::Folder
+            };
         }
 
         match extension.unwrap_or_default() {
@@ -120,6 +132,18 @@ impl FileItem {
     }
 }
 
+#[cfg(unix)]
+fn has_unix_execute_bit(metadata: &Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn has_unix_execute_bit(_metadata: &Metadata) -> bool {
+    false
+}
+
 fn natural_name_cmp(left: &FileItem, right: &FileItem) -> Ordering {
     left.name
         .to_lowercase()
@@ -130,4 +154,54 @@ fn natural_name_cmp(left: &FileItem, right: &FileItem) -> Ordering {
 fn format_modified_time(time: SystemTime) -> String {
     let local: DateTime<Local> = time.into();
     local.format("%Y-%m-%d %H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileItem, FileKind};
+    use std::{fs, path::PathBuf};
+    use tempfile::tempdir;
+
+    #[test]
+    fn app_bundle_has_application_kind() {
+        let directory = tempdir().expect("create temporary directory");
+        let path = directory.path().join("Example.app");
+        fs::create_dir(&path).expect("create app bundle directory");
+
+        let item = FileItem::from_metadata(
+            path.clone(),
+            "Example.app".to_string(),
+            fs::metadata(&path).expect("read app bundle metadata"),
+            false,
+        );
+
+        assert_eq!(item.kind, FileKind::Application);
+        assert!(item.is_dir);
+        assert_eq!(FileItem::kind_for(true, None), FileKind::Folder);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_file_has_unix_executable_kind() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("create temporary directory");
+        let path = directory.path().join("launcher");
+        fs::write(&path, b"#!/bin/sh\n").expect("create executable file");
+        let mut permissions = fs::metadata(&path)
+            .expect("read executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("set executable permission");
+
+        let item = FileItem::from_metadata(
+            PathBuf::from(&path),
+            "launcher".to_string(),
+            fs::metadata(&path).expect("read executable metadata"),
+            false,
+        );
+
+        assert_eq!(item.kind, FileKind::Executable);
+        assert!(!item.is_dir);
+    }
 }

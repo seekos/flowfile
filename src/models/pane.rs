@@ -80,6 +80,7 @@ pub struct Pane {
     pub selected_indices: BTreeSet<usize>,
     pub rename_index: Option<usize>,
     pub rename_buffer: String,
+    rename_in_progress: bool,
     pub is_loading: bool,
     pub error_message: Option<String>,
     pub search_active: bool,
@@ -112,6 +113,7 @@ impl Pane {
             selected_indices: BTreeSet::new(),
             rename_index: None,
             rename_buffer: String::new(),
+            rename_in_progress: false,
             is_loading: false,
             error_message: None,
             search_active: false,
@@ -419,7 +421,7 @@ impl Pane {
             return;
         };
 
-        if item.is_dir {
+        if should_navigate_to(&item) {
             self.navigate_to(item.path, cx);
         } else {
             self.open_file(item.path, cx);
@@ -438,12 +440,14 @@ impl Pane {
         };
         self.rename_index = Some(index);
         self.rename_buffer = item.name.clone();
+        self.rename_in_progress = false;
         self.error_message = None;
     }
 
     pub fn cancel_rename(&mut self) {
         self.rename_index = None;
         self.rename_buffer.clear();
+        self.rename_in_progress = false;
     }
 
     pub fn append_rename_text(&mut self, text: &str) {
@@ -457,6 +461,9 @@ impl Pane {
     }
 
     pub fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        if self.rename_in_progress {
+            return;
+        }
         let Some(index) = self.rename_index else {
             self.begin_rename();
             cx.notify();
@@ -468,6 +475,7 @@ impl Pane {
         };
         let new_name = self.rename_buffer.trim().to_string();
         let engine = self.operation_engine.clone();
+        self.rename_in_progress = true;
 
         cx.spawn(async move |this, cx| {
             let result = engine.rename(source, new_name).await;
@@ -477,6 +485,7 @@ impl Pane {
                     pane.refresh(cx);
                 }
                 Err(error) => {
+                    pane.rename_in_progress = false;
                     pane.error_message = Some(error.to_string());
                     cx.notify();
                 }
@@ -571,6 +580,7 @@ impl Pane {
             .collect();
         self.selected_index = self.selected_indices.iter().next_back().copied();
         self.rename_index = None;
+        self.rename_in_progress = false;
     }
 
     fn start_watching(&mut self, cx: &mut Context<Self>) {
@@ -613,6 +623,14 @@ fn path_title(path: &Path) -> String {
         .to_string()
 }
 
+fn should_navigate_to(item: &FileItem) -> bool {
+    item.is_dir
+        && !item
+            .extension
+            .as_deref()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+}
+
 fn resolve_path(current: &Path, input: PathBuf) -> PathBuf {
     let display = input.to_string_lossy();
     if display == "~" {
@@ -636,7 +654,7 @@ pub fn home_directory() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExplorerTab, Pane, ViewMode};
+    use super::{ExplorerTab, Pane, ViewMode, should_navigate_to};
     use crate::{
         models::{FileItem, FileKind},
         services::FileEngine,
@@ -753,5 +771,27 @@ mod tests {
         pane.set_rename_buffer("中文文件夹".to_string());
 
         assert_eq!(pane.rename_buffer, "中文文件夹");
+    }
+
+    #[test]
+    fn application_bundles_open_instead_of_navigate() {
+        let application = FileItem {
+            path: PathBuf::from("/Applications/Example.app"),
+            name: "Example.app".to_string(),
+            is_dir: true,
+            extension: Some("app".to_string()),
+            size: 0,
+            modified_unix: 0,
+            modified: String::new(),
+            is_hidden: false,
+            kind: FileKind::Folder,
+        };
+        let mut folder = application.clone();
+        folder.path = PathBuf::from("/Applications/Utilities");
+        folder.name = "Utilities".to_string();
+        folder.extension = None;
+
+        assert!(!should_navigate_to(&application));
+        assert!(should_navigate_to(&folder));
     }
 }

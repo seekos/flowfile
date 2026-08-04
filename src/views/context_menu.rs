@@ -31,6 +31,7 @@ struct ContextMenuState {
 struct OpenWithMenuState {
     path: std::path::PathBuf,
     applications: Vec<OpenWithApplication>,
+    text_opening_supported: bool,
     loading: bool,
     expanded: bool,
     error: Option<String>,
@@ -97,6 +98,9 @@ impl ContextMenuView {
             return;
         };
         pane.update(cx, |pane, cx| {
+            if pane.rename_index.is_some() {
+                pane.commit_rename(cx);
+            }
             // Finder-style behavior: preserve a multi-selection when the pointer
             // is already over one of its members; otherwise select only this item.
             pane.select_for_context_menu(item_index);
@@ -137,6 +141,9 @@ impl ContextMenuView {
             return;
         };
         pane.update(cx, |pane, cx| {
+            if pane.rename_index.is_some() {
+                pane.commit_rename(cx);
+            }
             pane.clear_selection();
             cx.notify();
         });
@@ -161,6 +168,7 @@ impl ContextMenuView {
         self.open_with_generation += 1;
         let generation = self.open_with_generation;
         self.open_with = Some(OpenWithMenuState {
+            text_opening_supported: FileEngine::supports_text_opening(&path),
             path: path.clone(),
             applications: Vec::new(),
             loading: true,
@@ -280,6 +288,57 @@ impl ContextMenuView {
                 .open_path_with(open_with.path, application.path)
                 .await
             {
+                let _ = pane.update(cx, |pane, cx| {
+                    pane.error_message = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn choose_custom_open_with_application(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let Some(open_with) = self.open_with.take() else {
+            return;
+        };
+        self.open_with_generation += 1;
+        cx.notify();
+
+        let pane = state.pane;
+        let engine = self.engine.clone();
+        cx.spawn(async move |_, cx| {
+            let result = match engine.choose_open_with_application().await {
+                Ok(Some(application)) => engine.open_path_with(open_with.path, application).await,
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                let _ = pane.update(cx, |pane, cx| {
+                    pane.error_message = Some(error.to_string());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn open_as_text(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let Some(open_with) = self.open_with.take() else {
+            return;
+        };
+        self.open_with_generation += 1;
+        cx.notify();
+
+        let pane = state.pane;
+        let engine = self.engine.clone();
+        cx.spawn(async move |_, cx| {
+            if let Err(error) = engine.open_path_as_text(open_with.path).await {
                 let _ = pane.update(cx, |pane, cx| {
                     pane.error_message = Some(error.to_string());
                     cx.notify();
@@ -425,8 +484,9 @@ impl ContextMenuView {
         if !open_with.expanded {
             return None;
         }
+        let text_opening_supported = open_with.text_opening_supported;
 
-        let children = if open_with.loading {
+        let mut children = if open_with.loading {
             vec![Self::submenu_message("正在查找可用应用…")]
         } else if open_with.error.is_some() {
             vec![Self::submenu_message("无法读取可用应用")]
@@ -475,6 +535,11 @@ impl ContextMenuView {
                 })
                 .collect()
         };
+        children.push(Self::separator());
+        if text_opening_supported {
+            children.push(self.text_open_item(cx));
+        }
+        children.push(self.custom_open_with_item(cx));
 
         let submenu = div()
             .id("open-with-submenu")
@@ -540,6 +605,74 @@ impl ContextMenuView {
             .text_size(theme::font(10.0))
             .text_color(theme::text_tertiary())
             .child(message)
+            .into_any_element()
+    }
+
+    fn custom_open_with_item(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("open-with-custom-application")
+            .flex()
+            .items_center()
+            .h(px(33.0))
+            .mx_1()
+            .px_2()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::accent()).text_color(theme::surface()))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.choose_custom_open_with_application(cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(22.0))
+                    .mr_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(theme::border())
+                    .bg(theme::surface_subtle())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(theme::font(11.0))
+                    .text_color(theme::accent())
+                    .child("＋"),
+            )
+            .child(div().min_w_0().flex_1().child("自定义打开方式…"))
+            .into_any_element()
+    }
+
+    fn text_open_item(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("open-as-text")
+            .flex()
+            .items_center()
+            .h(px(33.0))
+            .mx_1()
+            .px_2()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::accent()).text_color(theme::surface()))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.open_as_text(cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(22.0))
+                    .mr_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(theme::border())
+                    .bg(theme::surface_subtle())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(theme::font(10.0))
+                    .text_color(theme::accent())
+                    .child("✎"),
+            )
+            .child(div().min_w_0().flex_1().child("以文本方式打开"))
             .into_any_element()
     }
 

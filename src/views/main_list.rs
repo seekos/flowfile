@@ -13,11 +13,13 @@ use crate::{
     theme,
 };
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, FontWeight, Half, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Pixels, Point, Render, RenderImage,
-    SharedString, StyledImage, UTF16Selection, Window, canvas, deferred, div, img, point,
-    prelude::*, px, size, uniform_list,
+    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
+    GlobalElementId, Half, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, Pixels, Point, Render, RenderImage,
+    ShapedLine, SharedString, Style, StyledImage, Subscription, TextRun, UTF16Selection,
+    UnderlineStyle, Window, deferred, div, fill, img, point, prelude::*, px, relative, size,
+    uniform_list,
 };
 use std::{
     cell::RefCell,
@@ -143,6 +145,174 @@ impl Render for DragPreview {
     }
 }
 
+struct RenameTextElement {
+    input: Entity<MainListView>,
+}
+
+struct RenamePrepaintState {
+    line: Option<ShapedLine>,
+    cursor: Option<PaintQuad>,
+    selection: Option<PaintQuad>,
+}
+
+impl IntoElement for RenameTextElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for RenameTextElement {
+    type RequestLayoutState = ();
+    type PrepaintState = RenamePrepaintState;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let input = self.input.read(cx);
+        let content: SharedString = input.pane.read(cx).rename_buffer.clone().into();
+        let selected_range = clamp_char_range(&content, input.rename_selected_range.clone());
+        let cursor = input.rename_cursor_offset();
+        let marked_range = input.rename_marked_range.clone();
+        let style = window.text_style();
+        let run = TextRun {
+            len: content.len(),
+            font: style.font(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = if let Some(marked_range) = marked_range {
+            vec![
+                TextRun {
+                    len: marked_range.start,
+                    ..run.clone()
+                },
+                TextRun {
+                    len: marked_range.end.saturating_sub(marked_range.start),
+                    underline: Some(UnderlineStyle {
+                        color: Some(run.color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    ..run.clone()
+                },
+                TextRun {
+                    len: content.len().saturating_sub(marked_range.end),
+                    ..run
+                },
+            ]
+            .into_iter()
+            .filter(|run| run.len > 0)
+            .collect()
+        } else {
+            vec![run]
+        };
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(content, font_size, &runs, None);
+        let cursor_x = line.x_for_index(cursor);
+        let (selection, cursor) = if selected_range.is_empty() {
+            (
+                None,
+                Some(fill(
+                    Bounds::new(
+                        point(bounds.left() + cursor_x, bounds.top()),
+                        size(px(1.0), bounds.size.height),
+                    ),
+                    theme::accent(),
+                )),
+            )
+        } else {
+            (
+                Some(fill(
+                    Bounds::from_corners(
+                        point(
+                            bounds.left() + line.x_for_index(selected_range.start),
+                            bounds.top(),
+                        ),
+                        point(
+                            bounds.left() + line.x_for_index(selected_range.end),
+                            bounds.bottom(),
+                        ),
+                    ),
+                    theme::accent_soft(),
+                )),
+                None,
+            )
+        };
+
+        RenamePrepaintState {
+            line: Some(line),
+            cursor,
+            selection,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus_handle = self.input.read(cx).focus_handle.clone();
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.input.clone()),
+            cx,
+        );
+        if let Some(selection) = prepaint.selection.take() {
+            window.paint_quad(selection);
+        }
+        let line = prepaint.line.take().expect("rename line was shaped");
+        line.paint(bounds.origin, window.line_height(), window, cx)
+            .expect("rename line should paint");
+        if focus_handle.is_focused(window)
+            && let Some(cursor) = prepaint.cursor.take()
+        {
+            window.paint_quad(cursor);
+        }
+        self.input.update(cx, |input, _| {
+            input.rename_layout = Some(line);
+            input.rename_bounds = Some(bounds);
+        });
+    }
+}
+
 pub struct MainListView {
     pane_index: usize,
     pane: Model<Pane>,
@@ -159,7 +329,12 @@ pub struct MainListView {
     viewport_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     grid_columns: usize,
     rename_selected_range: Range<usize>,
+    rename_selection_reversed: bool,
     rename_marked_range: Option<Range<usize>>,
+    rename_layout: Option<ShapedLine>,
+    rename_bounds: Option<Bounds<Pixels>>,
+    rename_is_selecting: bool,
+    rename_blur_subscription: Option<Subscription>,
     last_rename_index: Option<usize>,
 }
 
@@ -191,7 +366,12 @@ impl MainListView {
             viewport_bounds: Rc::new(RefCell::new(None)),
             grid_columns: 4,
             rename_selected_range: 0..0,
+            rename_selection_reversed: false,
             rename_marked_range: None,
+            rename_layout: None,
+            rename_bounds: None,
+            rename_is_selecting: false,
+            rename_blur_subscription: None,
             last_rename_index: None,
         }
     }
@@ -199,6 +379,8 @@ impl MainListView {
     fn file_icon(item: &FileItem) -> AnyElement {
         let (label, color) = match item.kind {
             FileKind::Folder => ("▰", theme::folder()),
+            FileKind::Application => ("A", theme::file_purple()),
+            FileKind::Executable => (">_", theme::terminal_foreground()),
             FileKind::Document => ("DOC", theme::file_blue()),
             FileKind::Image => ("IMG", theme::file_green()),
             FileKind::Archive => ("ZIP", theme::file_purple()),
@@ -223,7 +405,7 @@ impl MainListView {
     }
 
     fn large_file_icon(item: &FileItem) -> AnyElement {
-        if item.is_dir {
+        if item.kind == FileKind::Folder {
             return div()
                 .flex()
                 .items_center()
@@ -261,6 +443,8 @@ impl MainListView {
         }
 
         let (label, color) = match item.kind {
+            FileKind::Application => ("APP".to_string(), theme::file_purple()),
+            FileKind::Executable => (">_".to_string(), theme::terminal_foreground()),
             FileKind::Document => (
                 item.extension
                     .as_deref()
@@ -307,6 +491,10 @@ impl MainListView {
     }
 
     fn file_visual(item: &FileItem, thumbnail: Option<Arc<RenderImage>>, edge: f32) -> AnyElement {
+        if matches!(item.kind, FileKind::Application | FileKind::Executable) {
+            return Self::program_icon(item.kind, edge);
+        }
+
         if let Some(thumbnail) = thumbnail {
             div()
                 .flex()
@@ -340,6 +528,74 @@ impl MainListView {
                     Self::file_icon(item)
                 })
                 .into_any_element()
+        }
+    }
+
+    fn program_icon(kind: FileKind, edge: f32) -> AnyElement {
+        let is_large = edge >= 64.0;
+
+        match kind {
+            FileKind::Application => {
+                let icon_edge = if is_large { 62.0 } else { 26.0 };
+                let inset = if is_large { 8.0 } else { 3.0 };
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(edge))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(icon_edge))
+                            .rounded(if is_large { px(14.0) } else { px(6.0) })
+                            .border_1()
+                            .border_color(theme::file_purple().opacity(0.9))
+                            .bg(theme::file_purple().opacity(0.16))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(icon_edge - inset * 2.0))
+                                    .rounded(if is_large { px(10.0) } else { px(4.0) })
+                                    .bg(theme::file_purple())
+                                    .text_color(theme::surface())
+                                    .text_size(theme::font(if is_large { 29.0 } else { 13.0 }))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("A"),
+                            ),
+                    )
+                    .into_any_element()
+            }
+            FileKind::Executable => {
+                let width = if is_large { 68.0 } else { 32.0 };
+                let height = if is_large { 52.0 } else { 25.0 };
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(edge))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(width))
+                            .h(px(height))
+                            .rounded(if is_large { px(8.0) } else { px(4.0) })
+                            .border_1()
+                            .border_color(theme::terminal_foreground().opacity(0.48))
+                            .bg(theme::terminal_background())
+                            .text_color(theme::terminal_foreground())
+                            .text_size(theme::font(if is_large { 20.0 } else { 10.0 }))
+                            .font_weight(FontWeight::BOLD)
+                            .child(">_"),
+                    )
+                    .into_any_element()
+            }
+            _ => unreachable!("program_icon only handles program file kinds"),
         }
     }
 
@@ -462,6 +718,11 @@ impl MainListView {
         cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window);
+        self.pane.update(cx, |pane, cx| {
+            if pane.rename_index.is_some() {
+                pane.commit_rename(cx);
+            }
+        });
         let base_selection = if event.modifiers.platform {
             self.pane.read(cx).selected_indices.clone()
         } else {
@@ -572,15 +833,17 @@ impl MainListView {
 
     fn rename_editor(
         &self,
-        rename_buffer: &str,
+        _rename_buffer: &str,
         width: f32,
         input_entity: Entity<Self>,
     ) -> AnyElement {
-        let value: SharedString = rename_buffer.to_string().into();
-        let input_focus = self.focus_handle.clone();
-        let prepaint_focus = self.focus_handle.clone();
+        let mouse_down_input = input_entity.clone();
+        let mouse_move_input = input_entity.clone();
+        let mouse_up_input = input_entity.clone();
+        let mouse_up_out_input = input_entity.clone();
 
         div()
+            .id(("rename-editor", self.pane_index))
             .relative()
             .flex()
             .items_center()
@@ -596,24 +859,43 @@ impl MainListView {
             .font_family("SF Mono")
             .text_size(theme::font(11.0))
             .text_color(theme::text_primary())
-            .child(div().min_w_0().truncate().child(value))
-            .child(div().w(px(1.0)).h(px(15.0)).bg(theme::accent()))
-            .child(
-                canvas(
-                    move |_, window, cx| {
-                        window.set_focus_handle(&prepaint_focus, cx);
-                    },
-                    move |bounds, _, window, cx| {
-                        window.handle_input(
-                            &input_focus,
-                            ElementInputHandler::new(bounds, input_entity),
-                            cx,
-                        );
-                    },
-                )
-                .absolute()
-                .size_full(),
+            .cursor_text()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                move |event: &MouseDownEvent, window, cx| {
+                    mouse_down_input.update(cx, |input, cx| {
+                        input.on_rename_mouse_down(event, window, cx)
+                    });
+                    cx.stop_propagation();
+                },
             )
+            .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+                mouse_move_input.update(cx, |input, cx| {
+                    input.on_rename_mouse_move(event, window, cx)
+                });
+                cx.stop_propagation();
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                move |event: &MouseUpEvent, window, cx| {
+                    mouse_up_input
+                        .update(cx, |input, cx| input.on_rename_mouse_up(event, window, cx));
+                    cx.stop_propagation();
+                },
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                move |event: &MouseUpEvent, window, cx| {
+                    mouse_up_out_input
+                        .update(cx, |input, cx| input.on_rename_mouse_up(event, window, cx));
+                    cx.stop_propagation();
+                },
+            )
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(RenameTextElement {
+                input: input_entity,
+            })
             .into_any_element()
     }
 
@@ -656,6 +938,7 @@ impl MainListView {
         input_entity: Entity<Self>,
     ) -> AnyElement {
         let formatted_size = item.formatted_size();
+        let is_folder = item.is_dir;
         let widths = self.detail_column_widths;
         let pane = self.pane.clone();
         let focus_handle = self.focus_handle.clone();
@@ -698,7 +981,8 @@ impl MainListView {
                 theme::surface()
             })
             .opacity(if is_cut { 0.5 } else { 1.0 })
-            .cursor_move()
+            .when(is_folder, |row| row.cursor_default())
+            .when(!is_folder, |row| row.cursor_move())
             .hover(|style| style.bg(theme::accent_soft().opacity(0.7)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -712,6 +996,9 @@ impl MainListView {
                 focus_handle.focus(window);
                 let modifiers = event.modifiers();
                 pane.update(cx, |pane, cx| {
+                    if pane.rename_index.is_some() {
+                        pane.commit_rename(cx);
+                    }
                     pane.select(index, modifiers.platform, modifiers.shift);
                     if event.click_count() >= 2 {
                         pane.activate_selected(cx);
@@ -784,6 +1071,7 @@ impl MainListView {
         thumbnail: Option<Arc<RenderImage>>,
         input_entity: Entity<Self>,
     ) -> AnyElement {
+        let is_folder = item.is_dir;
         let pane = self.pane.clone();
         let focus_handle = self.focus_handle.clone();
         let context_focus_handle = self.focus_handle.clone();
@@ -899,7 +1187,8 @@ impl MainListView {
             .border_color(theme::surface())
             .bg(theme::surface())
             .opacity(if is_cut { 0.5 } else { 1.0 })
-            .cursor_move()
+            .when(is_folder, |card| card.cursor_default())
+            .when(!is_folder, |card| card.cursor_move())
             .when(!is_selected, |card| {
                 card.hover(|style| style.border_color(theme::accent().opacity(0.42)))
             })
@@ -915,6 +1204,9 @@ impl MainListView {
                 focus_handle.focus(window);
                 let modifiers = event.modifiers();
                 pane.update(cx, |pane, cx| {
+                    if pane.rename_index.is_some() {
+                        pane.commit_rename(cx);
+                    }
                     pane.select(index, modifiers.platform, modifiers.shift);
                     if event.click_count() >= 2 {
                         pane.activate_selected(cx);
@@ -953,6 +1245,7 @@ impl MainListView {
         replacement.push_str(&value[range.end..]);
         let cursor = range.start + new_text.len();
         self.rename_selected_range = cursor..cursor;
+        self.rename_selection_reversed = false;
         self.rename_marked_range = None;
         self.pane.update(cx, |pane, cx| {
             pane.set_rename_buffer(replacement);
@@ -976,15 +1269,181 @@ impl MainListView {
         self.rename_offset_to_utf16(range.start, cx)..self.rename_offset_to_utf16(range.end, cx)
     }
 
+    fn rename_cursor_offset(&self) -> usize {
+        if self.rename_selection_reversed {
+            self.rename_selected_range.start
+        } else {
+            self.rename_selected_range.end
+        }
+    }
+
+    fn previous_rename_boundary(value: &str, offset: usize) -> usize {
+        value
+            .char_indices()
+            .rev()
+            .find_map(|(index, _)| (index < offset).then_some(index))
+            .unwrap_or(0)
+    }
+
+    fn next_rename_boundary(value: &str, offset: usize) -> usize {
+        value
+            .char_indices()
+            .find_map(|(index, _)| (index > offset).then_some(index))
+            .unwrap_or(value.len())
+    }
+
+    fn move_rename_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.rename_selected_range = offset..offset;
+        self.rename_selection_reversed = false;
+        self.rename_marked_range = None;
+        cx.notify();
+    }
+
+    fn select_rename_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        if self.rename_selection_reversed {
+            self.rename_selected_range.start = offset;
+        } else {
+            self.rename_selected_range.end = offset;
+        }
+        if self.rename_selected_range.end < self.rename_selected_range.start {
+            self.rename_selection_reversed = !self.rename_selection_reversed;
+            self.rename_selected_range =
+                self.rename_selected_range.end..self.rename_selected_range.start;
+        }
+        self.rename_marked_range = None;
+        cx.notify();
+    }
+
+    fn rename_index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+        let (Some(bounds), Some(line)) = (self.rename_bounds.as_ref(), self.rename_layout.as_ref())
+        else {
+            return self.rename_cursor_offset();
+        };
+        if position.x <= bounds.left() {
+            return 0;
+        }
+        if position.x >= bounds.right() {
+            return line.text.len();
+        }
+        line.closest_index_for_x(position.x - bounds.left())
+    }
+
+    fn on_rename_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window);
+        self.rename_is_selecting = true;
+        let offset = self.rename_index_for_mouse_position(event.position);
+        if event.modifiers.shift {
+            self.select_rename_to(offset, cx);
+        } else {
+            self.move_rename_to(offset, cx);
+        }
+        cx.stop_propagation();
+    }
+
+    fn on_rename_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rename_is_selecting && event.dragging() {
+            let offset = self.rename_index_for_mouse_position(event.position);
+            self.select_rename_to(offset, cx);
+        }
+        cx.stop_propagation();
+    }
+
+    fn on_rename_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.rename_is_selecting = false;
+        cx.stop_propagation();
+    }
+
+    fn move_rename_horizontally(
+        &mut self,
+        move_left: bool,
+        extend_selection: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let value = self.pane.read(cx).rename_buffer.clone();
+        let cursor = self.rename_cursor_offset().min(value.len());
+        if extend_selection {
+            let next = if move_left {
+                Self::previous_rename_boundary(&value, cursor)
+            } else {
+                Self::next_rename_boundary(&value, cursor)
+            };
+            self.select_rename_to(next, cx);
+        } else if self.rename_selected_range.is_empty() {
+            let next = if move_left {
+                Self::previous_rename_boundary(&value, cursor)
+            } else {
+                Self::next_rename_boundary(&value, cursor)
+            };
+            self.move_rename_to(next, cx);
+        } else {
+            let next = if move_left {
+                self.rename_selected_range.start
+            } else {
+                self.rename_selected_range.end
+            };
+            self.move_rename_to(next, cx);
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.key == "escape" && self.cancel_marquee(cx) {
             return;
         }
         let renaming = self.pane.read(cx).rename_index.is_some();
         if renaming {
+            if event.keystroke.modifiers.platform && event.keystroke.key == "a" {
+                let value_len = self.pane.read(cx).rename_buffer.len();
+                self.rename_selected_range = 0..value_len;
+                self.rename_selection_reversed = false;
+                self.rename_marked_range = None;
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
             match event.keystroke.key.as_str() {
+                "left" if self.rename_marked_range.is_none() => {
+                    self.move_rename_horizontally(true, event.keystroke.modifiers.shift, cx);
+                    cx.stop_propagation();
+                }
+                "right" if self.rename_marked_range.is_none() => {
+                    self.move_rename_horizontally(false, event.keystroke.modifiers.shift, cx);
+                    cx.stop_propagation();
+                }
+                "home" if self.rename_marked_range.is_none() => {
+                    if event.keystroke.modifiers.shift {
+                        self.select_rename_to(0, cx);
+                    } else {
+                        self.move_rename_to(0, cx);
+                    }
+                    cx.stop_propagation();
+                }
+                "end" if self.rename_marked_range.is_none() => {
+                    let end = self.pane.read(cx).rename_buffer.len();
+                    if event.keystroke.modifiers.shift {
+                        self.select_rename_to(end, cx);
+                    } else {
+                        self.move_rename_to(end, cx);
+                    }
+                    cx.stop_propagation();
+                }
                 "enter" if self.rename_marked_range.is_none() => {
                     self.pane.update(cx, |pane, cx| pane.commit_rename(cx));
+                    cx.stop_propagation();
                 }
                 "escape" => self.pane.update(cx, |pane, cx| {
                     pane.cancel_rename();
@@ -1002,6 +1461,18 @@ impl MainListView {
                         self.rename_selected_range = previous..cursor;
                     }
                     self.replace_rename_selection("", cx);
+                    cx.stop_propagation();
+                }
+                "delete" if self.rename_marked_range.is_none() => {
+                    if self.rename_selected_range.is_empty() {
+                        let value = self.pane.read(cx).rename_buffer.clone();
+                        let cursor = self.rename_cursor_offset().min(value.len());
+                        let next = Self::next_rename_boundary(&value, cursor);
+                        self.rename_selected_range = cursor..next;
+                        self.rename_selection_reversed = false;
+                    }
+                    self.replace_rename_selection("", cx);
+                    cx.stop_propagation();
                 }
                 _ => {}
             }
@@ -1057,7 +1528,7 @@ impl EntityInputHandler for MainListView {
     ) -> Option<UTF16Selection> {
         self.pane.read(cx).rename_index.map(|_| UTF16Selection {
             range: self.rename_range_to_utf16(&self.rename_selected_range, cx),
-            reversed: false,
+            reversed: self.rename_selection_reversed,
         })
     }
 
@@ -1122,6 +1593,7 @@ impl EntityInputHandler for MainListView {
                 inserted.start + start..inserted.start + end
             })
             .unwrap_or(inserted.end..inserted.end);
+        self.rename_selection_reversed = false;
 
         self.pane.update(cx, |pane, cx| {
             pane.set_rename_buffer(replacement);
@@ -1131,26 +1603,46 @@ impl EntityInputHandler for MainListView {
 
     fn bounds_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        range_utf16: Range<usize>,
         element_bounds: Bounds<Pixels>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        Some(element_bounds)
+        let line = self.rename_layout.as_ref()?;
+        let range = self.rename_range_from_utf16(&range_utf16, cx);
+        Some(Bounds::from_corners(
+            point(
+                element_bounds.left() + line.x_for_index(range.start),
+                element_bounds.top(),
+            ),
+            point(
+                element_bounds.left() + line.x_for_index(range.end),
+                element_bounds.bottom(),
+            ),
+        ))
     }
 
     fn character_index_for_point(
         &mut self,
-        _point: Point<Pixels>,
+        point: Point<Pixels>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.rename_offset_to_utf16(self.rename_selected_range.end, cx))
+        let index = self.rename_index_for_mouse_position(point);
+        Some(self.rename_offset_to_utf16(index, cx))
     }
 }
 
 impl Render for MainListView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.rename_blur_subscription.is_none() {
+            self.rename_blur_subscription =
+                Some(cx.on_blur(&self.focus_handle, window, |this, _window, cx| {
+                    if this.pane.read(cx).rename_index.is_some() {
+                        this.pane.update(cx, |pane, cx| pane.commit_rename(cx));
+                    }
+                }));
+        }
         let (items, rename_index, sort_mode, is_loading, view_mode) = {
             let pane = self.pane.read(cx);
             (
@@ -1168,12 +1660,22 @@ impl Render for MainListView {
         };
         if rename_index != self.last_rename_index {
             self.rename_marked_range = None;
-            if rename_index.is_some() {
-                let cursor = self.pane.read(cx).rename_buffer.len();
-                self.rename_selected_range = cursor..cursor;
+            self.rename_layout = None;
+            self.rename_bounds = None;
+            self.rename_is_selecting = false;
+            if let Some(index) = rename_index {
+                self.rename_selected_range = items
+                    .get(index)
+                    .map(initial_rename_selection)
+                    .unwrap_or_else(|| {
+                        let cursor = self.pane.read(cx).rename_buffer.len();
+                        cursor..cursor
+                    });
+                self.rename_selection_reversed = false;
                 self.focus_handle.focus(window);
             } else {
                 self.rename_selected_range = 0..0;
+                self.rename_selection_reversed = false;
             }
             self.last_rename_index = rename_index;
         }
@@ -1459,13 +1961,29 @@ fn grid_columns_for_width(width: Pixels) -> usize {
 }
 
 fn file_type_label(item: &FileItem) -> String {
-    if item.is_dir {
-        return "文件夹".to_string();
+    match item.kind {
+        FileKind::Application => return "应用程序".to_string(),
+        FileKind::Executable => return "Unix 可执行程序".to_string(),
+        FileKind::Folder => return "文件夹".to_string(),
+        _ => {}
     }
     item.extension
         .as_deref()
         .map(|extension| extension.to_ascii_uppercase())
         .unwrap_or_else(|| "文件".to_string())
+}
+
+fn initial_rename_selection(item: &FileItem) -> Range<usize> {
+    if item.is_dir {
+        return 0..item.name.len();
+    }
+
+    let extension_start = item
+        .name
+        .rfind('.')
+        .filter(|index| *index > 0)
+        .unwrap_or(item.name.len());
+    0..extension_start
 }
 
 fn abbreviated_grid_name(name: &str, max_units: usize) -> String {
@@ -1491,10 +2009,12 @@ fn abbreviated_grid_name(name: &str, max_units: usize) -> String {
 #[cfg(test)]
 mod grid_name_tests {
     use super::{
-        DetailColumn, DetailColumnWidths, abbreviated_grid_name, grid_columns_for_width,
-        marquee_bounds,
+        DetailColumn, DetailColumnWidths, MainListView, abbreviated_grid_name,
+        grid_columns_for_width, initial_rename_selection, marquee_bounds,
     };
+    use crate::models::{FileItem, FileKind};
     use gpui::{point, px};
+    use std::path::PathBuf;
 
     #[test]
     fn unselected_grid_names_have_a_visible_ellipsis() {
@@ -1538,5 +2058,43 @@ mod grid_name_tests {
         assert_eq!(grid_columns_for_width(px(80.0)), 1);
         assert_eq!(grid_columns_for_width(px(450.0)), 4);
         assert_eq!(grid_columns_for_width(px(900.0)), 8);
+    }
+
+    #[test]
+    fn file_rename_selects_the_stem_and_preserves_the_extension() {
+        let file = FileItem {
+            path: PathBuf::from("/tmp/archive.tar.gz"),
+            name: "archive.tar.gz".to_string(),
+            is_dir: false,
+            extension: Some("gz".to_string()),
+            size: 1,
+            modified_unix: 0,
+            modified: String::new(),
+            is_hidden: false,
+            kind: FileKind::Archive,
+        };
+        let hidden_file = FileItem {
+            name: ".env".to_string(),
+            path: PathBuf::from("/tmp/.env"),
+            extension: None,
+            kind: FileKind::Other,
+            ..file.clone()
+        };
+
+        assert_eq!(initial_rename_selection(&file), 0..11);
+        assert_eq!(initial_rename_selection(&hidden_file), 0..4);
+    }
+
+    #[test]
+    fn rename_cursor_moves_across_multibyte_characters() {
+        let value = "A中文😀B";
+        let after_emoji = value.find('B').unwrap();
+
+        assert_eq!(MainListView::next_rename_boundary(value, 0), 1);
+        assert_eq!(MainListView::next_rename_boundary(value, 1), 4);
+        assert_eq!(
+            MainListView::previous_rename_boundary(value, after_emoji),
+            value.find('😀').unwrap()
+        );
     }
 }
