@@ -218,6 +218,12 @@ fn view_mode_button(
         .mb_1()
         .ml_1()
         .rounded_sm()
+        .border_1()
+        .border_color(if active {
+            theme::accent()
+        } else {
+            theme::border()
+        })
         .bg(if active {
             theme::accent_soft()
         } else {
