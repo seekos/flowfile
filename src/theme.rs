@@ -3,7 +3,7 @@ use gpui::{Hsla, Pixels, WindowAppearance, px, rgb};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static DARK_MODE: AtomicBool = AtomicBool::new(false);
-const UI_TEXT_SCALE: f32 = 1.125;
+const UI_TEXT_SCALE: f32 = 1.25;
 
 /// Keeps the application typography on one coherent scale while preserving
 /// the compact density expected from a multi-pane file manager.

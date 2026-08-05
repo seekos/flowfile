@@ -30,7 +30,7 @@ use std::{
     sync::Arc,
 };
 
-const DETAILS_ICON_WIDTH: f32 = 40.0;
+const DETAILS_ICON_WIDTH: f32 = 42.0;
 const GRID_CARD_TARGET_WIDTH: f32 = 112.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -393,8 +393,8 @@ impl MainListView {
             .flex()
             .items_center()
             .justify_center()
-            .w(px(32.0))
-            .h(px(26.0))
+            .w(px(34.0))
+            .h(px(28.0))
             .rounded_sm()
             .bg(color.opacity(0.13))
             .text_color(color)
@@ -410,19 +410,19 @@ impl MainListView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .size(px(82.0))
+                .size(px(86.0))
                 .child(
                     div()
                         .relative()
-                        .w(px(68.0))
-                        .h(px(52.0))
+                        .w(px(72.0))
+                        .h(px(55.0))
                         .child(
                             div()
                                 .absolute()
                                 .top_0()
                                 .left(px(4.0))
-                                .w(px(30.0))
-                                .h(px(12.0))
+                                .w(px(32.0))
+                                .h(px(13.0))
                                 .rounded_t_sm()
                                 .bg(theme::folder().opacity(0.82)),
                         )
@@ -432,7 +432,7 @@ impl MainListView {
                                 .bottom_0()
                                 .left_0()
                                 .w_full()
-                                .h(px(44.0))
+                                .h(px(47.0))
                                 .rounded_sm()
                                 .border_1()
                                 .border_color(theme::folder().opacity(0.88))
@@ -469,14 +469,14 @@ impl MainListView {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(82.0))
+            .size(px(86.0))
             .child(
                 div()
                     .flex()
                     .items_end()
                     .justify_center()
-                    .w(px(54.0))
-                    .h(px(68.0))
+                    .w(px(58.0))
+                    .h(px(72.0))
                     .pb_2()
                     .rounded_sm()
                     .border_1()
@@ -536,7 +536,7 @@ impl MainListView {
 
         match kind {
             FileKind::Application => {
-                let icon_edge = if is_large { 62.0 } else { 26.0 };
+                let icon_edge = if is_large { 66.0 } else { 28.0 };
                 let inset = if is_large { 8.0 } else { 3.0 };
                 div()
                     .flex()
@@ -570,8 +570,8 @@ impl MainListView {
                     .into_any_element()
             }
             FileKind::Executable => {
-                let width = if is_large { 68.0 } else { 32.0 };
-                let height = if is_large { 52.0 } else { 25.0 };
+                let width = if is_large { 72.0 } else { 34.0 };
+                let height = if is_large { 55.0 } else { 27.0 };
                 div()
                     .flex()
                     .items_center()
@@ -972,7 +972,7 @@ impl MainListView {
             .items_center()
             .w_full()
             .min_w(px(widths.total()))
-            .h(px(38.0))
+            .h(px(40.0))
             .border_b_1()
             .border_color(theme::surface_subtle())
             .bg(if is_selected {
@@ -1018,7 +1018,7 @@ impl MainListView {
                     .flex_shrink_0()
                     .w(px(DETAILS_ICON_WIDTH))
                     .pl_2()
-                    .child(Self::file_visual(&item, thumbnail, 32.0)),
+                    .child(Self::file_visual(&item, thumbnail, 34.0)),
             )
             .child(self.name_cell(&item, renaming, &rename_buffer, widths.name, input_entity))
             .child(
@@ -1086,7 +1086,7 @@ impl MainListView {
             deferred(
                 div()
                     .absolute()
-                    .top(px(96.0))
+                    .top(px(100.0))
                     .left_0()
                     .right_0()
                     .flex()
@@ -1099,7 +1099,7 @@ impl MainListView {
             deferred(
                 div()
                     .absolute()
-                    .top(px(96.0))
+                    .top(px(100.0))
                     .left_0()
                     .right_0()
                     .flex()
@@ -1153,7 +1153,7 @@ impl MainListView {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(86.0))
+            .size(px(90.0))
             .rounded_sm()
             .border_1()
             .border_color(if is_selected {
@@ -1162,7 +1162,7 @@ impl MainListView {
                 theme::surface()
             })
             .bg(theme::surface())
-            .child(Self::file_visual(&item, thumbnail, 82.0));
+            .child(Self::file_visual(&item, thumbnail, 86.0));
 
         div()
             .on_children_prepainted(move |bounds, _, _| {
@@ -1177,7 +1177,7 @@ impl MainListView {
             .items_center()
             .min_w_0()
             .flex_1()
-            .h(px(132.0))
+            .h(px(136.0))
             .px_1()
             .pt_2()
             .pb_1()
@@ -1763,7 +1763,7 @@ impl Render for MainListView {
                         rows.map(|row| {
                             let first = row * columns;
                             let mut row_element =
-                                div().flex().items_start().w_full().h(px(140.0)).p_1();
+                                div().flex().items_start().w_full().h(px(144.0)).p_1();
                             for index in first..(first + columns) {
                                 let item = this.pane.read(cx).items.get(index).cloned();
                                 if let Some(item) = item {

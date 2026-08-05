@@ -89,7 +89,7 @@ impl Render for PaneView {
                 theme::border_strong()
             })
             .bg(theme::surface())
-            .on_click(move |_, _, cx| {
+            .capture_any_mouse_down(move |_, _, cx| {
                 multi_pane.update(cx, |model, cx| {
                     model.set_active_pane(index);
                     cx.notify();
