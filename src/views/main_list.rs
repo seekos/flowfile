@@ -380,7 +380,8 @@ impl MainListView {
         let (label, color) = match item.kind {
             FileKind::Folder => ("▰", theme::folder()),
             FileKind::Application => ("A", theme::file_purple()),
-            FileKind::Executable => (">_", theme::terminal_foreground()),
+            FileKind::Executable => ("BIN", theme::text_secondary()),
+            FileKind::Script => (">_", theme::terminal_foreground()),
             FileKind::Document => ("DOC", theme::file_blue()),
             FileKind::Image => ("IMG", theme::file_green()),
             FileKind::Archive => ("ZIP", theme::file_purple()),
@@ -444,7 +445,8 @@ impl MainListView {
 
         let (label, color) = match item.kind {
             FileKind::Application => ("APP".to_string(), theme::file_purple()),
-            FileKind::Executable => (">_".to_string(), theme::terminal_foreground()),
+            FileKind::Executable => ("BIN".to_string(), theme::text_secondary()),
+            FileKind::Script => (">_".to_string(), theme::terminal_foreground()),
             FileKind::Document => (
                 item.extension
                     .as_deref()
@@ -491,7 +493,7 @@ impl MainListView {
     }
 
     fn file_visual(item: &FileItem, thumbnail: Option<Arc<RenderImage>>, edge: f32) -> AnyElement {
-        if matches!(item.kind, FileKind::Application | FileKind::Executable) {
+        if matches!(item.kind, FileKind::Application | FileKind::Script) {
             return Self::program_icon(item.kind, edge);
         }
 
@@ -569,7 +571,7 @@ impl MainListView {
                     )
                     .into_any_element()
             }
-            FileKind::Executable => {
+            FileKind::Script => {
                 let width = if is_large { 72.0 } else { 34.0 };
                 let height = if is_large { 55.0 } else { 27.0 };
                 div()
@@ -595,7 +597,7 @@ impl MainListView {
                     )
                     .into_any_element()
             }
-            _ => unreachable!("program_icon only handles program file kinds"),
+            _ => unreachable!("program_icon only handles application and script kinds"),
         }
     }
 
@@ -1080,8 +1082,6 @@ impl MainListView {
         let pane_index = self.pane_index;
         let file_name = item.name.clone();
         let abbreviated_name = abbreviated_grid_name(&file_name, 16);
-        let selected_name_width =
-            (file_name.chars().count() as f32 * 7.0 + 16.0).clamp(36.0, 104.0);
         let name_element = if renaming {
             deferred(
                 div()
@@ -1106,7 +1106,7 @@ impl MainListView {
                     .justify_center()
                     .child(
                         div()
-                            .w(px(selected_name_width))
+                            .w(px(104.0))
                             .min_h(px(28.0))
                             .px_1()
                             .py_1()
@@ -1129,6 +1129,7 @@ impl MainListView {
                 .h(px(22.0))
                 .truncate()
                 .text_center()
+                .px_1()
                 .text_size(theme::font(11.0))
                 .font_weight(FontWeight::NORMAL)
                 .text_color(theme::text_primary())
@@ -1964,6 +1965,7 @@ fn file_type_label(item: &FileItem) -> String {
     match item.kind {
         FileKind::Application => return "应用程序".to_string(),
         FileKind::Executable => return "Unix 可执行程序".to_string(),
+        FileKind::Script => return "脚本".to_string(),
         FileKind::Folder => return "文件夹".to_string(),
         _ => {}
     }

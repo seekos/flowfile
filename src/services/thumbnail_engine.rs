@@ -78,8 +78,13 @@ impl ThumbnailEngine {
     }
 
     pub fn key_for(item: &FileItem) -> Option<ThumbnailKey> {
-        (!item.is_dir && !matches!(item.kind, FileKind::Application | FileKind::Executable))
-            .then(|| ThumbnailKey::for_item(item))
+        (!item.is_dir
+            && item.size > 0
+            && matches!(
+                item.kind,
+                FileKind::Image | FileKind::Audio | FileKind::Video
+            ))
+        .then(|| ThumbnailKey::for_item(item))
     }
 
     /// Records the exact viewport set for one pane and cancels work that is no
@@ -343,6 +348,34 @@ mod tests {
 
         assert!(ThumbnailEngine::key_for(&application).is_none());
         assert!(ThumbnailEngine::key_for(&executable).is_none());
+    }
+
+    #[test]
+    fn empty_files_use_default_icons_instead_of_blank_thumbnails() {
+        let mut text_file = item(1);
+        text_file.path = PathBuf::from("/tmp/empty.txt");
+        text_file.name = "empty.txt".to_string();
+        text_file.extension = Some("txt".to_string());
+        text_file.size = 0;
+        text_file.kind = FileKind::Document;
+
+        assert!(ThumbnailEngine::key_for(&text_file).is_none());
+    }
+
+    #[test]
+    fn only_media_files_receive_thumbnail_keys() {
+        let mut file = item(1);
+        assert!(ThumbnailEngine::key_for(&file).is_some());
+
+        for kind in [FileKind::Audio, FileKind::Video] {
+            file.kind = kind;
+            assert!(ThumbnailEngine::key_for(&file).is_some());
+        }
+
+        for kind in [FileKind::Document, FileKind::Archive, FileKind::Other] {
+            file.kind = kind;
+            assert!(ThumbnailEngine::key_for(&file).is_none());
+        }
     }
 
     #[test]

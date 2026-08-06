@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     fs::Metadata,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,6 +12,7 @@ pub enum FileKind {
     Folder,
     Application,
     Executable,
+    Script,
     Document,
     Image,
     Archive,
@@ -54,11 +55,15 @@ impl FileItem {
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or_default();
 
-        let kind = if has_unix_execute_bit(&metadata) {
-            FileKind::Executable
-        } else {
-            Self::kind_for(is_dir, extension.as_deref())
-        };
+        let is_executable = has_unix_execute_bit(&metadata);
+        let kind =
+            if is_script_extension(extension.as_deref()) || (is_executable && has_shebang(&path)) {
+                FileKind::Script
+            } else if is_executable {
+                FileKind::Executable
+            } else {
+                Self::kind_for(is_dir, extension.as_deref())
+            };
 
         Self {
             kind,
@@ -144,6 +149,44 @@ fn has_unix_execute_bit(_metadata: &Metadata) -> bool {
     false
 }
 
+fn is_script_extension(extension: Option<&str>) -> bool {
+    matches!(
+        extension.unwrap_or_default(),
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "command"
+            | "py"
+            | "pyw"
+            | "rb"
+            | "pl"
+            | "php"
+            | "lua"
+            | "js"
+            | "mjs"
+            | "cjs"
+            | "ts"
+            | "jsx"
+            | "tsx"
+            | "awk"
+            | "sed"
+            | "tcl"
+            | "expect"
+            | "scpt"
+            | "applescript"
+    )
+}
+
+fn has_shebang(path: &Path) -> bool {
+    use std::io::Read as _;
+
+    let mut prefix = [0; 2];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut prefix))
+        .is_ok()
+        && prefix == *b"#!"
+}
+
 fn natural_name_cmp(left: &FileItem, right: &FileItem) -> Ordering {
     left.name
         .to_lowercase()
@@ -182,7 +225,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn executable_file_has_unix_executable_kind() {
+    fn executable_script_has_script_kind() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempdir().expect("create temporary directory");
@@ -201,7 +244,47 @@ mod tests {
             false,
         );
 
-        assert_eq!(item.kind, FileKind::Executable);
+        assert_eq!(item.kind, FileKind::Script);
         assert!(!item.is_dir);
+    }
+
+    #[test]
+    fn script_extension_has_script_kind_without_execute_permission() {
+        let directory = tempdir().expect("create temporary directory");
+        let path = directory.path().join("build.sh");
+        fs::write(&path, b"echo ready\n").expect("create script file");
+
+        let item = FileItem::from_metadata(
+            PathBuf::from(&path),
+            "build.sh".to_string(),
+            fs::metadata(&path).expect("read script metadata"),
+            false,
+        );
+
+        assert_eq!(item.kind, FileKind::Script);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_binary_keeps_a_non_script_kind() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("create temporary directory");
+        let path = directory.path().join("binary");
+        fs::write(&path, [0xcf, 0xfa, 0xed, 0xfe]).expect("create executable file");
+        let mut permissions = fs::metadata(&path)
+            .expect("read executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("set executable permission");
+
+        let item = FileItem::from_metadata(
+            PathBuf::from(&path),
+            "binary".to_string(),
+            fs::metadata(&path).expect("read executable metadata"),
+            false,
+        );
+
+        assert_eq!(item.kind, FileKind::Executable);
     }
 }

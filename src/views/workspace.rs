@@ -1,6 +1,10 @@
 use super::{
-    context_menu::ContextMenuView, multi_pane_container::MultiPaneContainerView,
-    preferences::PreferencesModal, sidebar::SidebarView, status_bar::StatusBar,
+    context_menu::ContextMenuView,
+    multi_pane_container::MultiPaneContainerView,
+    preferences::PreferencesModal,
+    search_bar::{next_char_boundary, previous_char_boundary},
+    sidebar::SidebarView,
+    status_bar::StatusBar,
     tooltip::delayed_tooltip,
 };
 use crate::{
@@ -68,6 +72,7 @@ pub struct WorkspaceView {
     focus_handle: FocusHandle,
     modal_focus_handle: FocusHandle,
     modal: Option<ModalState>,
+    modal_cursor_offset: usize,
     modal_error: Option<String>,
     quick_look: Option<QuickLookState>,
     quick_look_generation: u64,
@@ -219,6 +224,7 @@ impl WorkspaceView {
             focus_handle,
             modal_focus_handle: cx.focus_handle(),
             modal: None,
+            modal_cursor_offset: 0,
             modal_error: None,
             quick_look: None,
             quick_look_generation: 0,
@@ -293,7 +299,8 @@ impl WorkspaceView {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let text = text.replace(['\n', '\r'], " ");
             if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
-                value.push_str(&text);
+                insert_at_cursor(value, &mut self.modal_cursor_offset, &text);
+                self.modal_error = None;
                 cx.notify();
                 return;
             }
@@ -331,6 +338,7 @@ impl WorkspaceView {
             return;
         }
         self.modal = Some(ModalState::PermanentDelete { paths });
+        self.modal_cursor_offset = 0;
         self.modal_error = None;
         self.modal_focus_handle.focus(window);
         cx.notify();
@@ -607,6 +615,7 @@ impl WorkspaceView {
         if self.modal.is_some() {
             return;
         }
+        self.modal_cursor_offset = value.len();
         self.modal = Some(ModalState::NameInput { kind, value });
         self.modal_error = None;
         self.modal_focus_handle.focus(window);
@@ -640,35 +649,70 @@ impl WorkspaceView {
 
     fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.modal = None;
+        self.modal_cursor_offset = 0;
         self.modal_error = None;
         self.focus_handle.focus(window);
         cx.notify();
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(modal) = &mut self.modal else {
+        if self.modal.is_none() {
             return;
-        };
+        }
         match event.keystroke.key.as_str() {
             "escape" => self.close_modal(window, cx),
             "enter" => self.confirm_modal(window, cx),
+            "left" => {
+                if let Some(ModalState::NameInput { value, .. }) = &self.modal {
+                    self.modal_cursor_offset =
+                        previous_char_boundary(value, self.modal_cursor_offset);
+                    cx.notify();
+                }
+            }
+            "right" => {
+                if let Some(ModalState::NameInput { value, .. }) = &self.modal {
+                    self.modal_cursor_offset = next_char_boundary(value, self.modal_cursor_offset);
+                    cx.notify();
+                }
+            }
+            "home" => {
+                if matches!(self.modal, Some(ModalState::NameInput { .. })) {
+                    self.modal_cursor_offset = 0;
+                    cx.notify();
+                }
+            }
+            "end" => {
+                if let Some(ModalState::NameInput { value, .. }) = &self.modal {
+                    self.modal_cursor_offset = value.len();
+                    cx.notify();
+                }
+            }
             "backspace" => {
-                if let ModalState::NameInput { value, .. } = modal {
-                    value.pop();
+                if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
+                    backspace_at_cursor(value, &mut self.modal_cursor_offset);
+                    self.modal_error = None;
+                    cx.notify();
+                }
+            }
+            "delete" => {
+                if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
+                    delete_at_cursor(value, &mut self.modal_cursor_offset);
+                    self.modal_error = None;
                     cx.notify();
                 }
             }
             _ => {
-                if let ModalState::NameInput { value, .. } = modal
+                if let Some(ModalState::NameInput { value, .. }) = &mut self.modal
                     && let Some(text) = &event.keystroke.key_char
                     && !text.chars().any(char::is_control)
                 {
-                    value.push_str(text);
+                    insert_at_cursor(value, &mut self.modal_cursor_offset, text);
                     self.modal_error = None;
                     cx.notify();
                 }
             }
         }
+        cx.stop_propagation();
     }
 
     fn layout_button(
@@ -981,7 +1025,9 @@ impl WorkspaceView {
                         ("新建文本文件", "创建一个空白的 UTF-8 文件", "创建")
                     }
                 };
-                let value: SharedString = value.into();
+                let cursor = self.modal_cursor_offset.min(value.len());
+                let value_before_cursor: SharedString = value[..cursor].to_string().into();
+                let value_after_cursor: SharedString = value[cursor..].to_string().into();
                 div()
                     .w(px(390.0))
                     .p_5()
@@ -1022,8 +1068,34 @@ impl WorkspaceView {
                             .font_family("SF Mono")
                             .text_size(theme::font(11.0))
                             .text_color(theme::text_primary())
-                            .child(div().min_w_0().flex_1().truncate().child(value))
-                            .child(div().w(px(1.0)).h(px(16.0)).bg(theme::accent())),
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .whitespace_nowrap()
+                                            .child(value_before_cursor),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .w(px(1.0))
+                                            .h(px(16.0))
+                                            .bg(theme::accent()),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .truncate()
+                                            .child(value_after_cursor),
+                                    ),
+                            ),
                     )
                     .when_some(modal_error, |card, error| {
                         card.child(
@@ -1472,5 +1544,52 @@ fn syntax_line_color(line: &str) -> gpui::Hsla {
         theme::file_purple()
     } else {
         theme::text_primary()
+    }
+}
+
+fn insert_at_cursor(value: &mut String, cursor: &mut usize, text: &str) {
+    let offset = (*cursor).min(value.len());
+    value.insert_str(offset, text);
+    *cursor = offset + text.len();
+}
+
+fn backspace_at_cursor(value: &mut String, cursor: &mut usize) {
+    let offset = (*cursor).min(value.len());
+    let previous = previous_char_boundary(value, offset);
+    if previous < offset {
+        value.replace_range(previous..offset, "");
+        *cursor = previous;
+    }
+}
+
+fn delete_at_cursor(value: &mut String, cursor: &mut usize) {
+    let offset = (*cursor).min(value.len());
+    let next = next_char_boundary(value, offset);
+    if offset < next {
+        value.replace_range(offset..next, "");
+    }
+    *cursor = offset;
+}
+
+#[cfg(test)]
+mod modal_name_input_tests {
+    use super::{backspace_at_cursor, delete_at_cursor, insert_at_cursor};
+
+    #[test]
+    fn cursor_edits_work_at_the_middle_of_file_names() {
+        let mut value = "新建文件夹".to_string();
+        let mut cursor = "新建".len();
+
+        insert_at_cursor(&mut value, &mut cursor, "测试");
+        assert_eq!(value, "新建测试文件夹");
+        assert_eq!(cursor, "新建测试".len());
+
+        backspace_at_cursor(&mut value, &mut cursor);
+        assert_eq!(value, "新建测文件夹");
+        assert_eq!(cursor, "新建测".len());
+
+        delete_at_cursor(&mut value, &mut cursor);
+        assert_eq!(value, "新建测件夹");
+        assert_eq!(cursor, "新建测".len());
     }
 }
