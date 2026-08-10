@@ -2,7 +2,7 @@ use super::{
     context_menu::ContextMenuView,
     multi_pane_container::MultiPaneContainerView,
     preferences::PreferencesModal,
-    search_bar::{next_char_boundary, previous_char_boundary},
+    search_bar::{clamp_char_range, next_char_boundary, previous_char_boundary},
     sidebar::SidebarView,
     status_bar::StatusBar,
     tooltip::delayed_tooltip,
@@ -25,11 +25,151 @@ use crate::{
     theme,
 };
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Render, ScrollWheelEvent,
-    SharedString, StyledImage, Timer, Window, black, div, img, prelude::*, px, uniform_list,
+    AnyElement, App, Bounds, Context, Element, ElementId, Entity, FocusHandle, Focusable,
+    FontWeight, GlobalElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, Pixels, Point, Render, ScrollWheelEvent,
+    ShapedLine, SharedString, Style, StyledImage, TextRun, Timer, Window, black, div, fill, img,
+    point, prelude::*, px, relative, size, uniform_list,
 };
-use std::{path::PathBuf, time::Duration};
+use std::{ops::Range, path::PathBuf, time::Duration};
+
+struct ModalNameTextElement {
+    input: Entity<WorkspaceView>,
+}
+
+struct ModalNamePrepaintState {
+    line: Option<ShapedLine>,
+    cursor: Option<PaintQuad>,
+    selection: Option<PaintQuad>,
+}
+
+impl IntoElement for ModalNameTextElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for ModalNameTextElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ModalNamePrepaintState;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let input = self.input.read(cx);
+        let value = input.modal_name().unwrap_or_default();
+        let content: SharedString = value.clone().into();
+        let selected_range = input
+            .modal_selection
+            .clone()
+            .map(|range| clamp_char_range(&content, range))
+            .unwrap_or_else(|| 0..0);
+        let cursor_offset = input.modal_cursor_offset.min(content.len());
+        let style = window.text_style();
+        let run = TextRun {
+            len: content.len(),
+            font: style.font(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(content, font_size, &[run], None);
+        let cursor_x = line.x_for_index(cursor_offset);
+        let (selection, cursor) = if selected_range.is_empty() {
+            (
+                None,
+                Some(fill(
+                    Bounds::new(
+                        point(bounds.left() + cursor_x, bounds.top()),
+                        size(px(1.0), bounds.size.height),
+                    ),
+                    theme::accent(),
+                )),
+            )
+        } else {
+            (
+                Some(fill(
+                    Bounds::from_corners(
+                        point(
+                            bounds.left() + line.x_for_index(selected_range.start),
+                            bounds.top(),
+                        ),
+                        point(
+                            bounds.left() + line.x_for_index(selected_range.end),
+                            bounds.bottom(),
+                        ),
+                    ),
+                    theme::accent_soft(),
+                )),
+                None,
+            )
+        };
+
+        ModalNamePrepaintState {
+            line: Some(line),
+            cursor,
+            selection,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(selection) = prepaint.selection.take() {
+            window.paint_quad(selection);
+        }
+        let line = prepaint.line.take().expect("modal name line was shaped");
+        line.paint(bounds.origin, window.line_height(), window, cx)
+            .expect("modal name line should paint");
+        if let Some(cursor) = prepaint.cursor.take() {
+            window.paint_quad(cursor);
+        }
+        self.input.update(cx, |input, _| {
+            input.modal_name_layout = Some(line);
+            input.modal_name_bounds = Some(bounds);
+        });
+    }
+}
 
 #[derive(Clone)]
 enum ModalState {
@@ -73,6 +213,11 @@ pub struct WorkspaceView {
     modal_focus_handle: FocusHandle,
     modal: Option<ModalState>,
     modal_cursor_offset: usize,
+    modal_selection: Option<Range<usize>>,
+    modal_selection_anchor: Option<usize>,
+    modal_is_selecting: bool,
+    modal_name_layout: Option<ShapedLine>,
+    modal_name_bounds: Option<Bounds<Pixels>>,
     modal_error: Option<String>,
     quick_look: Option<QuickLookState>,
     quick_look_generation: u64,
@@ -225,6 +370,11 @@ impl WorkspaceView {
             modal_focus_handle: cx.focus_handle(),
             modal: None,
             modal_cursor_offset: 0,
+            modal_selection: None,
+            modal_selection_anchor: None,
+            modal_is_selecting: false,
+            modal_name_layout: None,
+            modal_name_bounds: None,
             modal_error: None,
             quick_look: None,
             quick_look_generation: 0,
@@ -298,8 +448,8 @@ impl WorkspaceView {
     fn on_paste(&mut self, _: &PasteFiles, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let text = text.replace(['\n', '\r'], " ");
-            if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
-                insert_at_cursor(value, &mut self.modal_cursor_offset, &text);
+            if matches!(self.modal, Some(ModalState::NameInput { .. })) {
+                self.replace_modal_text(&text);
                 self.modal_error = None;
                 cx.notify();
                 return;
@@ -617,9 +767,113 @@ impl WorkspaceView {
         }
         self.modal_cursor_offset = value.len();
         self.modal = Some(ModalState::NameInput { kind, value });
+        self.modal_selection = None;
+        self.modal_selection_anchor = None;
+        self.modal_is_selecting = false;
+        self.modal_name_layout = None;
+        self.modal_name_bounds = None;
         self.modal_error = None;
         self.modal_focus_handle.focus(window);
         cx.notify();
+    }
+
+    fn modal_name(&self) -> Option<String> {
+        match &self.modal {
+            Some(ModalState::NameInput { value, .. }) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    fn modal_index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+        let (Some(bounds), Some(line)) = (
+            self.modal_name_bounds.as_ref(),
+            self.modal_name_layout.as_ref(),
+        ) else {
+            return self.modal_cursor_offset;
+        };
+        if position.x <= bounds.left() {
+            return 0;
+        }
+        if position.x >= bounds.right() {
+            return line.text.len();
+        }
+        line.closest_index_for_x(position.x - bounds.left())
+    }
+
+    fn set_modal_selection(&mut self, anchor: usize, offset: usize) {
+        self.modal_cursor_offset = offset;
+        self.modal_selection = (anchor != offset).then(|| {
+            let (start, end) = if anchor <= offset {
+                (anchor, offset)
+            } else {
+                (offset, anchor)
+            };
+            start..end
+        });
+    }
+
+    fn replace_modal_text(&mut self, text: &str) {
+        let Some(value) = self.modal_name() else {
+            return;
+        };
+        let range = self
+            .modal_selection
+            .take()
+            .map(|range| clamp_char_range(&value, range))
+            .unwrap_or_else(|| {
+                let cursor = self.modal_cursor_offset.min(value.len());
+                cursor..cursor
+            });
+        let mut replacement = value;
+        replacement.replace_range(range.clone(), text);
+        if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
+            *value = replacement;
+        }
+        self.modal_cursor_offset = range.start + text.len();
+        self.modal_selection_anchor = None;
+        self.modal_name_layout = None;
+        self.modal_name_bounds = None;
+    }
+
+    fn on_modal_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.modal_focus_handle.focus(window);
+        let offset = self.modal_index_for_mouse_position(event.position);
+        self.modal_selection_anchor = Some(offset);
+        self.modal_is_selecting = true;
+        self.modal_selection = None;
+        self.modal_cursor_offset = offset;
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn on_modal_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_is_selecting
+            && event.dragging()
+            && let Some(anchor) = self.modal_selection_anchor
+        {
+            let offset = self.modal_index_for_mouse_position(event.position);
+            self.set_modal_selection(anchor, offset);
+            cx.notify();
+        }
+    }
+
+    fn on_modal_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.modal_is_selecting = false;
     }
 
     fn confirm_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -650,6 +904,11 @@ impl WorkspaceView {
     fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.modal = None;
         self.modal_cursor_offset = 0;
+        self.modal_selection = None;
+        self.modal_selection_anchor = None;
+        self.modal_is_selecting = false;
+        self.modal_name_layout = None;
+        self.modal_name_bounds = None;
         self.modal_error = None;
         self.focus_handle.focus(window);
         cx.notify();
@@ -659,54 +918,86 @@ impl WorkspaceView {
         if self.modal.is_none() {
             return;
         }
+        if event.keystroke.modifiers.platform
+            && event.keystroke.key == "a"
+            && let Some(ModalState::NameInput { value, .. }) = &self.modal
+        {
+            self.modal_selection = Some(0..value.len());
+            self.modal_selection_anchor = None;
+            self.modal_cursor_offset = value.len();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         match event.keystroke.key.as_str() {
             "escape" => self.close_modal(window, cx),
             "enter" => self.confirm_modal(window, cx),
             "left" => {
                 if let Some(ModalState::NameInput { value, .. }) = &self.modal {
-                    self.modal_cursor_offset =
-                        previous_char_boundary(value, self.modal_cursor_offset);
+                    self.modal_cursor_offset = self.modal_selection.as_ref().map_or_else(
+                        || previous_char_boundary(value, self.modal_cursor_offset),
+                        |range| range.start,
+                    );
+                    self.modal_selection = None;
                     cx.notify();
                 }
             }
             "right" => {
                 if let Some(ModalState::NameInput { value, .. }) = &self.modal {
-                    self.modal_cursor_offset = next_char_boundary(value, self.modal_cursor_offset);
+                    self.modal_cursor_offset = self.modal_selection.as_ref().map_or_else(
+                        || next_char_boundary(value, self.modal_cursor_offset),
+                        |range| range.end,
+                    );
+                    self.modal_selection = None;
                     cx.notify();
                 }
             }
             "home" => {
                 if matches!(self.modal, Some(ModalState::NameInput { .. })) {
                     self.modal_cursor_offset = 0;
+                    self.modal_selection = None;
                     cx.notify();
                 }
             }
             "end" => {
                 if let Some(ModalState::NameInput { value, .. }) = &self.modal {
                     self.modal_cursor_offset = value.len();
+                    self.modal_selection = None;
                     cx.notify();
                 }
             }
             "backspace" => {
-                if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
+                if self.modal_selection.is_some() {
+                    self.replace_modal_text("");
+                    self.modal_error = None;
+                    cx.notify();
+                } else if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
                     backspace_at_cursor(value, &mut self.modal_cursor_offset);
+                    self.modal_name_layout = None;
+                    self.modal_name_bounds = None;
                     self.modal_error = None;
                     cx.notify();
                 }
             }
             "delete" => {
-                if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
+                if self.modal_selection.is_some() {
+                    self.replace_modal_text("");
+                    self.modal_error = None;
+                    cx.notify();
+                } else if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
                     delete_at_cursor(value, &mut self.modal_cursor_offset);
+                    self.modal_name_layout = None;
+                    self.modal_name_bounds = None;
                     self.modal_error = None;
                     cx.notify();
                 }
             }
             _ => {
-                if let Some(ModalState::NameInput { value, .. }) = &mut self.modal
+                if matches!(self.modal, Some(ModalState::NameInput { .. }))
                     && let Some(text) = &event.keystroke.key_char
                     && !text.chars().any(char::is_control)
                 {
-                    insert_at_cursor(value, &mut self.modal_cursor_offset, text);
+                    self.replace_modal_text(text);
                     self.modal_error = None;
                     cx.notify();
                 }
@@ -1013,21 +1304,26 @@ impl WorkspaceView {
             .child(self.toolbar(cx))
     }
 
-    fn render_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_modal(
+        &self,
+        cx: &mut Context<Self>,
+        input_entity: Entity<Self>,
+    ) -> Option<AnyElement> {
         let modal = self.modal.clone()?;
         let modal_error = self.modal_error.clone();
 
         let card = match modal {
-            ModalState::NameInput { kind, value } => {
+            ModalState::NameInput { kind, value: _ } => {
                 let (title, detail, button) = match kind {
                     CreateItemKind::Folder => ("新建文件夹", "在当前面板中创建文件夹", "创建"),
                     CreateItemKind::TextFile => {
                         ("新建文本文件", "创建一个空白的 UTF-8 文件", "创建")
                     }
                 };
-                let cursor = self.modal_cursor_offset.min(value.len());
-                let value_before_cursor: SharedString = value[..cursor].to_string().into();
-                let value_after_cursor: SharedString = value[cursor..].to_string().into();
+                let mouse_down_input = input_entity.clone();
+                let mouse_move_input = input_entity.clone();
+                let mouse_up_input = input_entity.clone();
+                let mouse_up_out_input = input_entity.clone();
                 div()
                     .w(px(390.0))
                     .p_5()
@@ -1053,6 +1349,7 @@ impl WorkspaceView {
                     .child(
                         div()
                             .mt_4()
+                            .id("modal-name-input")
                             .flex()
                             .items_center()
                             .h(px(34.0))
@@ -1068,33 +1365,46 @@ impl WorkspaceView {
                             .font_family("SF Mono")
                             .text_size(theme::font(11.0))
                             .text_color(theme::text_primary())
+                            .cursor_text()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                move |event: &MouseDownEvent, window, cx| {
+                                    mouse_down_input.update(cx, |input, cx| {
+                                        input.on_modal_mouse_down(event, window, cx)
+                                    });
+                                    cx.stop_propagation();
+                                },
+                            )
+                            .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+                                mouse_move_input.update(cx, |input, cx| {
+                                    input.on_modal_mouse_move(event, window, cx)
+                                });
+                            })
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                move |event: &MouseUpEvent, window, cx| {
+                                    mouse_up_input.update(cx, |input, cx| {
+                                        input.on_modal_mouse_up(event, window, cx)
+                                    });
+                                },
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                move |event: &MouseUpEvent, window, cx| {
+                                    mouse_up_out_input.update(cx, |input, cx| {
+                                        input.on_modal_mouse_up(event, window, cx)
+                                    });
+                                },
+                            )
                             .child(
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .flex()
-                                    .items_center()
+                                    .h(px(16.0))
                                     .overflow_hidden()
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .whitespace_nowrap()
-                                            .child(value_before_cursor),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .w(px(1.0))
-                                            .h(px(16.0))
-                                            .bg(theme::accent()),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .truncate()
-                                            .child(value_after_cursor),
-                                    ),
+                                    .child(ModalNameTextElement {
+                                        input: input_entity.clone(),
+                                    }),
                             ),
                     )
                     .when_some(modal_error, |card, error| {
@@ -1464,7 +1774,8 @@ impl Focusable for WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let modal = self.render_modal(cx);
+        let input_entity = cx.entity();
+        let modal = self.render_modal(cx, input_entity);
         let quick_look = self.render_quick_look(cx);
         div()
             .id("workspace")
@@ -1547,12 +1858,6 @@ fn syntax_line_color(line: &str) -> gpui::Hsla {
     }
 }
 
-fn insert_at_cursor(value: &mut String, cursor: &mut usize, text: &str) {
-    let offset = (*cursor).min(value.len());
-    value.insert_str(offset, text);
-    *cursor = offset + text.len();
-}
-
 fn backspace_at_cursor(value: &mut String, cursor: &mut usize) {
     let offset = (*cursor).min(value.len());
     let previous = previous_char_boundary(value, offset);
@@ -1573,14 +1878,15 @@ fn delete_at_cursor(value: &mut String, cursor: &mut usize) {
 
 #[cfg(test)]
 mod modal_name_input_tests {
-    use super::{backspace_at_cursor, delete_at_cursor, insert_at_cursor};
+    use super::{backspace_at_cursor, delete_at_cursor};
 
     #[test]
     fn cursor_edits_work_at_the_middle_of_file_names() {
         let mut value = "新建文件夹".to_string();
         let mut cursor = "新建".len();
 
-        insert_at_cursor(&mut value, &mut cursor, "测试");
+        value.insert_str(cursor, "测试");
+        cursor += "测试".len();
         assert_eq!(value, "新建测试文件夹");
         assert_eq!(cursor, "新建测试".len());
 
