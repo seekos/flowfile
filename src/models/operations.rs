@@ -172,6 +172,15 @@ impl FileOperationController {
         self.start_transfer(paths, destination, mode, cx);
     }
 
+    pub fn show_notice(
+        &mut self,
+        notice: impl Into<String>,
+        is_error: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_notice(notice, is_error, cx);
+    }
+
     pub fn move_selected_to_trash(&mut self, cx: &mut Context<Self>) {
         let paths = self.active_selected_paths(cx);
         if paths.is_empty() {

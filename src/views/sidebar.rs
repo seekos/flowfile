@@ -1,20 +1,25 @@
 use super::tooltip::delayed_tooltip;
 use crate::{
     models::{FileDragPayload, FileOperationController, Model, MultiPaneModel, home_directory},
-    services::{FileEngine, FileWatcher, TransferMode},
+    services::{FileEngine, FileWatcher, TransferMode, VolumeInfo},
     theme,
 };
 use gpui::{
     Context, Entity, FontWeight, IntoElement, Render, SharedString, Timer, Window, div, prelude::*,
     px,
 };
-use std::{path::PathBuf, time::Duration};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Clone, Eq, PartialEq)]
 struct SidebarLocation {
     icon: &'static str,
     label: String,
     path: PathBuf,
+    detail: Option<String>,
 }
 
 pub struct SidebarView {
@@ -23,6 +28,9 @@ pub struct SidebarView {
     quick_access: Vec<SidebarLocation>,
     volumes: Vec<SidebarLocation>,
     volumes_loading: bool,
+    engine: FileEngine,
+    ntfs_mounting: HashSet<PathBuf>,
+    ntfs_mount_failures: HashSet<PathBuf>,
     _volumes_watcher: Option<FileWatcher>,
 }
 
@@ -52,6 +60,7 @@ impl SidebarView {
             icon,
             label: label.to_string(),
             path,
+            detail: None,
         })
         .collect();
 
@@ -68,12 +77,13 @@ impl SidebarView {
             .map(|(watcher, receiver)| (Some(watcher), Some(receiver)))
             .unwrap_or((None, None));
         if let Some(volume_events) = volume_events {
+            let watcher_engine = engine.clone();
             cx.spawn(async move |this, cx| {
                 while volume_events.recv().await.is_ok() {
                     Timer::after(Duration::from_millis(150)).await;
                     while volume_events.try_recv().is_ok() {}
 
-                    let result = engine.list_volumes().await;
+                    let result = watcher_engine.list_volumes().await;
                     if this
                         .update(cx, |sidebar, cx| sidebar.apply_volumes(result.ok(), cx))
                         .is_err()
@@ -91,26 +101,92 @@ impl SidebarView {
             quick_access,
             volumes: Vec::new(),
             volumes_loading: true,
+            engine,
+            ntfs_mounting: HashSet::new(),
+            ntfs_mount_failures: HashSet::new(),
             _volumes_watcher: volumes_watcher,
         }
     }
 
-    fn apply_volumes(&mut self, paths: Option<Vec<PathBuf>>, cx: &mut Context<Self>) {
+    fn apply_volumes(&mut self, paths: Option<Vec<VolumeInfo>>, cx: &mut Context<Self>) {
         self.volumes_loading = false;
         if let Some(paths) = paths {
+            let present_paths = paths
+                .iter()
+                .map(|volume| volume.path.clone())
+                .collect::<HashSet<_>>();
+            self.ntfs_mount_failures
+                .retain(|path| present_paths.contains(path) || self.ntfs_mounting.contains(path));
+            let ntfs_to_mount = paths
+                .iter()
+                .find(|volume| {
+                    volume.path.starts_with(Path::new("/Volumes"))
+                        && volume.is_ntfs()
+                        && volume.read_only
+                        && !self.ntfs_mounting.contains(&volume.path)
+                        && !self.ntfs_mount_failures.contains(&volume.path)
+                })
+                .map(|volume| volume.path.clone());
             let volumes = paths
                 .into_iter()
-                .map(|path| SidebarLocation {
+                .map(|volume| SidebarLocation {
                     icon: "◉",
-                    label: volume_label(&path),
-                    path,
+                    label: volume_label(&volume.path),
+                    detail: volume.status_label().map(str::to_string),
+                    path: volume.path,
                 })
                 .collect::<Vec<_>>();
             if self.volumes != volumes {
                 self.volumes = volumes;
                 cx.notify();
             }
+            if let Some(path) = ntfs_to_mount
+                && self.engine.ntfs_auto_mount_available()
+            {
+                self.start_ntfs_auto_mount(path, cx);
+            }
         }
+    }
+
+    fn start_ntfs_auto_mount(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.ntfs_mounting.insert(path.clone());
+        self.operations.update(cx, |operations, cx| {
+            operations.show_notice(
+                format!("正在将 {} 挂载为可写…", volume_label(&path)),
+                false,
+                cx,
+            );
+        });
+
+        let engine = self.engine.clone();
+        let operations = self.operations.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine.auto_mount_ntfs(path.clone()).await;
+            let refreshed_volumes = engine.list_volumes().await.ok();
+            let _ = this.update(cx, |sidebar, cx| {
+                sidebar.ntfs_mounting.remove(&path);
+                match result {
+                    Ok(true) => operations.update(cx, |operations, cx| {
+                        operations.show_notice(
+                            format!("{} 已自动挂载为 NTFS 可写", volume_label(&path)),
+                            false,
+                            cx,
+                        );
+                    }),
+                    Ok(false) => {
+                        sidebar.ntfs_mount_failures.insert(path.clone());
+                    }
+                    Err(error) => {
+                        sidebar.ntfs_mount_failures.insert(path.clone());
+                        operations.update(cx, |operations, cx| {
+                            operations.show_notice(error.to_string(), true, cx);
+                        });
+                    }
+                }
+                sidebar.apply_volumes(refreshed_volumes, cx);
+            });
+        })
+        .detach();
     }
 
     fn section_title(title: &'static str) -> impl IntoElement {
@@ -131,6 +207,7 @@ impl SidebarView {
         let drop_path = path.clone();
         let tooltip = format!("在当前面板中打开 {}", path.display());
         let label: SharedString = location.label.into();
+        let detail = location.detail.map(SharedString::from);
 
         div()
             .id(("sidebar-location", id))
@@ -185,7 +262,21 @@ impl SidebarView {
                     })
                     .child(location.icon),
             )
-            .child(div().min_w_0().flex_1().truncate().child(label))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .child(div().truncate().child(label))
+                    .when_some(detail, |location, detail| {
+                        location
+                            .text_size(theme::font(8.0))
+                            .text_color(theme::text_tertiary())
+                            .child(detail)
+                    }),
+            )
     }
 }
 

@@ -1,4 +1,4 @@
-use super::quick_look::is_text_extension;
+use super::{quick_look::is_text_extension, volume};
 use crate::models::{FileItem, FileKind, SortMode};
 use anyhow::{Context as _, Result};
 use std::{
@@ -59,14 +59,26 @@ impl FileEngine {
             .context("目录读取任务异常终止")?
     }
 
-    pub async fn list_volumes(&self) -> Result<Vec<PathBuf>> {
+    pub async fn list_volumes(&self) -> Result<Vec<volume::VolumeInfo>> {
         self.runtime
-            .spawn(discover_volume_paths(
-                PathBuf::from("/"),
-                PathBuf::from("/Volumes"),
-            ))
+            .spawn(async {
+                let paths =
+                    discover_volume_paths(PathBuf::from("/"), PathBuf::from("/Volumes")).await?;
+                Ok(volume::annotate(paths))
+            })
             .await
             .context("挂载卷读取任务异常终止")?
+    }
+
+    pub fn ntfs_auto_mount_available(&self) -> bool {
+        volume::ntfs_auto_mount_available()
+    }
+
+    pub async fn auto_mount_ntfs(&self, path: PathBuf) -> Result<bool> {
+        self.runtime
+            .spawn_blocking(move || volume::auto_mount_ntfs(&path))
+            .await
+            .context("NTFS 自动挂载任务异常终止")?
     }
 
     pub async fn open_path(&self, path: PathBuf) -> Result<()> {

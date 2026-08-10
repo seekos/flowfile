@@ -377,9 +377,45 @@ impl MainListView {
     }
 
     fn file_icon(item: &FileItem) -> AnyElement {
+        if item.kind == FileKind::Folder {
+            return div()
+                .relative()
+                .w(px(30.0))
+                .h(px(24.0))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(2.0))
+                        .left(px(2.0))
+                        .w(px(13.0))
+                        .h(px(7.0))
+                        .rounded_t_sm()
+                        .bg(theme::folder().opacity(0.76)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom(px(1.0))
+                        .left(px(1.0))
+                        .w(px(28.0))
+                        .h(px(19.0))
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(theme::folder().opacity(0.95))
+                        .bg(theme::folder().opacity(0.82))
+                        .child(
+                            div()
+                                .mt(px(3.0))
+                                .mx(px(3.0))
+                                .h(px(1.0))
+                                .bg(theme::surface().opacity(0.32)),
+                        ),
+                )
+                .into_any_element();
+        }
+
         let (label, color) = match item.kind {
-            FileKind::Folder => ("▰", theme::folder()),
-            FileKind::Application => ("A", theme::file_purple()),
+            FileKind::Application => ("APP", theme::file_purple()),
             FileKind::Executable => ("BIN", theme::text_secondary()),
             FileKind::Script => (">_", theme::terminal_foreground()),
             FileKind::Document => ("DOC", theme::file_blue()),
@@ -388,20 +424,46 @@ impl MainListView {
             FileKind::Audio => ("AUD", theme::file_purple()),
             FileKind::Video => ("VID", theme::file_green()),
             FileKind::Other => ("FILE", theme::text_secondary()),
+            FileKind::Folder => unreachable!(),
         };
 
         div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(34.0))
-            .h(px(28.0))
-            .rounded_sm()
-            .bg(color.opacity(0.13))
-            .text_color(color)
-            .text_size(theme::font(if item.is_dir { 17.0 } else { 8.0 }))
-            .font_weight(FontWeight::BOLD)
-            .child(label)
+            .relative()
+            .w(px(24.0))
+            .h(px(29.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(color.opacity(0.7))
+            .bg(theme::surface())
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .size(px(7.0))
+                    .border_l_1()
+                    .border_b_1()
+                    .border_color(color.opacity(0.55))
+                    .bg(color.opacity(0.16)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(3.0))
+                    .right(px(3.0))
+                    .bottom(px(3.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(9.0))
+                    .rounded(px(2.0))
+                    .bg(color.opacity(0.16))
+                    .text_color(color)
+                    .text_size(theme::font(5.5))
+                    .font_weight(FontWeight::BOLD)
+                    .child(label),
+            )
             .into_any_element()
     }
 
@@ -498,24 +560,29 @@ impl MainListView {
         }
 
         if let Some(thumbnail) = thumbnail {
+            let visual_edge = if edge < 64.0 { 30.0 } else { edge };
             div()
                 .flex()
                 .items_center()
                 .justify_center()
                 .size(px(edge))
-                .overflow_hidden()
-                .rounded_md()
-                .bg(theme::surface_subtle())
                 .child(
-                    img(thumbnail)
-                        .size_full()
-                        .object_fit(ObjectFit::Contain)
-                        .with_loading(|| {
-                            div()
+                    div()
+                        .size(px(visual_edge))
+                        .overflow_hidden()
+                        .rounded_md()
+                        .bg(theme::surface_subtle())
+                        .child(
+                            img(thumbnail)
                                 .size_full()
-                                .bg(theme::surface_subtle())
-                                .into_any_element()
-                        }),
+                                .object_fit(ObjectFit::Contain)
+                                .with_loading(|| {
+                                    div()
+                                        .size_full()
+                                        .bg(theme::surface_subtle())
+                                        .into_any_element()
+                                }),
+                        ),
                 )
                 .into_any_element()
         } else {
@@ -538,7 +605,7 @@ impl MainListView {
 
         match kind {
             FileKind::Application => {
-                let icon_edge = if is_large { 66.0 } else { 28.0 };
+                let icon_edge = if is_large { 66.0 } else { 30.0 };
                 let inset = if is_large { 8.0 } else { 3.0 };
                 div()
                     .flex()
@@ -572,8 +639,8 @@ impl MainListView {
                     .into_any_element()
             }
             FileKind::Script => {
-                let width = if is_large { 72.0 } else { 34.0 };
-                let height = if is_large { 55.0 } else { 27.0 };
+                let width = if is_large { 72.0 } else { 30.0 };
+                let height = if is_large { 55.0 } else { 26.0 };
                 div()
                     .flex()
                     .items_center()

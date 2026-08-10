@@ -7,7 +7,7 @@ use crate::{
     services::{ThumbnailEngine, TransferMode},
     theme,
 };
-use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, Entity, IntoElement, Render, Window, div, prelude::*, px};
 
 pub struct PaneView {
     index: usize,
@@ -151,7 +151,6 @@ impl Render for PaneView {
                     .child(view_mode_button(
                         self.index,
                         "pane-details",
-                        "≡",
                         ViewMode::Details,
                         view_mode,
                         self.pane.clone(),
@@ -160,7 +159,6 @@ impl Render for PaneView {
                     .child(view_mode_button(
                         self.index,
                         "pane-grid",
-                        "▦",
                         ViewMode::Grid,
                         view_mode,
                         self.pane.clone(),
@@ -202,7 +200,6 @@ impl Render for PaneView {
 fn view_mode_button(
     pane_index: usize,
     id: &'static str,
-    glyph: &'static str,
     target: ViewMode,
     current: ViewMode,
     pane: Model<Pane>,
@@ -229,7 +226,6 @@ fn view_mode_button(
         } else {
             theme::surface()
         })
-        .text_size(theme::font(12.0))
         .text_color(if active {
             theme::accent()
         } else {
@@ -240,5 +236,45 @@ fn view_mode_button(
         .on_click(move |_, _, cx| {
             pane.update(cx, |pane, cx| pane.set_view_mode(target, cx));
         })
-        .child(glyph)
+        .child(view_mode_icon(target, active))
+}
+
+fn view_mode_icon(mode: ViewMode, active: bool) -> AnyElement {
+    let color = if active {
+        theme::accent()
+    } else {
+        theme::text_tertiary()
+    };
+    match mode {
+        ViewMode::Details => div()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(2.5))
+            .w(px(15.0))
+            .h(px(14.0))
+            .children((0..3).map(move |_| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(3.0))
+                    .child(div().size(px(2.5)).rounded_full().bg(color))
+                    .child(div().w(px(9.5)).h(px(1.5)).rounded_full().bg(color))
+            }))
+            .into_any_element(),
+        ViewMode::Grid => div()
+            .flex()
+            .flex_wrap()
+            .gap(px(2.0))
+            .size(px(14.0))
+            .children((0..4).map(move |_| {
+                div()
+                    .size(px(6.0))
+                    .rounded(px(1.5))
+                    .border_1()
+                    .border_color(color)
+                    .bg(color.opacity(if active { 0.16 } else { 0.06 }))
+            }))
+            .into_any_element(),
+    }
 }

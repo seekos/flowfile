@@ -1,4 +1,4 @@
-use super::FileEngine;
+use super::{FileEngine, ensure_writable};
 use anyhow::{Context as _, Result, bail};
 use async_channel::Sender;
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,7 @@ impl FileOperationEngine {
     pub async fn create_directory(&self, parent: PathBuf, name: String) -> Result<PathBuf> {
         self.runtime
             .spawn(async move {
+                ensure_writable(&parent)?;
                 validate_file_name(&name)?;
                 let path = available_path(&parent.join(name)).await?;
                 fs::create_dir(&path)
@@ -92,6 +93,7 @@ impl FileOperationEngine {
     pub async fn create_text_file(&self, parent: PathBuf, name: String) -> Result<PathBuf> {
         self.runtime
             .spawn(async move {
+                ensure_writable(&parent)?;
                 validate_file_name(&name)?;
                 let path = available_path(&parent.join(name)).await?;
                 fs::File::create(&path)
@@ -113,6 +115,9 @@ impl FileOperationEngine {
     pub async fn move_to_trash(&self, paths: Vec<PathBuf>) -> Result<()> {
         self.runtime
             .spawn_blocking(move || {
+                for path in &paths {
+                    ensure_writable(path)?;
+                }
                 trash::delete_all(paths.iter()).context("无法将所选项目移到废纸篓")
             })
             .await
@@ -123,6 +128,7 @@ impl FileOperationEngine {
         self.runtime
             .spawn(async move {
                 for path in paths {
+                    ensure_writable(&path)?;
                     let metadata = fs::symlink_metadata(&path)
                         .await
                         .with_context(|| format!("无法读取 {}", path.display()))?;
@@ -170,6 +176,7 @@ impl FileOperationEngine {
 }
 
 async fn rename_path(source: PathBuf, new_name: String) -> Result<PathBuf> {
+    ensure_writable(&source)?;
     validate_file_name(&new_name)?;
     let parent = source.parent().context("无法确定文件所在目录")?;
     let destination = parent.join(new_name);
@@ -210,6 +217,12 @@ async fn execute_transfer(
     conflict_policy: ConflictPolicy,
     progress: Sender<TransferProgress>,
 ) -> Result<Vec<PathBuf>> {
+    ensure_writable(&destination)?;
+    if mode == TransferMode::Move {
+        for source in &sources {
+            ensure_writable(source)?;
+        }
+    }
     if sources.is_empty() {
         bail!("没有可传输的项目");
     }

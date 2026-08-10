@@ -6,6 +6,7 @@ mod quick_look;
 mod search_engine;
 mod terminal_session;
 mod thumbnail_engine;
+mod volume;
 
 pub use file_engine::{DirectorySnapshot, FileEngine, OpenWithApplication};
 pub use file_inspector::FileInspector;
@@ -15,3 +16,4 @@ pub use quick_look::{PreviewKind, QuickLookService};
 pub use search_engine::{SearchEngine, SearchScope};
 pub use terminal_session::SystemTerminal;
 pub use thumbnail_engine::ThumbnailEngine;
+pub use volume::{VolumeInfo, ensure_writable};
