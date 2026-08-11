@@ -28,7 +28,7 @@ if [[ -n "${identity}" ]]; then
           "${FLOWFILE_CODESIGN_TIMESTAMP:-0}" == "1" ]]; then
         sign_args+=(--timestamp)
     fi
-    /usr/bin/codesign "${sign_args[@]}" "${app_path}"
+    /usr/bin/codesign "${sign_args[@]}" "${app_path}" >/dev/null 2>&1
     print "Signed FlowFile with stable identity: ${identity_label}"
 else
     if [[ "${FLOWFILE_REQUIRE_STABLE_SIGNING:-0}" == "1" ]]; then
@@ -37,10 +37,8 @@ else
         exit 1
     fi
 
-    /usr/bin/codesign --force --deep --sign - "${app_path}"
-    print -u2 "Warning: FlowFile was ad-hoc signed because no code-signing identity is installed."
-    print -u2 "macOS may request folder permissions again after the next rebuild."
-    print -u2 "Install an Apple Development certificate or set FLOWFILE_CODESIGN_IDENTITY."
+    /usr/bin/codesign --force --deep --sign - "${app_path}" >/dev/null 2>&1
+    print "Signed FlowFile with an ad-hoc development signature."
 fi
 
 /usr/bin/codesign --verify --deep --strict "${app_path}"

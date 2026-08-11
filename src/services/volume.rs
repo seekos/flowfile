@@ -1,5 +1,6 @@
 use anyhow::{Context as _, Result};
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -35,8 +36,12 @@ struct MountInfo {
     read_only: bool,
 }
 
+// NTFS 可写挂载仍在开发中。保留实现，待功能稳定后再重新开放入口。
+const NTFS_READ_WRITE_MOUNT_ENABLED: bool = false;
+
 pub(crate) fn ntfs_auto_mount_available() -> bool {
-    supports_fskit()
+    NTFS_READ_WRITE_MOUNT_ENABLED
+        && supports_fskit()
         && ntfs_mount_helper().is_some()
         && Command::new("/usr/sbin/pkgutil")
             .args(["--pkg-info", "io.macfuse.installer.components.core"])
@@ -64,6 +69,9 @@ pub(crate) fn auto_mount_ntfs(path: &Path) -> Result<bool> {
     if !device.starts_with("/dev/disk") || !disk_is_external(&device) {
         return Ok(false);
     }
+    let log_offset = fs::metadata("/var/log/mount-ntfs-3g.log")
+        .map(|metadata| metadata.len() as usize)
+        .unwrap_or(0);
 
     let output = Command::new("/usr/bin/osascript")
         .args([
@@ -96,7 +104,10 @@ pub(crate) fn auto_mount_ntfs(path: &Path) -> Result<bool> {
         if error.contains("(-128)") {
             anyhow::bail!("已取消 NTFS 可写挂载授权，磁盘已恢复为只读");
         }
-        anyhow::bail!("NTFS 可写挂载失败，磁盘已恢复为只读：{}", error.trim());
+        anyhow::bail!(mount_failure_message(
+            log_offset,
+            format!("NTFS 可写挂载失败，磁盘已恢复为只读：{}", error.trim())
+        ));
     }
 
     for _ in 0..40 {
@@ -111,7 +122,21 @@ pub(crate) fn auto_mount_ntfs(path: &Path) -> Result<bool> {
     }
 
     restore_native_mount(&device);
-    anyhow::bail!("未能确认 NTFS 可写挂载，磁盘已恢复为系统只读挂载");
+    anyhow::bail!(mount_failure_message(
+        log_offset,
+        "未能确认 NTFS 可写挂载，磁盘已恢复为系统只读挂载".to_string()
+    ));
+}
+
+fn mount_failure_message(log_offset: usize, fallback: String) -> String {
+    let Ok(log) = fs::read("/var/log/mount-ntfs-3g.log") else {
+        return fallback;
+    };
+    let recent = String::from_utf8_lossy(&log[log_offset.min(log.len())..]);
+    if recent.contains("unsafe state") || recent.contains("wasn't safely closed on Windows") {
+        return "该 NTFS 卷未被 Windows 安全关闭，无法安全写入；请在 Windows 运行 chkdsk X: /f，关闭快速启动后完全关机并安全弹出。磁盘已恢复为只读".to_string();
+    }
+    fallback
 }
 
 pub fn inspect_path(path: &Path) -> Option<VolumeInfo> {
@@ -290,7 +315,8 @@ fn is_path_within(path: &Path, mount: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_path_within, parse_diskutil_info, parse_mount_line, parse_mounts, version_supports_fskit,
+        is_path_within, mount_failure_message, parse_diskutil_info, parse_mount_line, parse_mounts,
+        version_supports_fskit,
     };
     use std::path::Path;
 
@@ -338,5 +364,13 @@ mod tests {
         assert!(!version_supports_fskit("15.3.2"));
         assert!(version_supports_fskit("15.4"));
         assert!(version_supports_fskit("26.5.2"));
+    }
+
+    #[test]
+    fn mount_failure_falls_back_when_no_new_log_was_written() {
+        assert_eq!(
+            mount_failure_message(usize::MAX, "挂载失败".to_string()),
+            "挂载失败"
+        );
     }
 }

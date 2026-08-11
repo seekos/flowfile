@@ -24,7 +24,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 - 默认隐藏名称以 `.` 开头的项目，可通过工具栏或设置切换。
 - 侧边栏提供中文“个人文件夹、下载、桌面、文稿”等快速访问入口。
 - 动态读取 `/Volumes`，挂载或弹出卷后通过 `notify` 监听自动更新侧边栏。
-- 识别 NTFS 卷并显示当前读写状态；检测到 NTFS-3G、macFUSE 和外置只读 NTFS 卷时，会通过 macOS 管理员授权自动重新挂载为可写，失败则恢复系统只读挂载。复制、移动、新建、删除和重命名沿用同一套文件操作。
+- 识别 NTFS 卷并显示当前读写状态；应用内的 NTFS 可写重新挂载功能暂时关闭，相关能力将在后续版本继续开发。
 - 当前目录内的文件变化使用 150ms 防抖自动刷新。
 
 ### 列表与大图标网格
@@ -153,9 +153,9 @@ Intel Mac 请将变量名和 target 分别改为 `BINDGEN_EXTRA_CLANG_ARGS_x86_6
 
 ## macOS 文件夹权限与签名
 
-macOS 会根据应用的签名身份记住“桌面、文稿、下载”等受保护目录的授权。临时 ad-hoc 签名会随二进制变化，重新编译后可能再次请求权限。
+默认使用无需证书的 ad-hoc 开发签名。macOS 会根据应用的签名身份记住“桌面、文稿、下载”等受保护目录的授权，因此重新编译后可能再次请求权限。
 
-建议安装 Apple Development 或 Developer ID Application 证书，并始终从同一 `.app` 路径启动。可显式指定签名身份：
+如需正式分发，可选用 Apple Development 或 Developer ID Application 证书，并显式指定签名身份：
 
 ```bash
 FLOWFILE_CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" \
