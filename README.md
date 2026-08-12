@@ -1,6 +1,7 @@
 # FlowFile
 
 ![FlowFile 界面截图](test.png)
+![FlowFile 界面截图](test2.png)
 FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建的 macOS 多面板文件管理器。它以类似 Q-Dir 的 1、2 或 4 面板工作区为核心，同时提供真实文件系统访问、异步文件操作、缩略图、Quick Look、Spotlight 搜索和会话恢复。
 
 当前版本：`0.1.0`，最低支持 macOS 11。
