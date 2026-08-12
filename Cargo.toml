@@ -3,6 +3,7 @@ name = "flowfile"
 version = "0.1.0"
 edition = "2024"
 description = "A multi-pane macOS file manager built with Rust and GPUI"
+license = "MulanPSL-2.0"
 
 [dependencies]
 anyhow = "1"

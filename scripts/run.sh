@@ -34,6 +34,6 @@ cp "${project_dir}/resources/FlowFile.icns" \
     "${app_path}/Contents/Resources/FlowFile.icns"
 cp "${project_dir}/resources/Info.plist" "${app_path}/Contents/Info.plist"
 chmod 755 "${app_path}/Contents/MacOS/flowfile"
-"${script_dir}/sign_macos_app.sh" "${app_path}"
+/usr/bin/codesign --force --deep --sign - "${app_path}" >/dev/null 2>&1
 
 exec /usr/bin/open -W "${app_path}"

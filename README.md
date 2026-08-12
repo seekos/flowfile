@@ -159,55 +159,42 @@ Intel Mac 请将变量名和 target 分别改为 `BINDGEN_EXTRA_CLANG_ARGS_x86_6
 
 ```bash
 FLOWFILE_CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" \
-    ./scripts/package_single_file.sh
+    ./scripts/build.sh
 ```
 
 不允许退回 ad-hoc 签名时启用严格模式：
 
 ```bash
-FLOWFILE_REQUIRE_STABLE_SIGNING=1 ./scripts/package_single_file.sh
+FLOWFILE_REQUIRE_STABLE_SIGNING=1 ./scripts/build.sh
 ```
 
-开发时不要交替启动 `target/.../FlowFile.app` 与 `dist/FlowFile.app`，否则 Launch Services 中可能存在多个相同 Bundle ID 的副本，造成权限对象混淆。
+开发时请使用 `scripts/run.sh` 生成的固定 Debug 应用路径，避免 Launch Services 中出现多个相同 Bundle ID 的副本，造成权限对象混淆。
 
 ## 构建与发布
 
 生成 Release 应用和 DMG：
 
 ```bash
-./scripts/build_macos.sh
+./scripts/build.sh
 ```
+
+可以通过 `-v`（或 `--version`）为本次构建指定版本号；开头的 `v` 可省略：
+
+```bash
+./scripts/build.sh -v v0.1.2
+```
+
+指定的版本会写入应用的 `CFBundleShortVersionString`，并用于 DMG 文件名，但不会修改 `Cargo.toml`。
 
 输出：
 
-- `target/release/bundle/osx/FlowFile.app`
-- `target/release/FlowFile-<version>.dmg`
-
-生成 `dist/` 下的独立二进制、DMG 和 ZIP：
-
-```bash
-./scripts/package_single_file.sh
-```
-
-可选参数：
-
-```bash
-./scripts/package_single_file.sh --binary-only
-./scripts/package_single_file.sh --dmg-only
-./scripts/package_single_file.sh --zip-only
-```
-
-对应输出：
-
-- `dist/flowfile`
 - `dist/FlowFile.app`
-- `dist/FlowFile-<version>-<arch>.dmg`
-- `dist/FlowFile-<version>-<arch>.zip`
+- `dist/FlowFile-<version>.dmg`
 
 如已配置公证凭据，可在构建时提交 DMG：
 
 ```bash
-FLOWFILE_NOTARY_PROFILE="notary-profile" ./scripts/build_macos.sh
+FLOWFILE_NOTARY_PROFILE="notary-profile" ./scripts/build.sh
 ```
 
 `cargo-bundle` 可选；缺失时构建脚本会使用离线方式组装 `.app`。应用 Bundle ID 为 `com.flowfile.app`。
@@ -255,3 +242,7 @@ src/
 - 布局为 1、2 或 4 面板，不包含三面板布局。
 - 终端功能调用系统 Terminal，不提供内嵌 PTY 终端。
 - 非图片媒体格式依赖 macOS Quick Look 提供缩略图；复杂格式预览仍交给 Quick Look。
+
+## 开源许可
+
+FlowFile 使用[木兰宽松许可证，第 2 版（MulanPSL-2.0）](LICENSE)发布。
