@@ -128,6 +128,33 @@ pub(crate) fn auto_mount_ntfs(path: &Path) -> Result<bool> {
     ));
 }
 
+pub(crate) fn eject(path: &Path) -> Result<()> {
+    if !path.starts_with("/Volumes") || path == Path::new("/Volumes") {
+        anyhow::bail!("只能弹出外置卷");
+    }
+
+    let output = Command::new("/usr/sbin/diskutil")
+        .arg("eject")
+        .arg(path)
+        .output()
+        .with_context(|| format!("无法弹出 {}", path.display()))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "无法弹出 {}{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("该卷"),
+            if message.is_empty() {
+                String::new()
+            } else {
+                format!("：{message}")
+            }
+        );
+    }
+    Ok(())
+}
+
 fn mount_failure_message(log_offset: usize, fallback: String) -> String {
     let Ok(log) = fs::read("/var/log/mount-ntfs-3g.log") else {
         return fallback;

@@ -1148,7 +1148,6 @@ impl MainListView {
         let item_bounds = self.item_bounds.clone();
         let pane_index = self.pane_index;
         let file_name = item.name.clone();
-        let abbreviated_name = abbreviated_grid_name(&file_name, 16);
         let name_element = if renaming {
             deferred(
                 div()
@@ -1193,14 +1192,17 @@ impl MainListView {
             div()
                 .mt_2()
                 .w_full()
-                .h(px(22.0))
-                .truncate()
+                .h(px(34.0))
+                .overflow_hidden()
+                .whitespace_normal()
+                .line_clamp(2)
+                .text_ellipsis()
                 .text_center()
                 .px_1()
                 .text_size(theme::font(11.0))
                 .font_weight(FontWeight::NORMAL)
                 .text_color(theme::text_primary())
-                .child(abbreviated_name)
+                .child(file_name)
                 .into_any_element()
         };
         let drag_paths = if is_selected && !selected_paths.is_empty() {
@@ -2055,48 +2057,15 @@ fn initial_rename_selection(item: &FileItem) -> Range<usize> {
     0..extension_start
 }
 
-fn abbreviated_grid_name(name: &str, max_units: usize) -> String {
-    let display_units = |character: char| if character.is_ascii() { 1 } else { 2 };
-    if name.chars().map(display_units).sum::<usize>() <= max_units {
-        return name.to_string();
-    }
-
-    let mut abbreviated = String::new();
-    let mut used = 0;
-    for character in name.chars() {
-        let units = display_units(character);
-        if used + units > max_units.saturating_sub(1) {
-            break;
-        }
-        abbreviated.push(character);
-        used += units;
-    }
-    abbreviated.push('…');
-    abbreviated
-}
-
 #[cfg(test)]
 mod grid_name_tests {
     use super::{
-        DetailColumn, DetailColumnWidths, MainListView, abbreviated_grid_name,
-        grid_columns_for_width, initial_rename_selection, marquee_bounds,
+        DetailColumn, DetailColumnWidths, MainListView, grid_columns_for_width,
+        initial_rename_selection, marquee_bounds,
     };
     use crate::models::{FileItem, FileKind};
     use gpui::{point, px};
     use std::path::PathBuf;
-
-    #[test]
-    fn unselected_grid_names_have_a_visible_ellipsis() {
-        assert_eq!(
-            abbreviated_grid_name("balenaEtcher-2.1.6-arm64.dmg", 16),
-            "balenaEtcher-2.…"
-        );
-        assert_eq!(
-            abbreviated_grid_name("超长中文文件名称.txt", 10),
-            "超长中文…"
-        );
-        assert_eq!(abbreviated_grid_name("notes.txt", 16), "notes.txt");
-    }
 
     #[test]
     fn detail_columns_resize_independently_and_keep_minimum_widths() {

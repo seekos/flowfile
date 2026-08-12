@@ -31,6 +31,7 @@ pub struct SidebarView {
     engine: FileEngine,
     ntfs_mounting: HashSet<PathBuf>,
     ntfs_mount_failures: HashSet<PathBuf>,
+    ejecting_volumes: HashSet<PathBuf>,
     _volumes_watcher: Option<FileWatcher>,
 }
 
@@ -104,6 +105,7 @@ impl SidebarView {
             engine,
             ntfs_mounting: HashSet::new(),
             ntfs_mount_failures: HashSet::new(),
+            ejecting_volumes: HashSet::new(),
             _volumes_watcher: volumes_watcher,
         }
     }
@@ -200,7 +202,54 @@ impl SidebarView {
             .child(title)
     }
 
-    fn item(&self, id: usize, location: SidebarLocation, is_active: bool) -> impl IntoElement {
+    fn eject_volume(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.ejecting_volumes.insert(path.clone()) {
+            return;
+        }
+        let label = volume_label(&path);
+        self.operations.update(cx, |operations, cx| {
+            operations.show_notice(format!("正在弹出 {label}…"), false, cx);
+        });
+        cx.notify();
+
+        let engine = self.engine.clone();
+        let operations = self.operations.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine.eject_volume(path.clone()).await;
+            let _ = this.update(cx, |sidebar, cx| {
+                sidebar.ejecting_volumes.remove(&path);
+                match result {
+                    Ok(()) => {
+                        let fallback = home_directory();
+                        let panes = sidebar.model.read(cx).panes.clone();
+                        for pane in panes {
+                            if pane.read(cx).current_path.starts_with(&path) {
+                                pane.update(cx, |pane, cx| pane.navigate_to(fallback.clone(), cx));
+                            }
+                        }
+                        operations.update(cx, |operations, cx| {
+                            operations.show_notice(format!("已弹出 {label}"), false, cx);
+                        });
+                        sidebar.volumes.retain(|volume| volume.path != path);
+                    }
+                    Err(error) => operations.update(cx, |operations, cx| {
+                        operations.show_notice(error.to_string(), true, cx);
+                    }),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn item(
+        &self,
+        id: usize,
+        location: SidebarLocation,
+        is_active: bool,
+        can_eject: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let model = self.model.clone();
         let operations = self.operations.clone();
         let path = location.path.clone();
@@ -208,6 +257,8 @@ impl SidebarView {
         let tooltip = format!("在当前面板中打开 {}", path.display());
         let label: SharedString = location.label.into();
         let detail = location.detail.map(SharedString::from);
+        let eject_path = location.path.clone();
+        let is_ejecting = self.ejecting_volumes.contains(&eject_path);
 
         div()
             .id(("sidebar-location", id))
@@ -277,6 +328,32 @@ impl SidebarView {
                             .child(detail)
                     }),
             )
+            .when(can_eject, |item| {
+                item.child(
+                    div()
+                        .id(("sidebar-eject", id))
+                        .w(px(24.0))
+                        .h(px(24.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(theme::font(12.0))
+                        .text_color(theme::text_tertiary())
+                        .hover(|style| style.bg(theme::surface()).text_color(theme::text_primary()))
+                        .tooltip(delayed_tooltip(if is_ejecting {
+                            "正在弹出…".to_string()
+                        } else {
+                            format!("弹出 {}", volume_label(&eject_path))
+                        }))
+                        .child(if is_ejecting { "…" } else { "⏏" })
+                        .on_click(cx.listener(move |sidebar, _, _, cx| {
+                            cx.stop_propagation();
+                            sidebar.eject_volume(eject_path.clone(), cx);
+                        })),
+                )
+            })
     }
 }
 
@@ -308,7 +385,7 @@ impl Render for SidebarView {
                     .enumerate()
                     .map(|(index, location)| {
                         let is_active = current_path == location.path;
-                        self.item(index, location, is_active)
+                        self.item(index, location, is_active, false, cx)
                     }),
             )
             .child(Self::section_title("卷"))
@@ -323,7 +400,8 @@ impl Render for SidebarView {
             })
             .children(volumes.into_iter().enumerate().map(|(index, location)| {
                 let is_active = current_path == location.path;
-                self.item(100 + index, location, is_active)
+                let can_eject = location.path.starts_with(Path::new("/Volumes"));
+                self.item(100 + index, location, is_active, can_eject, cx)
             }))
             .child(
                 div()

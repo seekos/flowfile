@@ -81,6 +81,13 @@ impl FileEngine {
             .context("NTFS 自动挂载任务异常终止")?
     }
 
+    pub async fn eject_volume(&self, path: PathBuf) -> Result<()> {
+        self.runtime
+            .spawn_blocking(move || volume::eject(&path))
+            .await
+            .context("卷弹出任务异常终止")?
+    }
+
     pub async fn open_path(&self, path: PathBuf) -> Result<()> {
         self.runtime
             .spawn_blocking(move || {
