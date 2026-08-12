@@ -18,8 +18,8 @@ use crate::{
         PreviousPane, Refresh, ToggleQuickLook, ViewDetails, ViewGrid,
     },
     models::{
-        AppPreferences, CreateItemKind, FileOperationController, LayoutMode, Model, MultiPaneModel,
-        Pane, SessionState, home_directory,
+        AppPreferences, CreateItemKind, Favorites, FileOperationController, LayoutMode, Model,
+        MultiPaneModel, Pane, SessionState, home_directory,
     },
     services::{
         FileEngine, FileInspector, FileOperationEngine, PreviewKind, QuickLookService,
@@ -337,6 +337,7 @@ impl WorkspaceView {
             last_active_pane_index,
         });
         let operations = cx.new(|_| FileOperationController::new(model.clone(), operation_engine));
+        let favorites = cx.new(|_| Favorites::load());
         let thumbnails =
             cx.new(|_| ThumbnailEngine::new().expect("failed to initialize thumbnail engine"));
         let quick_look_service = QuickLookService::new(&engine);
@@ -358,12 +359,20 @@ impl WorkspaceView {
             pane.update(cx, |pane, cx| pane.load_initial(cx));
         }
 
-        let sidebar =
-            cx.new(|cx| SidebarView::new(model.clone(), operations.clone(), engine.clone(), cx));
+        let sidebar = cx.new(|cx| {
+            SidebarView::new(
+                model.clone(),
+                operations.clone(),
+                favorites.clone(),
+                engine.clone(),
+                cx,
+            )
+        });
         let context_menu = cx.new(|_| {
             ContextMenuView::new(
                 model.clone(),
                 operations.clone(),
+                favorites.clone(),
                 terminal.clone(),
                 engine.clone(),
             )

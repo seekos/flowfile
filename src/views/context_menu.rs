@@ -1,6 +1,6 @@
 use crate::{
     actions::{NewFolder, NewTextFile, ToggleQuickLook},
-    models::{FileOperationController, Model, MultiPaneModel, Pane},
+    models::{Favorites, FileOperationController, Model, MultiPaneModel, Pane},
     services::{FileEngine, OpenWithApplication, SystemTerminal, TransferMode},
     theme,
 };
@@ -53,11 +53,13 @@ enum MenuCommand {
     NewFolder,
     NewTextFile,
     OpenTerminal,
+    ToggleFavorite,
 }
 
 pub struct ContextMenuView {
     model: Model<MultiPaneModel>,
     operations: Entity<FileOperationController>,
+    favorites: Entity<Favorites>,
     terminal: SystemTerminal,
     engine: FileEngine,
     state: Option<ContextMenuState>,
@@ -69,12 +71,14 @@ impl ContextMenuView {
     pub fn new(
         model: Model<MultiPaneModel>,
         operations: Entity<FileOperationController>,
+        favorites: Entity<Favorites>,
         terminal: SystemTerminal,
         engine: FileEngine,
     ) -> Self {
         Self {
             model,
             operations,
+            favorites,
             terminal,
             engine,
             state: None,
@@ -258,6 +262,40 @@ impl ContextMenuView {
             MenuCommand::OpenTerminal => {
                 let path = state.pane.read(cx).current_path.clone();
                 self.terminal.open(path);
+            }
+            MenuCommand::ToggleFavorite => {
+                let path = {
+                    let pane = state.pane.read(cx);
+                    pane.selected_index
+                        .and_then(|index| pane.items.get(index))
+                        .filter(|item| item.is_dir)
+                        .map(|item| item.path.clone())
+                };
+                if let Some(path) = path {
+                    let label = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("文件夹")
+                        .to_string();
+                    self.favorites.update(cx, |favorites, cx| {
+                        match favorites.toggle(path) {
+                            Ok(true) => self.operations.update(cx, |operations, cx| {
+                                operations.show_notice(
+                                    format!("已将 {label} 添加到收藏"),
+                                    false,
+                                    cx,
+                                );
+                            }),
+                            Ok(false) => self.operations.update(cx, |operations, cx| {
+                                operations.show_notice(format!("已取消收藏 {label}"), false, cx);
+                            }),
+                            Err(error) => self.operations.update(cx, |operations, cx| {
+                                operations.show_notice(error.to_string(), true, cx);
+                            }),
+                        }
+                        cx.notify();
+                    });
+                }
             }
         }
     }
@@ -681,10 +719,11 @@ impl ContextMenuView {
         selection_count: usize,
         quick_look_enabled: bool,
         has_other_pane: bool,
+        selected_folder_is_favorite: Option<bool>,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let has_selection = selection_count > 0;
-        vec![
+        let mut items = vec![
             self.item(
                 "context-open",
                 "📄",
@@ -769,6 +808,23 @@ impl ContextMenuView {
                 MenuCommand::Trash,
                 cx,
             ),
+        ];
+        if let Some(is_favorite) = selected_folder_is_favorite {
+            items.push(self.item(
+                "context-toggle-favorite",
+                if is_favorite { "☆" } else { "★" },
+                if is_favorite {
+                    "取消收藏"
+                } else {
+                    "添加到收藏"
+                },
+                "",
+                true,
+                MenuCommand::ToggleFavorite,
+                cx,
+            ));
+        }
+        items.extend([
             Self::separator(),
             self.item(
                 "context-get-info",
@@ -779,7 +835,8 @@ impl ContextMenuView {
                 MenuCommand::GetInfo,
                 cx,
             ),
-        ]
+        ]);
+        items
     }
 
     fn background_menu(&self, can_paste: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -838,12 +895,21 @@ impl Render for ContextMenuView {
                 .selected_index
                 .and_then(|index| pane.items.get(index))
                 .is_some_and(|item| !item.is_dir);
+        let selected_folder_is_favorite = (selection_count == 1)
+            .then(|| pane.selected_index.and_then(|index| pane.items.get(index)))
+            .flatten()
+            .filter(|item| item.is_dir)
+            .map(|item| self.favorites.read(cx).contains(&item.path));
         let has_other_pane = self.model.read(cx).other_pane_index().is_some();
         let can_paste = self.operations.read(cx).can_paste(cx);
         let children = match state.target {
-            ContextMenuTarget::Selection => {
-                self.selection_menu(selection_count, quick_look_enabled, has_other_pane, cx)
-            }
+            ContextMenuTarget::Selection => self.selection_menu(
+                selection_count,
+                quick_look_enabled,
+                has_other_pane,
+                selected_folder_is_favorite,
+                cx,
+            ),
             ContextMenuTarget::Background => self.background_menu(can_paste, cx),
         };
         let open_with_submenu = self.open_with_submenu(state.position, window.viewport_size(), cx);

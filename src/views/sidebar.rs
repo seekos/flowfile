@@ -1,6 +1,8 @@
 use super::tooltip::delayed_tooltip;
 use crate::{
-    models::{FileDragPayload, FileOperationController, Model, MultiPaneModel, home_directory},
+    models::{
+        Favorites, FileDragPayload, FileOperationController, Model, MultiPaneModel, home_directory,
+    },
     services::{FileEngine, FileWatcher, TransferMode, VolumeInfo},
     theme,
 };
@@ -25,6 +27,7 @@ struct SidebarLocation {
 pub struct SidebarView {
     model: Model<MultiPaneModel>,
     operations: Entity<FileOperationController>,
+    favorites: Entity<Favorites>,
     quick_access: Vec<SidebarLocation>,
     volumes: Vec<SidebarLocation>,
     volumes_loading: bool,
@@ -39,10 +42,12 @@ impl SidebarView {
     pub fn new(
         model: Model<MultiPaneModel>,
         operations: Entity<FileOperationController>,
+        favorites: Entity<Favorites>,
         engine: FileEngine,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&model, |_, _, cx| cx.notify()).detach();
+        cx.observe(&favorites, |_, _, cx| cx.notify()).detach();
         let panes = model.read(cx).panes.clone();
         for pane in &panes {
             cx.observe(pane, |_, _, cx| cx.notify()).detach();
@@ -99,6 +104,7 @@ impl SidebarView {
         Self {
             model,
             operations,
+            favorites,
             quick_access,
             volumes: Vec::new(),
             volumes_loading: true,
@@ -367,6 +373,23 @@ impl Render for SidebarView {
                 .clone()
         };
         let quick_access = self.quick_access.clone();
+        let favorites = self
+            .favorites
+            .read(cx)
+            .paths()
+            .iter()
+            .filter(|path| path.is_dir())
+            .map(|path| SidebarLocation {
+                icon: "★",
+                label: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("收藏文件夹")
+                    .to_string(),
+                path: path.clone(),
+                detail: None,
+            })
+            .collect::<Vec<_>>();
         let volumes = self.volumes.clone();
 
         div()
@@ -388,6 +411,21 @@ impl Render for SidebarView {
                         self.item(index, location, is_active, false, cx)
                     }),
             )
+            .child(Self::section_title("收藏夹"))
+            .when(favorites.is_empty(), |sidebar| {
+                sidebar.child(
+                    div()
+                        .mx_3()
+                        .pb_1()
+                        .text_size(theme::font(10.0))
+                        .text_color(theme::text_tertiary())
+                        .child("暂无收藏的文件夹"),
+                )
+            })
+            .children(favorites.into_iter().enumerate().map(|(index, location)| {
+                let is_active = current_path == location.path;
+                self.item(50 + index, location, is_active, false, cx)
+            }))
             .child(Self::section_title("卷"))
             .when(self.volumes_loading, |sidebar| {
                 sidebar.child(

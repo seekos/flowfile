@@ -1,3 +1,4 @@
+mod favorites;
 mod file_item;
 mod multi_pane;
 mod operations;
@@ -5,6 +6,7 @@ pub mod pane;
 mod preferences;
 mod session;
 
+pub use favorites::Favorites;
 pub use file_item::{FileItem, FileKind, SortMode};
 pub use multi_pane::{LayoutMode, MultiPaneModel};
 pub use operations::{CreateItemKind, FileDragPayload, FileOperationController};
