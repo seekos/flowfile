@@ -56,13 +56,16 @@ impl FileItem {
             .unwrap_or_default();
 
         let is_executable = has_unix_execute_bit(&metadata);
+        let extension_kind = Self::kind_for(is_dir, extension.as_deref());
         let kind =
             if is_script_extension(extension.as_deref()) || (is_executable && has_shebang(&path)) {
                 FileKind::Script
+            } else if extension_kind != FileKind::Other || is_dir {
+                extension_kind
             } else if is_executable {
                 FileKind::Executable
             } else {
-                Self::kind_for(is_dir, extension.as_deref())
+                FileKind::Other
             };
 
         Self {
@@ -262,6 +265,34 @@ mod tests {
         );
 
         assert_eq!(item.kind, FileKind::Script);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn known_file_types_are_not_overridden_by_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("create temporary directory");
+        for (name, expected_kind) in [
+            ("archive.7z", FileKind::Archive),
+            ("archive.zip", FileKind::Archive),
+            ("document.pdf", FileKind::Document),
+            ("installer.dmg", FileKind::Archive),
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, b"contents").expect("create test file");
+            let mut permissions = fs::metadata(&path).expect("read metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("set executable permission");
+
+            let item = FileItem::from_metadata(
+                path.clone(),
+                name.to_string(),
+                fs::metadata(path).expect("read updated metadata"),
+                false,
+            );
+            assert_eq!(item.kind, expected_kind, "wrong kind for {name}");
+        }
     }
 
     #[cfg(unix)]

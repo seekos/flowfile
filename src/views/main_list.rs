@@ -414,7 +414,7 @@ impl MainListView {
                 .into_any_element();
         }
 
-        let (label, color) = match item.kind {
+        let (fallback_label, color) = match item.kind {
             FileKind::Application => ("APP", theme::file_purple()),
             FileKind::Executable => ("BIN", theme::text_secondary()),
             FileKind::Script => (">_", theme::terminal_foreground()),
@@ -426,6 +426,12 @@ impl MainListView {
             FileKind::Other => ("FILE", theme::text_secondary()),
             FileKind::Folder => unreachable!(),
         };
+        let label = item
+            .extension
+            .as_deref()
+            .filter(|extension| extension.len() <= 4)
+            .map(str::to_ascii_uppercase)
+            .unwrap_or_else(|| fallback_label.to_string());
 
         div()
             .relative()
