@@ -387,7 +387,6 @@ impl ContextMenuView {
     }
 
     fn item(
-        &self,
         id: &'static str,
         icon: &'static str,
         label: &'static str,
@@ -524,7 +523,7 @@ impl ContextMenuView {
         }
         let text_opening_supported = open_with.text_opening_supported;
 
-        let mut children = if open_with.loading {
+        let application_items = if open_with.loading {
             vec![Self::submenu_message("正在查找可用应用…")]
         } else if open_with.error.is_some() {
             vec![Self::submenu_message("无法读取可用应用")]
@@ -573,10 +572,14 @@ impl ContextMenuView {
                 })
                 .collect()
         };
-        children.push(Self::separator());
+        let mut children = Vec::new();
         if text_opening_supported {
             children.push(self.text_open_item(cx));
+            children.push(Self::separator());
         }
+        children.push(Self::submenu_section_label("按类型推荐"));
+        children.extend(application_items);
+        children.push(Self::separator());
         children.push(self.custom_open_with_item(cx));
 
         let submenu = div()
@@ -643,6 +646,19 @@ impl ContextMenuView {
             .text_size(theme::font(10.0))
             .text_color(theme::text_tertiary())
             .child(message)
+            .into_any_element()
+    }
+
+    fn submenu_section_label(label: &'static str) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .h(px(24.0))
+            .px_3()
+            .text_size(theme::font(9.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::text_tertiary())
+            .child(label)
             .into_any_element()
     }
 
@@ -724,7 +740,7 @@ impl ContextMenuView {
     ) -> Vec<AnyElement> {
         let has_selection = selection_count > 0;
         let mut items = vec![
-            self.item(
+            Self::item(
                 "context-open",
                 "📄",
                 "打开",
@@ -734,7 +750,7 @@ impl ContextMenuView {
                 cx,
             ),
             self.open_with_trigger(cx),
-            self.item(
+            Self::item(
                 "context-quick-look",
                 "👁",
                 "QuickLook 预览",
@@ -744,7 +760,7 @@ impl ContextMenuView {
                 cx,
             ),
             Self::separator(),
-            self.item(
+            Self::item(
                 "context-cut",
                 "✂",
                 "剪切",
@@ -753,7 +769,7 @@ impl ContextMenuView {
                 MenuCommand::Cut,
                 cx,
             ),
-            self.item(
+            Self::item(
                 "context-copy",
                 "📋",
                 "复制",
@@ -762,7 +778,7 @@ impl ContextMenuView {
                 MenuCommand::Copy,
                 cx,
             ),
-            self.item(
+            Self::item(
                 "context-paste-disabled",
                 "📥",
                 "粘贴",
@@ -771,7 +787,7 @@ impl ContextMenuView {
                 MenuCommand::Paste,
                 cx,
             ),
-            self.item(
+            Self::item(
                 "context-copy-other",
                 "➡",
                 "复制到另一面板",
@@ -780,7 +796,7 @@ impl ContextMenuView {
                 MenuCommand::CopyToOther,
                 cx,
             ),
-            self.item(
+            Self::item(
                 "context-move-other",
                 "🚚",
                 "移动到另一面板",
@@ -790,7 +806,7 @@ impl ContextMenuView {
                 cx,
             ),
             Self::separator(),
-            self.item(
+            Self::item(
                 "context-rename",
                 "✏",
                 "重命名",
@@ -799,7 +815,7 @@ impl ContextMenuView {
                 MenuCommand::Rename,
                 cx,
             ),
-            self.item(
+            Self::item(
                 "context-trash",
                 "🗑",
                 "移至废纸篓",
@@ -810,7 +826,7 @@ impl ContextMenuView {
             ),
         ];
         if let Some(is_favorite) = selected_folder_is_favorite {
-            items.push(self.item(
+            items.push(Self::item(
                 "context-toggle-favorite",
                 if is_favorite { "☆" } else { "★" },
                 if is_favorite {
@@ -826,7 +842,7 @@ impl ContextMenuView {
         }
         items.extend([
             Self::separator(),
-            self.item(
+            Self::item(
                 "context-get-info",
                 "ⓘ",
                 "显示简介",
@@ -841,7 +857,7 @@ impl ContextMenuView {
 
     fn background_menu(&self, can_paste: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
         vec![
-            self.item(
+            Self::item(
                 "context-new-folder",
                 "📁",
                 "新建文件夹",
@@ -850,7 +866,7 @@ impl ContextMenuView {
                 MenuCommand::NewFolder,
                 cx,
             ),
-            self.item(
+            Self::item(
                 "context-new-file",
                 "📄",
                 "新建文本文件",
@@ -860,7 +876,7 @@ impl ContextMenuView {
                 cx,
             ),
             Self::separator(),
-            self.item(
+            Self::item(
                 "context-background-paste",
                 "📥",
                 "粘贴",
@@ -870,7 +886,7 @@ impl ContextMenuView {
                 cx,
             ),
             Self::separator(),
-            self.item(
+            Self::item(
                 "context-open-terminal",
                 "⌘",
                 "在系统终端中打开",

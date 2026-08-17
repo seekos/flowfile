@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 
+pub(crate) const NAVIGATION_HISTORY_LIMIT: usize = 100;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ViewMode {
     Details,
@@ -50,6 +52,10 @@ impl ExplorerTab {
 
         self.history.truncate(self.history_index + 1);
         self.history.push(path.clone());
+        if self.history.len() > NAVIGATION_HISTORY_LIMIT {
+            let overflow = self.history.len() - NAVIGATION_HISTORY_LIMIT;
+            self.history.drain(..overflow);
+        }
         self.history_index = self.history.len() - 1;
         self.path = path.clone();
         self.title = path_title(&path);
@@ -654,7 +660,7 @@ pub fn home_directory() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExplorerTab, Pane, ViewMode, should_navigate_to};
+    use super::{ExplorerTab, NAVIGATION_HISTORY_LIMIT, Pane, ViewMode, should_navigate_to};
     use crate::{
         models::{FileItem, FileKind},
         services::FileEngine,
@@ -683,6 +689,23 @@ mod tests {
         assert_eq!(tab.history.len(), 3);
         assert_eq!(tab.history_index, 2);
         assert_eq!(tab.history[2], home.join("Documents"));
+    }
+
+    #[test]
+    fn navigation_history_discards_the_oldest_entries_at_the_limit() {
+        let root = PathBuf::from("/history");
+        let mut tab = ExplorerTab::new(root.clone());
+        for index in 0..NAVIGATION_HISTORY_LIMIT + 20 {
+            tab.push_path(root.join(index.to_string()));
+        }
+
+        assert_eq!(tab.history.len(), NAVIGATION_HISTORY_LIMIT);
+        assert_eq!(tab.history_index, NAVIGATION_HISTORY_LIMIT - 1);
+        assert_eq!(
+            tab.path,
+            root.join((NAVIGATION_HISTORY_LIMIT + 19).to_string())
+        );
+        assert_eq!(tab.history[0], root.join("20"));
     }
 
     #[test]

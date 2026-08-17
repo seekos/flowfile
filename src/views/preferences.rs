@@ -23,10 +23,15 @@ pub struct PreferencesModal {
     capturing: Option<ShortcutTarget>,
     error: Option<String>,
     focus_handle: FocusHandle,
+    return_focus_handle: FocusHandle,
 }
 
 impl PreferencesModal {
-    pub fn new(model: Model<MultiPaneModel>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        model: Model<MultiPaneModel>,
+        return_focus_handle: FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             model,
             preferences: AppPreferences::load(),
@@ -34,6 +39,7 @@ impl PreferencesModal {
             capturing: None,
             error: None,
             focus_handle: cx.focus_handle(),
+            return_focus_handle,
         }
     }
 
@@ -46,20 +52,47 @@ impl PreferencesModal {
         cx.notify();
     }
 
-    fn close(&mut self, cx: &mut Context<Self>) {
+    #[cfg(target_os = "macos")]
+    pub fn accessibility_summary(&self) -> Option<String> {
+        self.visible.then(|| {
+            let capture = self
+                .capturing
+                .map(|_| "，正在录入快捷键")
+                .unwrap_or_default();
+            let error = self
+                .error
+                .as_deref()
+                .map(|error| format!("，错误：{error}"))
+                .unwrap_or_default();
+            format!(
+                "主题：{}；默认布局：{}；显示隐藏文件：{}；搜索快捷键：{}；终端快捷键：{}；Quick Look 快捷键：{}{}{}",
+                self.preferences.theme.label(),
+                self.preferences.default_layout.label(),
+                if self.preferences.show_hidden { "是" } else { "否" },
+                display_keystroke(&self.preferences.search_shortcut),
+                display_keystroke(&self.preferences.terminal_shortcut),
+                display_keystroke(&self.preferences.quick_look_shortcut),
+                capture,
+                error,
+            )
+        })
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = false;
         self.capturing = None;
         self.error = None;
+        self.return_focus_handle.focus(window);
         cx.notify();
     }
 
-    fn cancel(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preferences = AppPreferences::load();
         theme::apply(self.preferences.theme, window.appearance());
-        self.close(cx);
+        self.close(window, cx);
     }
 
-    fn save(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let shortcuts = [
             self.preferences.search_shortcut.as_str(),
             self.preferences.terminal_shortcut.as_str(),
@@ -99,7 +132,7 @@ impl PreferencesModal {
             cx.notify();
         });
         actions::register_keybindings_with_preferences(cx, &self.preferences);
-        self.close(cx);
+        self.close(window, cx);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -128,6 +161,20 @@ impl PreferencesModal {
             "escape" => self.cancel(window, cx),
             "enter" => self.save(window, cx),
             _ => {}
+        }
+    }
+
+    fn on_close(
+        &mut self,
+        _: &actions::ClosePreferences,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.capturing.is_some() {
+            self.capturing = None;
+            cx.notify();
+        } else {
+            self.cancel(window, cx);
         }
     }
 
@@ -252,6 +299,7 @@ impl Render for PreferencesModal {
             .items_center()
             .justify_center()
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::on_close))
             .on_key_down(cx.listener(Self::on_key_down))
             .child(
                 div()

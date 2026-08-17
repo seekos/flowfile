@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build macOS Universal
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build files
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos-universal
+
+      - name: Read version from tag
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Unsupported release tag: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install macOS system build dependencies
+        shell: bash
+        run: brew install cmake pkg-config
+
+      - name: Build arm64 and x86_64 release binaries
+        shell: bash
+        run: |
+          sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+          export SDKROOT="$sdk_path"
+          export MACOSX_DEPLOYMENT_TARGET=11.0
+          export BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin="--target=arm64-apple-macos11 -isysroot $sdk_path"
+          export BINDGEN_EXTRA_CLANG_ARGS_x86_64_apple_darwin="--target=x86_64-apple-macos11 -isysroot $sdk_path"
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Package signed macOS Universal DMG
+        shell: bash
+        env:
+          # Ad-hoc signing placeholder. Replace "-" with an imported Developer ID
+          # identity when certificate-based signing and notarization are configured.
+          CODESIGN_IDENTITY: "-"
+        run: |
+          set -euo pipefail
+          app_path="dist/FlowFile.app"
+          contents_path="$app_path/Contents"
+          mkdir -p "$contents_path/MacOS" "$contents_path/Resources"
+
+          lipo -create \
+            "target/aarch64-apple-darwin/release/flowfile" \
+            "target/x86_64-apple-darwin/release/flowfile" \
+            -output "$contents_path/MacOS/flowfile"
+          chmod 755 "$contents_path/MacOS/flowfile"
+          cp resources/Info.plist "$contents_path/Info.plist"
+          cp resources/FlowFile.icns "$contents_path/Resources/FlowFile.icns"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleShortVersionString $VERSION" "$contents_path/Info.plist"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleVersion $GITHUB_RUN_NUMBER" "$contents_path/Info.plist"
+
+          lipo -info "$contents_path/MacOS/flowfile"
+          codesign --force --deep --options runtime \
+            --sign "$CODESIGN_IDENTITY" "$app_path"
+          codesign --verify --deep --strict "$app_path"
+
+          dmg_stage="$(mktemp -d)"
+          trap 'rm -rf "$dmg_stage"' EXIT
+          cp -R "$app_path" "$dmg_stage/FlowFile.app"
+          ln -s /Applications "$dmg_stage/Applications"
+          hdiutil create \
+            -volname FlowFile \
+            -srcfolder "$dmg_stage" \
+            -ov -format UDZO \
+            "dist/FlowFile-$VERSION-macos-universal.dmg"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowfile-macos-universal
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download packaged artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flowfile-macos-universal
+          path: release-assets
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release-assets/*.dmg)
+          if (( ${#assets[@]} == 0 )); then
+            echo "No DMG release asset was downloaded." >&2
+            exit 1
+          fi
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --verify-tag \
+              --title "FlowFile $GITHUB_REF_NAME" \
+              --generate-notes
+          fi

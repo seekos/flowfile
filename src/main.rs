@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+mod accessibility;
 mod actions;
 mod models;
 mod services;

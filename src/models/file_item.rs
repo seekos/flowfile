@@ -18,6 +18,7 @@ pub enum FileKind {
     Archive,
     Audio,
     Video,
+    Model,
     Other,
 }
 
@@ -96,6 +97,8 @@ impl FileItem {
             "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "dmg" => FileKind::Archive,
             "mp3" | "wav" | "aac" | "m4a" | "flac" => FileKind::Audio,
             "mp4" | "mov" | "mkv" | "avi" | "webm" => FileKind::Video,
+            "ply" | "stl" | "obj" | "fbx" | "gltf" | "glb" | "dae" | "3ds" | "usd" | "usda"
+            | "usdc" | "usdz" | "step" | "stp" | "iges" | "igs" => FileKind::Model,
             "txt" | "md" | "rtf" | "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
             | "rs" | "go" | "js" | "ts" | "json" | "toml" | "yaml" | "yml" => FileKind::Document,
             _ => FileKind::Other,
@@ -278,6 +281,7 @@ mod tests {
             ("archive.zip", FileKind::Archive),
             ("document.pdf", FileKind::Document),
             ("installer.dmg", FileKind::Archive),
+            ("point-cloud.ply", FileKind::Model),
         ] {
             let path = directory.path().join(name);
             fs::write(&path, b"contents").expect("create test file");
@@ -292,6 +296,17 @@ mod tests {
                 false,
             );
             assert_eq!(item.kind, expected_kind, "wrong kind for {name}");
+        }
+    }
+
+    #[test]
+    fn three_dimensional_files_have_model_kind() {
+        for extension in ["ply", "stl", "obj", "glb", "usdz", "step"] {
+            assert_eq!(
+                FileItem::kind_for(false, Some(extension)),
+                FileKind::Model,
+                "wrong kind for .{extension}"
+            );
         }
     }
 

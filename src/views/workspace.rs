@@ -10,6 +10,8 @@ use super::{
     status_bar::StatusBar,
     tooltip::delayed_tooltip,
 };
+#[cfg(target_os = "macos")]
+use crate::accessibility::{AccessibilitySnapshot, ItemSnapshot, MacAccessibility, PaneSnapshot};
 use crate::{
     actions::{
         CloseContextMenu, CloseQuickLook, CopyFiles, CutFiles, Duplicate, FindFiles, GetInfo,
@@ -18,8 +20,8 @@ use crate::{
         PreviousPane, Refresh, ToggleQuickLook, ViewDetails, ViewGrid,
     },
     models::{
-        AppPreferences, CreateItemKind, Favorites, FileOperationController, LayoutMode, Model,
-        MultiPaneModel, Pane, SessionState, home_directory,
+        AppPreferences, CreateItemKind, Favorites, FileKind, FileOperationController, LayoutMode,
+        Model, MultiPaneModel, Pane, SessionState, home_directory,
     },
     services::{
         FileEngine, FileInspector, FileOperationEngine, PreviewKind, QuickLookService,
@@ -28,8 +30,8 @@ use crate::{
     theme,
 };
 use gpui::{
-    AnyElement, App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, FontWeight, GlobalElementId, IntoElement,
+    AnyElement, App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight, GlobalElementId, IntoElement,
     KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     PaintQuad, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, SharedString, Style,
     StyledImage, TextRun, Timer, UTF16Selection, UnderlineStyle, Window, black, div, fill, img,
@@ -261,6 +263,8 @@ pub struct WorkspaceView {
     quick_look_focus_handle: FocusHandle,
     session_save_generation: u64,
     last_saved_session: Option<SessionState>,
+    #[cfg(target_os = "macos")]
+    accessibility: MacAccessibility,
 }
 
 impl WorkspaceView {
@@ -386,7 +390,9 @@ impl WorkspaceView {
                 cx,
             )
         });
-        let preferences = cx.new(|cx| PreferencesModal::new(model.clone(), cx));
+        let focus_handle = cx.focus_handle();
+        let preferences =
+            cx.new(|cx| PreferencesModal::new(model.clone(), focus_handle.clone(), cx));
         let status_bar = cx.new(|cx| {
             StatusBar::new(
                 model.clone(),
@@ -396,7 +402,19 @@ impl WorkspaceView {
                 cx,
             )
         });
-        let focus_handle = cx.focus_handle();
+        #[cfg(target_os = "macos")]
+        let accessibility = MacAccessibility::new(
+            window,
+            AccessibilitySnapshot {
+                layout: layout_mode.label().to_string(),
+                sidebar_visible,
+                panes: Vec::new(),
+                status: "正在载入文件".to_string(),
+                modal: None,
+                quick_look: None,
+                preferences: None,
+            },
+        );
         focus_handle.focus(window);
 
         let workspace = Self {
@@ -428,6 +446,8 @@ impl WorkspaceView {
             quick_look_focus_handle: cx.focus_handle(),
             session_save_generation: 0,
             last_saved_session: None,
+            #[cfg(target_os = "macos")]
+            accessibility,
         };
 
         cx.on_app_quit(|workspace, cx| {
@@ -445,6 +465,97 @@ impl WorkspaceView {
 
     fn capture_session(&self, cx: &App) -> SessionState {
         SessionState::capture(self.model.read(cx), self.sidebar_visible, cx)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn accessibility_snapshot(&self, cx: &App) -> AccessibilitySnapshot {
+        let model = self.model.read(cx);
+        let pane_count = model.layout_mode.pane_count().min(model.panes.len());
+        let panes = model
+            .panes
+            .iter()
+            .take(pane_count)
+            .enumerate()
+            .map(|(pane_index, pane)| {
+                let pane = pane.read(cx);
+                let items = pane
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(item_index, item)| ItemSnapshot {
+                        name: item.name.clone(),
+                        description: accessible_item_description(item),
+                        selected: pane.selected_indices.contains(&item_index),
+                    })
+                    .collect();
+                PaneSnapshot {
+                    path: pane.current_path.display().to_string(),
+                    active: pane_index == model.active_pane_index,
+                    search: pane
+                        .search_active
+                        .then(|| pane.search_query.trim().to_string())
+                        .filter(|query| !query.is_empty()),
+                    items,
+                }
+            })
+            .collect();
+        let active_pane = model
+            .panes
+            .get(model.active_pane_index)
+            .map(|pane| pane.read(cx));
+        let status = active_pane
+            .as_ref()
+            .map(|pane| {
+                if let Some(error) = &pane.error_message {
+                    format!("错误：{error}")
+                } else if pane.is_loading {
+                    "正在载入文件".to_string()
+                } else {
+                    format!(
+                        "{} 个项目，已选择 {} 个",
+                        pane.items.len(),
+                        pane.selected_indices.len()
+                    )
+                }
+            })
+            .unwrap_or_else(|| "没有活动面板".to_string());
+        let modal = self.modal.as_ref().map(|modal| match modal {
+            ModalState::NameInput { kind, value } => {
+                let title = match kind {
+                    CreateItemKind::Folder => "新建文件夹",
+                    CreateItemKind::TextFile => "新建文本文件",
+                };
+                match &self.modal_error {
+                    Some(error) => format!("{title}，名称：{value}，错误：{error}"),
+                    None => format!("{title}，名称：{value}"),
+                }
+            }
+            ModalState::PermanentDelete { paths } => {
+                format!("永久删除确认，将删除 {} 个项目", paths.len())
+            }
+        });
+        let quick_look = self.quick_look.as_ref().map(|preview| {
+            let state = match &preview.content {
+                QuickLookContent::Loading => "正在载入",
+                QuickLookContent::Image => "图像预览",
+                QuickLookContent::Text { truncated, .. } if *truncated => "文本预览，内容已截断",
+                QuickLookContent::Text { .. } => "文本预览",
+                QuickLookContent::Native => "系统预览",
+                QuickLookContent::Error(error) => error,
+            };
+            format!("{}，{state}", preview.path.display())
+        });
+        let preferences = self.preferences.read(cx).accessibility_summary();
+
+        AccessibilitySnapshot {
+            layout: model.layout_mode.label().to_string(),
+            sidebar_visible: self.sidebar_visible,
+            panes,
+            status,
+            modal,
+            quick_look,
+            preferences,
+        }
     }
 
     fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
@@ -483,11 +594,28 @@ impl WorkspaceView {
     }
 
     fn on_copy(&mut self, _: &CopyFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.modal, Some(ModalState::NameInput { .. })) {
+            if let Some(text) = self.selected_modal_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            cx.stop_propagation();
+            return;
+        }
         self.operations
             .update(cx, |operations, cx| operations.copy_selected(cx));
     }
 
     fn on_cut(&mut self, _: &CutFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.modal, Some(ModalState::NameInput { .. })) {
+            if let Some(text) = self.selected_modal_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.replace_modal_text("");
+                self.modal_error = None;
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
         self.operations
             .update(cx, |operations, cx| operations.cut_selected(cx));
     }
@@ -499,6 +627,7 @@ impl WorkspaceView {
                 self.replace_modal_text(&text);
                 self.modal_error = None;
                 cx.notify();
+                cx.stop_propagation();
                 return;
             }
             let pane = self.active_pane(cx);
@@ -830,6 +959,12 @@ impl WorkspaceView {
             Some(ModalState::NameInput { value, .. }) => Some(value.clone()),
             _ => None,
         }
+    }
+
+    fn selected_modal_text(&self) -> Option<String> {
+        let value = self.modal_name()?;
+        let range = clamp_char_range(&value, self.modal_selection.clone()?);
+        (!range.is_empty()).then(|| value[range].to_string())
     }
 
     fn modal_index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
@@ -1961,6 +2096,11 @@ impl EntityInputHandler for WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(target_os = "macos")]
+        {
+            let snapshot = self.accessibility_snapshot(cx);
+            self.accessibility.update(snapshot);
+        }
         let input_entity = cx.entity();
         let modal = self.render_modal(cx, input_entity);
         let quick_look = self.render_quick_look(cx);
@@ -2024,6 +2164,32 @@ impl Render for WorkspaceView {
             .when_some(modal, |workspace, modal| workspace.child(modal))
             .child(self.preferences.clone())
             .child(self.context_menu.clone())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn accessible_item_description(item: &crate::models::FileItem) -> String {
+    let kind = match item.kind {
+        FileKind::Folder => "文件夹",
+        FileKind::Application => "应用程序",
+        FileKind::Executable => "可执行文件",
+        FileKind::Script => "脚本",
+        FileKind::Document => "文档",
+        FileKind::Image => "图像",
+        FileKind::Archive => "压缩文件",
+        FileKind::Audio => "音频",
+        FileKind::Video => "视频",
+        FileKind::Model => "三维模型",
+        FileKind::Other => "文件",
+    };
+    if item.is_dir {
+        kind.to_string()
+    } else {
+        format!(
+            "{kind}，{}，修改于 {}",
+            item.formatted_size(),
+            item.modified
+        )
     }
 }
 

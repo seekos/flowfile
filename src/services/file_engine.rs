@@ -95,6 +95,10 @@ impl FileEngine {
                     run_unix_executable(&path)
                 } else if let Some(application) = preferred_text_application(&path) {
                     open_path_with_application(&path, &application)
+                } else if file_kind_for_path(&path) == FileKind::Model
+                    && let Ok(Some(application)) = recommended_application_for_path(&path)
+                {
+                    open_path_with_application(&path, &application.path)
                 } else {
                     open::that(&path).with_context(|| format!("无法打开 {}", path.display()))
                 }
@@ -120,8 +124,8 @@ impl FileEngine {
     pub async fn open_path_as_text(&self, path: PathBuf) -> Result<()> {
         self.runtime
             .spawn_blocking(move || {
-                if !is_text_or_unknown_path(&path) {
-                    anyhow::bail!("该文件不是文本或未知格式：{}", path.display());
+                if path.is_dir() {
+                    anyhow::bail!("文件夹不能以文本方式打开：{}", path.display());
                 }
                 let application =
                     installed_text_editor_application().context("未找到可用的文本编辑器")?;
@@ -132,7 +136,7 @@ impl FileEngine {
     }
 
     pub fn supports_text_opening(path: &Path) -> bool {
-        is_text_or_unknown_path(path)
+        !path.is_dir()
     }
 
     pub async fn choose_open_with_application(&self) -> Result<Option<PathBuf>> {
@@ -207,13 +211,48 @@ fn query_applications_for_path(path: &Path) -> Result<Vec<OpenWithApplication>> 
         anyhow::bail!("Launch Services 查询失败：{message}");
     }
     let mut applications = parse_open_with_applications(&String::from_utf8_lossy(&output.stdout))?;
-    ensure_text_editor(&mut applications);
-    if is_text_or_unknown_path(path)
-        && let Some(notepad_path) = installed_notepad_application()
-    {
-        promote_notepad_application(&mut applications, notepad_path);
+    rank_applications_for_path(path, &mut applications);
+    if is_text_or_unknown_path(path) {
+        ensure_text_editor(&mut applications);
+        if let Some(notepad_path) = installed_notepad_application() {
+            promote_notepad_application(&mut applications, notepad_path);
+        }
     }
     Ok(applications)
+}
+
+fn recommended_application_for_path(path: &Path) -> Result<Option<OpenWithApplication>> {
+    Ok(query_applications_for_path(path)?.into_iter().next())
+}
+
+fn rank_applications_for_path(path: &Path, applications: &mut [OpenWithApplication]) {
+    let kind = file_kind_for_path(path);
+    applications.sort_by_key(|application| {
+        let name = application.name.to_ascii_lowercase();
+        match kind {
+            // Preview is the most reliable built-in handler for macOS polygon
+            // formats. Specialist model tools follow it; generic source editors
+            // remain available but should not become the implicit first choice.
+            FileKind::Model if name == "preview" => 0,
+            FileKind::Model if name == "cloudcompare" => 1,
+            FileKind::Model if name == "meshlab" => 2,
+            FileKind::Model if name == "freecad" => 3,
+            FileKind::Model if name == "blender" => 4,
+            FileKind::Model if name == "xcode" => 100,
+            FileKind::Image if name == "preview" => 0,
+            FileKind::Archive if name == "archive utility" => 0,
+            FileKind::Audio | FileKind::Video if name == "quicktime player" => 0,
+            _ => 20,
+        }
+    });
+}
+
+fn file_kind_for_path(path: &Path) -> FileKind {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    FileItem::kind_for(false, extension.as_deref())
 }
 
 fn open_path_with_application(path: &Path, application: &Path) -> Result<()> {
@@ -438,7 +477,7 @@ mod tests {
     use super::{
         OpenWithApplication, discover_volume_paths, ensure_text_editor, fetch_dir_entries,
         fetch_dir_entries_with_options, is_text_or_unknown_path, is_text_path, is_unix_executable,
-        parse_open_with_applications, promote_notepad_application,
+        parse_open_with_applications, promote_notepad_application, rank_applications_for_path,
     };
     use crate::models::SortMode;
     use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf};
@@ -544,11 +583,42 @@ mod tests {
         assert!(is_text_or_unknown_path(std::path::Path::new("README")));
         assert!(is_text_or_unknown_path(std::path::Path::new("data.custom")));
         assert!(!is_text_or_unknown_path(std::path::Path::new("photo.png")));
+        assert!(!is_text_or_unknown_path(std::path::Path::new(
+            "point-cloud.ply"
+        )));
         promote_notepad_application(&mut applications, notepad_path.clone());
 
         assert_eq!(applications[0].name, "Notepad--");
         assert_eq!(applications[0].path, notepad_path);
         assert_eq!(applications.len(), 2);
+    }
+
+    #[test]
+    fn model_applications_are_ranked_by_type() {
+        let mut applications = vec![
+            OpenWithApplication {
+                name: "Xcode".to_string(),
+                path: "/Applications/Xcode.app".into(),
+            },
+            OpenWithApplication {
+                name: "CloudCompare".to_string(),
+                path: "/Applications/CloudCompare.app".into(),
+            },
+            OpenWithApplication {
+                name: "Preview".to_string(),
+                path: "/System/Applications/Preview.app".into(),
+            },
+        ];
+
+        rank_applications_for_path(std::path::Path::new("point-cloud.ply"), &mut applications);
+
+        assert_eq!(
+            applications
+                .iter()
+                .map(|application| application.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Preview", "CloudCompare", "Xcode"]
+        );
     }
 
     #[test]

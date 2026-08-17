@@ -4,7 +4,7 @@ use super::{
     tooltip::delayed_tooltip,
 };
 use crate::{
-    actions::RenameSelected,
+    actions::{CopyFiles, CutFiles, PasteFiles, RenameSelected},
     models::{
         FileDragPayload, FileItem, FileKind, FileOperationController, Model, Pane, SortMode,
         ViewMode,
@@ -13,13 +13,13 @@ use crate::{
     theme,
 };
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Element, ElementId,
+    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Element, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
     GlobalElementId, Half, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, Pixels, Point, Render, RenderImage,
-    ShapedLine, SharedString, Style, StyledImage, Subscription, TextRun, UTF16Selection,
-    UnderlineStyle, Window, deferred, div, fill, img, point, prelude::*, px, relative, size,
-    uniform_list,
+    ScrollWheelEvent, ShapedLine, SharedString, Style, StyledImage, Subscription, TextRun,
+    UTF16Selection, UnderlineStyle, Window, deferred, div, fill, img, point, prelude::*, px,
+    relative, size, uniform_list,
 };
 use std::{
     cell::RefCell,
@@ -423,6 +423,7 @@ impl MainListView {
             FileKind::Archive => ("ZIP", theme::file_purple()),
             FileKind::Audio => ("AUD", theme::file_purple()),
             FileKind::Video => ("VID", theme::file_green()),
+            FileKind::Model => ("3D", theme::file_blue()),
             FileKind::Other => ("FILE", theme::text_secondary()),
             FileKind::Folder => unreachable!(),
         };
@@ -526,6 +527,7 @@ impl MainListView {
             FileKind::Archive => ("ZIP".to_string(), theme::file_purple()),
             FileKind::Audio => ("AUD".to_string(), theme::file_purple()),
             FileKind::Video => ("VID".to_string(), theme::file_green()),
+            FileKind::Model => ("3D".to_string(), theme::file_blue()),
             FileKind::Other | FileKind::Folder => (
                 item.extension
                     .as_deref()
@@ -1312,6 +1314,43 @@ impl MainListView {
         });
     }
 
+    fn on_copy_rename(&mut self, _: &CopyFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.pane.read(cx).rename_index.is_none() {
+            return;
+        }
+        let value = self.pane.read(cx).rename_buffer.clone();
+        let range = clamp_char_range(&value, self.rename_selected_range.clone());
+        if !range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(value[range].to_string()));
+        }
+        cx.stop_propagation();
+    }
+
+    fn on_cut_rename(&mut self, _: &CutFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.pane.read(cx).rename_index.is_none() {
+            return;
+        }
+        let value = self.pane.read(cx).rename_buffer.clone();
+        let range = clamp_char_range(&value, self.rename_selected_range.clone());
+        if !range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(value[range.clone()].to_string()));
+            self.rename_selected_range = range;
+            self.rename_selection_reversed = false;
+            self.replace_rename_selection("", cx);
+        }
+        cx.stop_propagation();
+    }
+
+    fn on_paste_rename(&mut self, _: &PasteFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.pane.read(cx).rename_index.is_none() {
+            return;
+        }
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.replace_rename_selection(&text.replace(['\n', '\r'], " "), cx);
+        }
+        cx.stop_propagation();
+    }
+
     fn replace_rename_selection(&mut self, new_text: &str, cx: &mut Context<Self>) {
         let value = self.pane.read(cx).rename_buffer.clone();
         let range = clamp_char_range(&value, self.rename_selected_range.clone());
@@ -1587,9 +1626,7 @@ impl EntityInputHandler for MainListView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        if self.pane.read(cx).rename_index.is_none() {
-            return None;
-        }
+        self.pane.read(cx).rename_index?;
         let value = self.pane.read(cx).rename_buffer.clone();
         let range = clamp_char_range(&value, self.rename_range_from_utf16(&range_utf16, cx));
         actual_range.replace(self.rename_range_to_utf16(&range, cx));
@@ -1957,6 +1994,9 @@ impl Render for MainListView {
             .bg(theme::surface())
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::rename_selected))
+            .on_action(cx.listener(Self::on_copy_rename))
+            .on_action(cx.listener(Self::on_cut_rename))
+            .on_action(cx.listener(Self::on_paste_rename))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_move(cx.listener(Self::on_pointer_move))
             .on_mouse_up(
@@ -1967,8 +2007,19 @@ impl Render for MainListView {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.finish_pointer_interaction(cx)),
             )
-            .when(view_mode == ViewMode::Details, |root| {
-                root.overflow_x_scroll()
+            .when(view_mode == ViewMode::Details, |mut root| {
+                // GPUI otherwise redirects a vertical wheel delta into this
+                // horizontal-only scroller, which makes detail rows drift left
+                // and right while the inner uniform list scrolls vertically.
+                root.style().restrict_scroll_to_axis = Some(true);
+                root.overflow_x_scroll().on_scroll_wheel(|event, _, cx| {
+                    // A trackpad commonly reports a tiny X component during a
+                    // vertical gesture. Let the inner list consume that gesture,
+                    // but keep genuinely horizontal gestures available here.
+                    if is_vertical_scroll(event) {
+                        cx.stop_propagation();
+                    }
+                })
             })
             .when_some(details_header, |root, header| root.child(header))
             .child(
@@ -2006,6 +2057,11 @@ impl Render for MainListView {
                     }),
             )
     }
+}
+
+fn is_vertical_scroll(event: &ScrollWheelEvent) -> bool {
+    let delta = event.delta.pixel_delta(px(1.0));
+    delta.y.abs() > delta.x.abs()
 }
 
 fn marquee_bounds(first: Point<Pixels>, second: Point<Pixels>) -> Bounds<Pixels> {
@@ -2067,10 +2123,10 @@ fn initial_rename_selection(item: &FileItem) -> Range<usize> {
 mod grid_name_tests {
     use super::{
         DetailColumn, DetailColumnWidths, MainListView, grid_columns_for_width,
-        initial_rename_selection, marquee_bounds,
+        initial_rename_selection, is_vertical_scroll, marquee_bounds,
     };
     use crate::models::{FileItem, FileKind};
-    use gpui::{point, px};
+    use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
     use std::path::PathBuf;
 
     #[test]
@@ -2084,6 +2140,23 @@ mod grid_name_tests {
 
         widths.resize(DetailColumn::Size, -500.0);
         assert_eq!(widths.size, DetailColumnWidths::minimum(DetailColumn::Size));
+    }
+
+    #[test]
+    fn detail_scroll_ignores_trackpad_cross_axis_noise() {
+        let vertical = ScrollWheelEvent {
+            delta: ScrollDelta::Pixels(point(px(0.7), px(12.0))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+            ..Default::default()
+        };
+        let horizontal = ScrollWheelEvent {
+            delta: ScrollDelta::Pixels(point(px(12.0), px(0.7))),
+            ..vertical.clone()
+        };
+
+        assert!(is_vertical_scroll(&vertical));
+        assert!(!is_vertical_scroll(&horizontal));
     }
 
     #[test]

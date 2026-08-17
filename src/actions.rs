@@ -29,6 +29,7 @@ actions!(
         FindFiles,
         OpenTerminal,
         OpenPreferences,
+        ClosePreferences,
         Quit,
     ]
 );
@@ -83,6 +84,7 @@ pub fn register_keybindings_with_preferences(cx: &mut App, preferences: &AppPref
         ),
         KeyBinding::new("cmd-shift-t", OpenTerminal, Some("Workspace")),
         KeyBinding::new("cmd-,", OpenPreferences, Some("Workspace")),
+        KeyBinding::new("escape", ClosePreferences, Some("Preferences")),
         KeyBinding::new("cmd-q", Quit, None),
     ]);
 }

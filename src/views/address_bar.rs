@@ -5,10 +5,15 @@ use super::{
     },
     tooltip::delayed_tooltip,
 };
-use crate::{models::Model, models::Pane, theme};
+use crate::{
+    actions::{CopyFiles, CutFiles, PasteFiles},
+    models::Model,
+    models::Pane,
+    theme,
+};
 use gpui::{
-    AnyElement, App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, KeyDownEvent,
+    AnyElement, App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, KeyDownEvent,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     Render, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, div,
     fill, point, prelude::*, px, relative, size,
@@ -136,6 +141,45 @@ impl AddressBar {
             }
             _ => {}
         }
+    }
+
+    fn on_copy_text(&mut self, _: &CopyFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editing {
+            return;
+        }
+        let range = clamp_char_range(&self.edit_buffer, self.selected_range.clone());
+        if !range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                self.edit_buffer[range].to_string(),
+            ));
+        }
+        cx.stop_propagation();
+    }
+
+    fn on_cut_text(&mut self, _: &CutFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editing {
+            return;
+        }
+        let range = clamp_char_range(&self.edit_buffer, self.selected_range.clone());
+        if !range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                self.edit_buffer[range.clone()].to_string(),
+            ));
+            self.selected_range = range;
+            self.selection_reversed = false;
+            self.replace_selection("", cx);
+        }
+        cx.stop_propagation();
+    }
+
+    fn on_paste_text(&mut self, _: &PasteFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editing {
+            return;
+        }
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.replace_selection(&text.replace(['\n', '\r'], " "), cx);
+        }
+        cx.stop_propagation();
     }
 
     fn replace_selection(&mut self, new_text: &str, cx: &mut Context<Self>) {
@@ -319,9 +363,30 @@ impl AddressBar {
             .child(glyph)
     }
 
+    fn edit_path_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("edit-current-path")
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(29.0))
+            .rounded_sm()
+            .cursor_pointer()
+            .text_size(theme::font(13.0))
+            .text_color(theme::text_secondary())
+            .hover(|style| style.bg(theme::accent_soft()).text_color(theme::accent()))
+            .tooltip(delayed_tooltip("编辑当前路径"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.begin_edit(window, cx);
+            }))
+            .child("✎")
+    }
+
     fn breadcrumb(&self, path: &Path, cx: &mut Context<Self>) -> AnyElement {
         let pane = self.pane.clone();
         let nodes = breadcrumb_nodes(path);
+        let node_count = nodes.len();
+        let input_entity = cx.entity();
 
         div()
             .flex()
@@ -341,7 +406,13 @@ impl AddressBar {
                     .enumerate()
                     .flat_map(|(index, (label, path))| {
                         let pane = pane.clone();
-                        let tooltip = format!("前往 {}", path.display());
+                        let input_entity = input_entity.clone();
+                        let is_current = index + 1 == node_count;
+                        let tooltip = if is_current {
+                            "编辑当前路径".to_string()
+                        } else {
+                            format!("前往 {}", path.display())
+                        };
                         let label: SharedString = label.into();
                         let node = div()
                             .id(("breadcrumb", index))
@@ -357,8 +428,14 @@ impl AddressBar {
                                 style.bg(theme::accent_soft()).text_color(theme::accent())
                             })
                             .tooltip(delayed_tooltip(tooltip))
-                            .on_click(move |_, _, cx| {
-                                pane.update(cx, |pane, cx| pane.navigate_to(path.clone(), cx));
+                            .on_click(move |_, window, cx| {
+                                if is_current {
+                                    input_entity.update(cx, |input, cx| {
+                                        input.begin_edit(window, cx);
+                                    });
+                                } else {
+                                    pane.update(cx, |pane, cx| pane.navigate_to(path.clone(), cx));
+                                }
                             })
                             .child(label)
                             .into_any_element();
@@ -407,6 +484,9 @@ impl AddressBar {
             .cursor_text()
             .overflow_hidden()
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::on_copy_text))
+            .on_action(cx.listener(Self::on_cut_text))
+            .on_action(cx.listener(Self::on_paste_text))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, {
                 let input_entity = input_entity.clone();
@@ -783,6 +863,7 @@ impl Render for AddressBar {
                         can_go_up,
                     ))
                     .child(path_control)
+                    .child(self.edit_path_button(cx))
                     .child(self.navigation_button(
                         "refresh-directory",
                         "↻",

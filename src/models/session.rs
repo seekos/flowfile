@@ -1,9 +1,15 @@
-use super::{ExplorerTab, LayoutMode, MultiPaneModel, Pane, SortMode, ViewMode, home_directory};
+use super::{
+    ExplorerTab, LayoutMode, MultiPaneModel, Pane, SortMode, ViewMode, home_directory,
+    pane::NAVIGATION_HISTORY_LIMIT,
+};
 use crate::services::FileEngine;
 use anyhow::{Context as _, Result};
 use gpui::App;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 const SESSION_VERSION: u32 = 1;
 
@@ -152,7 +158,7 @@ impl PaneSession {
     }
 }
 
-fn sanitize_tab(tab: &ExplorerTab, fallback_path: &PathBuf) -> ExplorerTab {
+fn sanitize_tab(tab: &ExplorerTab, fallback_path: &Path) -> ExplorerTab {
     let source_history = if tab.history.is_empty() {
         vec![tab.path.clone()]
     } else {
@@ -174,7 +180,19 @@ fn sanitize_tab(tab: &ExplorerTab, fallback_path: &PathBuf) -> ExplorerTab {
     }
 
     if history.is_empty() {
-        return ExplorerTab::new(fallback_path.clone());
+        return ExplorerTab::new(fallback_path.to_path_buf());
+    }
+
+    if history.len() > NAVIGATION_HISTORY_LIMIT {
+        let latest_start = history.len() - NAVIGATION_HISTORY_LIMIT;
+        let centered_start = history_index.saturating_sub(NAVIGATION_HISTORY_LIMIT / 2);
+        let start = centered_start.min(latest_start);
+        history = history
+            .into_iter()
+            .skip(start)
+            .take(NAVIGATION_HISTORY_LIMIT)
+            .collect();
+        history_index -= start;
     }
 
     let path = history[history_index].clone();
@@ -202,7 +220,7 @@ pub fn session_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{PaneSession, SessionState, sanitize_tab};
+    use super::{NAVIGATION_HISTORY_LIMIT, PaneSession, SessionState, sanitize_tab};
     use crate::models::{ExplorerTab, LayoutMode, SortMode, ViewMode};
     use std::{fs, path::PathBuf};
 
@@ -232,6 +250,27 @@ mod tests {
         assert_eq!(restored.history, vec![first.clone(), second]);
         assert_eq!(restored.history_index, 0);
         assert_eq!(restored.path, first);
+    }
+
+    #[test]
+    fn restored_history_is_capped_without_losing_the_current_position() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let valid = directory.path().to_path_buf();
+        let history = (0..NAVIGATION_HISTORY_LIMIT + 40)
+            .map(|_| valid.clone())
+            .collect::<Vec<_>>();
+        let tab = ExplorerTab {
+            title: "history".to_string(),
+            path: valid.clone(),
+            history,
+            history_index: 70,
+        };
+
+        let restored = sanitize_tab(&tab, &valid);
+
+        assert_eq!(restored.history.len(), NAVIGATION_HISTORY_LIMIT);
+        assert_eq!(restored.history_index, NAVIGATION_HISTORY_LIMIT / 2);
+        assert_eq!(restored.path, valid);
     }
 
     #[test]

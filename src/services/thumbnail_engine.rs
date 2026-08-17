@@ -82,7 +82,7 @@ impl ThumbnailEngine {
             && item.size > 0
             && matches!(
                 item.kind,
-                FileKind::Image | FileKind::Audio | FileKind::Video
+                FileKind::Image | FileKind::Audio | FileKind::Video | FileKind::Model
             ))
         .then(|| ThumbnailKey::for_item(item))
     }
@@ -363,11 +363,11 @@ mod tests {
     }
 
     #[test]
-    fn only_media_files_receive_thumbnail_keys() {
+    fn only_previewable_files_receive_thumbnail_keys() {
         let mut file = item(1);
         assert!(ThumbnailEngine::key_for(&file).is_some());
 
-        for kind in [FileKind::Audio, FileKind::Video] {
+        for kind in [FileKind::Audio, FileKind::Video, FileKind::Model] {
             file.kind = kind;
             assert!(ThumbnailEngine::key_for(&file).is_some());
         }

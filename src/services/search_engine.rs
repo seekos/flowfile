@@ -76,12 +76,8 @@ fn spotlight_search(
     scope: SearchScope,
     show_hidden: bool,
 ) -> Result<Vec<FileItem>> {
-    let escaped = query
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('*', "\\*")
-        .replace('?', "\\?");
-    let expression = format!("kMDItemFSName == \"*{escaped}*\"cd");
+    let pattern = spotlight_name_pattern(query);
+    let expression = format!("kMDItemFSName == \"{pattern}\"cd");
     let mut command = Command::new("/usr/bin/mdfind");
     command.arg("-0");
     if scope == SearchScope::CurrentFolder {
@@ -103,6 +99,21 @@ fn spotlight_search(
         .filter(|bytes| !bytes.is_empty())
         .map(|bytes| PathBuf::from(String::from_utf8_lossy(bytes).into_owned()));
     Ok(collect_ranked(paths, query, show_hidden))
+}
+
+fn spotlight_name_pattern(query: &str) -> String {
+    let mut pattern = String::from("*");
+    for (index, character) in query.trim().chars().enumerate() {
+        if index > 0 {
+            pattern.push('*');
+        }
+        if matches!(character, '\\' | '"' | '*' | '?') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push('*');
+    pattern
 }
 
 fn walk_search(query: &str, root: &Path, show_hidden: bool) -> Result<Vec<FileItem>> {
@@ -188,7 +199,7 @@ fn is_hidden_entry(entry: &DirEntry) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::fuzzy_score;
+    use super::{fuzzy_score, spotlight_name_pattern};
 
     #[test]
     fn contiguous_matches_rank_above_sparse_matches() {
@@ -200,5 +211,11 @@ mod tests {
     #[test]
     fn rejects_non_matching_names() {
         assert_eq!(fuzzy_score("notes.txt", "xyz"), None);
+    }
+
+    #[test]
+    fn spotlight_pattern_requests_ordered_character_matches() {
+        assert_eq!(spotlight_name_pattern(" lcapi "), "*l*c*a*p*i*");
+        assert_eq!(spotlight_name_pattern(r#"a*?\"b"#), r#"*a*\**\?*\\*\"*b*"#);
     }
 }

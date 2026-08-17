@@ -1,11 +1,16 @@
 use super::tooltip::delayed_tooltip;
-use crate::{models::Model, models::Pane, theme};
+use crate::{
+    actions::{CopyFiles, CutFiles, PasteFiles},
+    models::Model,
+    models::Pane,
+    theme,
+};
 use gpui::{
-    App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Focusable, GlobalElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, div, fill, point,
-    prelude::*, px, relative, size,
+    App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, KeyDownEvent,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    Render, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, div,
+    fill, point, prelude::*, px, relative, size,
 };
 use std::ops::Range;
 
@@ -116,6 +121,43 @@ impl SearchBar {
             }
             _ => {}
         }
+    }
+
+    fn on_copy_text(&mut self, _: &CopyFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.pane.read(cx).search_active {
+            return;
+        }
+        let query = self.pane.read(cx).search_query.clone();
+        let range = clamp_char_range(&query, self.selected_range.clone());
+        if !range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(query[range].to_string()));
+        }
+        cx.stop_propagation();
+    }
+
+    fn on_cut_text(&mut self, _: &CutFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.pane.read(cx).search_active {
+            return;
+        }
+        let query = self.pane.read(cx).search_query.clone();
+        let range = clamp_char_range(&query, self.selected_range.clone());
+        if !range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(query[range.clone()].to_string()));
+            self.selected_range = range;
+            self.selection_reversed = false;
+            self.replace_search_selection("", cx);
+        }
+        cx.stop_propagation();
+    }
+
+    fn on_paste_text(&mut self, _: &PasteFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.pane.read(cx).search_active {
+            return;
+        }
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.replace_search_selection(&text.replace(['\n', '\r'], " "), cx);
+        }
+        cx.stop_propagation();
     }
 
     fn replace_search_selection(&mut self, new_text: &str, cx: &mut Context<Self>) {
@@ -571,7 +613,10 @@ impl Render for SearchBar {
             })
             .track_focus(&self.focus_handle)
             .when(active, |bar| {
-                bar.on_key_down(cx.listener(Self::on_key_down))
+                bar.on_action(cx.listener(Self::on_copy_text))
+                    .on_action(cx.listener(Self::on_cut_text))
+                    .on_action(cx.listener(Self::on_paste_text))
+                    .on_key_down(cx.listener(Self::on_key_down))
             })
             .child(
                 div()

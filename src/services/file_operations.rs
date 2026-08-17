@@ -4,8 +4,11 @@ use async_channel::Sender;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    ffi::CString,
+    os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    ptr,
     time::Instant,
 };
 use tokio::{
@@ -206,8 +209,15 @@ struct TransferPlan {
 struct PlanEntry {
     source: PathBuf,
     relative: PathBuf,
-    is_dir: bool,
+    kind: PlanEntryKind,
     size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlanEntryKind {
+    Directory,
+    File,
+    Symlink,
 }
 
 async fn execute_transfer(
@@ -322,32 +332,42 @@ async fn build_plan(
     let mut total_bytes = 0_u64;
 
     while let Some((source, relative)) = stack.pop() {
-        let metadata = fs::metadata(&source)
+        let metadata = fs::symlink_metadata(&source)
             .await
             .with_context(|| format!("无法读取 {}", source.display()))?;
-        if metadata.is_dir() {
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            entries.push(PlanEntry {
+                source,
+                relative,
+                kind: PlanEntryKind::Symlink,
+                size: 0,
+            });
+        } else if file_type.is_dir() {
             entries.push(PlanEntry {
                 source: source.clone(),
                 relative: relative.clone(),
-                is_dir: true,
+                kind: PlanEntryKind::Directory,
                 size: 0,
             });
             let mut directory = fs::read_dir(&source).await?;
             while let Some(entry) = directory.next_entry().await? {
                 stack.push((entry.path(), relative.join(entry.file_name())));
             }
-        } else {
+        } else if file_type.is_file() {
             total_bytes += metadata.len();
             entries.push(PlanEntry {
                 source,
                 relative,
-                is_dir: false,
+                kind: PlanEntryKind::File,
                 size: metadata.len(),
             });
+        } else {
+            bail!("不支持复制此类型的文件：{}", source.display());
         }
     }
 
-    entries.sort_by_key(|entry| !entry.is_dir);
+    entries.sort_by_key(|entry| entry.kind != PlanEntryKind::Directory);
     Ok(TransferPlan {
         source_root,
         destination_root,
@@ -369,23 +389,57 @@ async fn copy_plan(
         } else {
             plan.destination_root.join(&entry.relative)
         };
-        if entry.is_dir {
-            fs::create_dir_all(&destination).await?;
-            continue;
+        match entry.kind {
+            PlanEntryKind::Directory => {
+                fs::create_dir_all(&destination).await?;
+            }
+            PlanEntryKind::File => {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                copy_file_streamed(
+                    entry,
+                    &destination,
+                    progress,
+                    total_bytes,
+                    bytes_done,
+                    started,
+                )
+                .await?;
+                copy_metadata(entry.source.clone(), destination, false).await?;
+            }
+            PlanEntryKind::Symlink => {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                let target = fs::read_link(&entry.source)
+                    .await
+                    .with_context(|| format!("无法读取符号链接 {}", entry.source.display()))?;
+                fs::symlink(&target, &destination).await.with_context(|| {
+                    format!(
+                        "无法复制符号链接 {} 到 {}",
+                        entry.source.display(),
+                        destination.display()
+                    )
+                })?;
+                copy_metadata(entry.source.clone(), destination, true).await?;
+            }
         }
+    }
 
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        copy_file_streamed(
-            entry,
-            &destination,
-            progress,
-            total_bytes,
-            bytes_done,
-            started,
-        )
-        .await?;
+    let mut directories = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == PlanEntryKind::Directory)
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|entry| std::cmp::Reverse(entry.relative.components().count()));
+    for entry in directories {
+        let destination = if entry.relative.as_os_str().is_empty() {
+            plan.destination_root.clone()
+        } else {
+            plan.destination_root.join(&entry.relative)
+        };
+        copy_metadata(entry.source.clone(), destination, false).await?;
     }
     Ok(())
 }
@@ -418,6 +472,60 @@ async fn copy_file_streamed(
         send_progress(progress, current_file, *bytes_done, total_bytes, started);
     }
     output.flush().await?;
+    Ok(())
+}
+
+async fn copy_metadata(source: PathBuf, destination: PathBuf, no_follow: bool) -> Result<()> {
+    tokio::task::spawn_blocking(move || copy_macos_metadata(&source, &destination, no_follow))
+        .await
+        .context("文件元数据复制任务异常终止")?
+}
+
+fn copy_macos_metadata(source: &Path, destination: &Path, no_follow: bool) -> Result<()> {
+    const COPYFILE_ACL: u32 = 1 << 0;
+    const COPYFILE_STAT: u32 = 1 << 1;
+    const COPYFILE_XATTR: u32 = 1 << 2;
+    const COPYFILE_METADATA: u32 = COPYFILE_ACL | COPYFILE_STAT | COPYFILE_XATTR;
+    const COPYFILE_NOFOLLOW_SRC: u32 = 1 << 18;
+    const COPYFILE_NOFOLLOW_DST: u32 = 1 << 19;
+
+    unsafe extern "C" {
+        fn copyfile(
+            from: *const std::os::raw::c_char,
+            to: *const std::os::raw::c_char,
+            state: *mut std::ffi::c_void,
+            flags: u32,
+        ) -> std::os::raw::c_int;
+    }
+
+    let source_c = CString::new(source.as_os_str().as_bytes())
+        .with_context(|| format!("源路径包含 NUL 字节：{}", source.display()))?;
+    let destination_c = CString::new(destination.as_os_str().as_bytes())
+        .with_context(|| format!("目标路径包含 NUL 字节：{}", destination.display()))?;
+    let flags = if no_follow {
+        COPYFILE_METADATA | COPYFILE_NOFOLLOW_SRC | COPYFILE_NOFOLLOW_DST
+    } else {
+        COPYFILE_METADATA
+    };
+    // SAFETY: Both paths are valid, NUL-terminated C strings for the duration
+    // of the call. A null state is explicitly supported by macOS copyfile(3).
+    let result = unsafe {
+        copyfile(
+            source_c.as_ptr(),
+            destination_c.as_ptr(),
+            ptr::null_mut(),
+            flags,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "无法复制 {} 的权限和 macOS 元数据到 {}",
+                source.display(),
+                destination.display()
+            )
+        });
+    }
     Ok(())
 }
 
@@ -494,7 +602,11 @@ fn validate_file_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{ConflictPolicy, TransferMode, available_path, execute_transfer, rename_path};
-    use std::fs;
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt as _, symlink},
+        process::Command,
+    };
 
     #[tokio::test]
     async fn copy_uses_numbered_name_when_destination_exists() {
@@ -583,6 +695,96 @@ mod tests {
 
         assert_ne!(destinations[0], destinations[1]);
         assert!(destinations.iter().all(|path| path.exists()));
+    }
+
+    #[tokio::test]
+    async fn copy_preserves_executable_permissions_and_extended_attributes() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let destination_directory = tempfile::tempdir().expect("destination directory");
+        let source = source_directory.path().join("run.sh");
+        fs::write(&source, b"#!/bin/sh\necho ready\n").expect("write executable");
+        let mut permissions = fs::metadata(&source)
+            .expect("source metadata")
+            .permissions();
+        permissions.set_mode(0o751);
+        fs::set_permissions(&source, permissions).expect("set executable permissions");
+        let attribute = "com.flowfile.transfer-test";
+        let status = Command::new("/usr/bin/xattr")
+            .args(["-w", attribute, "preserved"])
+            .arg(&source)
+            .status()
+            .expect("set extended attribute");
+        assert!(status.success());
+        let (progress, _receiver) = async_channel::bounded(8);
+
+        let destinations = execute_transfer(
+            vec![source],
+            destination_directory.path().to_path_buf(),
+            TransferMode::Copy,
+            ConflictPolicy::AutoRename,
+            progress,
+        )
+        .await
+        .expect("copy executable");
+
+        let copied = &destinations[0];
+        assert_eq!(
+            fs::metadata(copied)
+                .expect("copied metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        let output = Command::new("/usr/bin/xattr")
+            .args(["-p", attribute])
+            .arg(copied)
+            .output()
+            .expect("read copied extended attribute");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "preserved");
+    }
+
+    #[tokio::test]
+    async fn copy_preserves_symlinks_without_following_cycles() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let destination_directory = tempfile::tempdir().expect("destination directory");
+        let source = source_directory.path().join("project");
+        fs::create_dir(&source).expect("create project");
+        fs::write(source.join("README.md"), b"hello").expect("write project file");
+        symlink(".", source.join("loop")).expect("create cyclic symlink");
+        let mut permissions = fs::metadata(&source)
+            .expect("source directory metadata")
+            .permissions();
+        permissions.set_mode(0o750);
+        fs::set_permissions(&source, permissions).expect("set directory permissions");
+        let (progress, _receiver) = async_channel::bounded(8);
+
+        let destinations = execute_transfer(
+            vec![source],
+            destination_directory.path().to_path_buf(),
+            TransferMode::Copy,
+            ConflictPolicy::AutoRename,
+            progress,
+        )
+        .await
+        .expect("copy project with cyclic symlink");
+
+        let copied_link = destinations[0].join("loop");
+        let metadata = fs::symlink_metadata(&copied_link).expect("copied link metadata");
+        assert!(metadata.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(copied_link).expect("read copied link"),
+            std::path::Path::new(".")
+        );
+        assert_eq!(
+            fs::metadata(&destinations[0])
+                .expect("copied directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
     }
 
     #[tokio::test]
