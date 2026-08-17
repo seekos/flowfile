@@ -38,6 +38,7 @@ pub struct AppPreferences {
     pub search_shortcut: String,
     pub terminal_shortcut: String,
     pub quick_look_shortcut: String,
+    pub dismissed_update_version: Option<String>,
 }
 
 impl Default for AppPreferences {
@@ -49,6 +50,7 @@ impl Default for AppPreferences {
             search_shortcut: "cmd-f".to_string(),
             terminal_shortcut: "cmd-`".to_string(),
             quick_look_shortcut: "space".to_string(),
+            dismissed_update_version: None,
         }
     }
 }

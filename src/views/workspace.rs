@@ -1,7 +1,7 @@
 use super::{
     context_menu::ContextMenuView,
     multi_pane_container::MultiPaneContainerView,
-    preferences::PreferencesModal,
+    preferences::{PreferencesModal, application_version},
     search_bar::{
         clamp_char_range, next_char_boundary, previous_char_boundary, utf8_to_utf16_offset,
         utf16_to_utf8_offset,
@@ -24,8 +24,8 @@ use crate::{
         Model, MultiPaneModel, Pane, SessionState, home_directory,
     },
     services::{
-        FileEngine, FileInspector, FileOperationEngine, PreviewKind, QuickLookService,
-        SystemTerminal, ThumbnailEngine, TransferMode,
+        AvailableUpdate, FileEngine, FileInspector, FileOperationEngine, PreviewKind,
+        QuickLookService, SystemTerminal, ThumbnailEngine, TransferMode, UpdateChecker,
     },
     theme,
 };
@@ -263,6 +263,7 @@ pub struct WorkspaceView {
     quick_look_focus_handle: FocusHandle,
     session_save_generation: u64,
     last_saved_session: Option<SessionState>,
+    update_notice: Option<AvailableUpdate>,
     #[cfg(target_os = "macos")]
     accessibility: MacAccessibility,
 }
@@ -271,6 +272,8 @@ impl WorkspaceView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let engine = FileEngine::new().expect("failed to initialize FlowFile engine");
         let app_preferences = AppPreferences::load();
+        let dismissed_update_version = app_preferences.dismissed_update_version.clone();
+        let update_checker = UpdateChecker::new(&engine, application_version());
         theme::apply(app_preferences.theme, window.appearance());
         cx.observe_window_appearance(window, |_, window, cx| {
             theme::apply(AppPreferences::load().theme, window.appearance());
@@ -417,7 +420,7 @@ impl WorkspaceView {
         );
         focus_handle.focus(window);
 
-        let workspace = Self {
+        let mut workspace = Self {
             model,
             operations,
             _thumbnails: thumbnails,
@@ -446,6 +449,7 @@ impl WorkspaceView {
             quick_look_focus_handle: cx.focus_handle(),
             session_save_generation: 0,
             last_saved_session: None,
+            update_notice: None,
             #[cfg(target_os = "macos")]
             accessibility,
         };
@@ -460,7 +464,113 @@ impl WorkspaceView {
         })
         .detach();
 
+        workspace.check_for_updates(update_checker, dismissed_update_version, cx);
+
         workspace
+    }
+
+    fn check_for_updates(
+        &mut self,
+        checker: UpdateChecker,
+        dismissed_version: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let Ok(Some(update)) = checker.check().await else {
+                return;
+            };
+            if dismissed_version.as_deref() == Some(update.version.as_str()) {
+                return;
+            }
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.update_notice = Some(update);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn dismiss_update_notice(&mut self, cx: &mut Context<Self>) {
+        let Some(update) = self.update_notice.take() else {
+            return;
+        };
+        let mut preferences = AppPreferences::load();
+        preferences.dismissed_update_version = Some(update.version);
+        if let Err(error) = preferences.save() {
+            self.operations.update(cx, |operations, cx| {
+                operations.show_notice(format!("无法保存更新提示设置：{error}"), true, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn open_update_release(&mut self, cx: &mut Context<Self>) {
+        let Some(update) = self.update_notice.as_ref() else {
+            return;
+        };
+        if let Err(error) = open::that(&update.release_url) {
+            self.operations.update(cx, |operations, cx| {
+                operations.show_notice(format!("无法打开更新页面：{error}"), true, cx);
+            });
+        }
+    }
+
+    fn render_update_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let update = self.update_notice.as_ref()?;
+        let message = format!(
+            "FlowFile {} 已发布（当前版本 {}）",
+            update.version, update.current_version
+        );
+        Some(
+            div()
+                .id("update-notice")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(38.0))
+                .px_4()
+                .border_b_1()
+                .border_color(theme::accent().opacity(0.28))
+                .bg(theme::accent_soft())
+                .text_size(theme::font(10.0))
+                .text_color(theme::text_primary())
+                .child(message)
+                .child(
+                    div()
+                        .id("update-notice-open")
+                        .ml_3()
+                        .px_3()
+                        .h(px(25.0))
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .bg(theme::accent())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::surface())
+                        .cursor_pointer()
+                        .hover(|style| style.opacity(0.88))
+                        .on_click(cx.listener(|this, _, _, cx| this.open_update_release(cx)))
+                        .child("查看更新"),
+                )
+                .child(
+                    div()
+                        .id("update-notice-close")
+                        .ml_2()
+                        .size(px(25.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .text_size(theme::font(13.0))
+                        .text_color(theme::text_secondary())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::surface().opacity(0.7)))
+                        .tooltip(delayed_tooltip("关闭此版本的更新提示"))
+                        .on_click(cx.listener(|this, _, _, cx| this.dismiss_update_notice(cx)))
+                        .child("×"),
+                )
+                .into_any_element(),
+        )
     }
 
     fn capture_session(&self, cx: &App) -> SessionState {
@@ -1438,6 +1548,28 @@ impl WorkspaceView {
                         }
                     }),
             )
+            .child(
+                div()
+                    .id("open-preferences")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(34.0))
+                    .ml_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme::border())
+                    .bg(theme::surface())
+                    .text_size(theme::font(15.0))
+                    .text_color(theme::text_secondary())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::accent_soft()).text_color(theme::accent()))
+                    .tooltip(delayed_tooltip("打开设置 (⌘,)"))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(OpenPreferences), cx);
+                    })
+                    .child("⚙︎"),
+            )
     }
 
     fn titlebar_sidebar(&self, window: &Window) -> impl IntoElement {
@@ -2104,6 +2236,7 @@ impl Render for WorkspaceView {
         let input_entity = cx.entity();
         let modal = self.render_modal(cx, input_entity);
         let quick_look = self.render_quick_look(cx);
+        let update_notice = self.render_update_notice(cx);
         div()
             .id("workspace")
             .key_context("Workspace")
@@ -2142,6 +2275,7 @@ impl Render for WorkspaceView {
             .bg(theme::canvas())
             .text_color(theme::text_primary())
             .child(self.titlebar(window, cx))
+            .when_some(update_notice, |workspace, notice| workspace.child(notice))
             .child(
                 div()
                     .flex()

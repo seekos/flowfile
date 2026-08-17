@@ -9,6 +9,8 @@ use gpui::{
     black, div, prelude::*, px,
 };
 
+const PROJECT_URL: &str = "https://github.com/seekos/flowfile";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShortcutTarget {
     Search,
@@ -19,6 +21,7 @@ enum ShortcutTarget {
 pub struct PreferencesModal {
     model: Model<MultiPaneModel>,
     preferences: AppPreferences,
+    version: String,
     visible: bool,
     capturing: Option<ShortcutTarget>,
     error: Option<String>,
@@ -35,6 +38,7 @@ impl PreferencesModal {
         Self {
             model,
             preferences: AppPreferences::load(),
+            version: application_version(),
             visible: false,
             capturing: None,
             error: None,
@@ -65,7 +69,8 @@ impl PreferencesModal {
                 .map(|error| format!("，错误：{error}"))
                 .unwrap_or_default();
             format!(
-                "主题：{}；默认布局：{}；显示隐藏文件：{}；搜索快捷键：{}；终端快捷键：{}；Quick Look 快捷键：{}{}{}",
+                "版本：{}；主题：{}；默认布局：{}；显示隐藏文件：{}；搜索快捷键：{}；终端快捷键：{}；Quick Look 快捷键：{}{}{}",
+                self.version,
                 self.preferences.theme.label(),
                 self.preferences.default_layout.label(),
                 if self.preferences.show_hidden { "是" } else { "否" },
@@ -133,6 +138,13 @@ impl PreferencesModal {
         });
         actions::register_keybindings_with_preferences(cx, &self.preferences);
         self.close(window, cx);
+    }
+
+    fn open_project_page(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = open::that(PROJECT_URL) {
+            self.error = Some(format!("无法打开项目页面：{error}"));
+            cx.notify();
+        }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -285,6 +297,7 @@ impl Render for PreferencesModal {
         let search_shortcut = self.preferences.search_shortcut.clone();
         let terminal_shortcut = self.preferences.terminal_shortcut.clone();
         let quicklook_shortcut = self.preferences.quick_look_shortcut.clone();
+        let version = self.version.clone();
 
         div()
             .id("preferences-modal")
@@ -419,6 +432,50 @@ impl Render for PreferencesModal {
                         quicklook_shortcut,
                         cx,
                     ))
+                    .child(
+                        div()
+                            .mt_4()
+                            .mb_1()
+                            .text_size(theme::font(9.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::text_tertiary())
+                            .child("关于"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .p_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme::border())
+                            .bg(theme::surface_subtle())
+                            .child(
+                                div()
+                                    .text_size(theme::font(10.0))
+                                    .text_color(theme::text_primary())
+                                    .child(
+                                        "FlowFile 是一款面向 macOS 的轻量、高效多面板文件管理器。",
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("preferences-project-link")
+                                    .mt_2()
+                                    .flex()
+                                    .items_center()
+                                    .text_size(theme::font(9.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::accent())
+                                    .cursor_pointer()
+                                    .hover(|style| style.opacity(0.75))
+                                    .tooltip(delayed_tooltip("在浏览器中打开 FlowFile 项目页面"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_project_page(cx)),
+                                    )
+                                    .child(PROJECT_URL),
+                            ),
+                    )
                     .when_some(error, |card, error| {
                         card.child(
                             div()
@@ -431,47 +488,82 @@ impl Render for PreferencesModal {
                     .child(
                         div()
                             .flex()
-                            .justify_end()
-                            .gap_2()
+                            .items_center()
+                            .justify_between()
                             .mt_4()
                             .child(
                                 div()
-                                    .id("preferences-cancel")
-                                    .h(px(30.0))
-                                    .px_4()
-                                    .flex()
-                                    .items_center()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(theme::border())
-                                    .hover(|style| style.bg(theme::surface_subtle()))
-                                    .tooltip(delayed_tooltip("放弃更改并关闭 (Esc)"))
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.cancel(window, cx)),
-                                    )
-                                    .child("取消"),
+                                    .text_size(theme::font(9.0))
+                                    .text_color(theme::text_tertiary())
+                                    .child(format!("FlowFile v{version}")),
                             )
                             .child(
                                 div()
-                                    .id("preferences-save")
-                                    .h(px(30.0))
-                                    .px_4()
                                     .flex()
-                                    .items_center()
-                                    .rounded_md()
-                                    .bg(theme::accent())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::surface())
-                                    .tooltip(delayed_tooltip("保存设置"))
-                                    .on_click(
-                                        cx.listener(|this, _, window, cx| this.save(window, cx)),
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("preferences-cancel")
+                                            .h(px(30.0))
+                                            .px_4()
+                                            .flex()
+                                            .items_center()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(theme::border())
+                                            .hover(|style| style.bg(theme::surface_subtle()))
+                                            .tooltip(delayed_tooltip("放弃更改并关闭 (Esc)"))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.cancel(window, cx)
+                                            }))
+                                            .child("取消"),
                                     )
-                                    .child("保存设置"),
+                                    .child(
+                                        div()
+                                            .id("preferences-save")
+                                            .h(px(30.0))
+                                            .px_4()
+                                            .flex()
+                                            .items_center()
+                                            .rounded_md()
+                                            .bg(theme::accent())
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::surface())
+                                            .tooltip(delayed_tooltip("保存设置"))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.save(window, cx)
+                                            }))
+                                            .child("保存设置"),
+                                    ),
                             ),
                     ),
             )
             .into_any_element()
     }
+}
+
+pub(super) fn application_version() -> String {
+    let bundled_version = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(std::path::Path::to_path_buf))
+        .filter(|directory| directory.file_name().and_then(|name| name.to_str()) == Some("MacOS"))
+        .and_then(|macos_directory| macos_directory.parent().map(std::path::Path::to_path_buf))
+        .filter(|directory| {
+            directory.file_name().and_then(|name| name.to_str()) == Some("Contents")
+        })
+        .map(|contents_directory| contents_directory.join("Info.plist"))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|plist| short_version_from_plist(&plist));
+
+    bundled_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+fn short_version_from_plist(plist: &str) -> Option<String> {
+    let (_, remainder) = plist.split_once("<key>CFBundleShortVersionString</key>")?;
+    let (_, remainder) = remainder.split_once("<string>")?;
+    let (version, _) = remainder.split_once("</string>")?;
+    let version = version.trim();
+    (!version.is_empty()).then(|| version.to_string())
 }
 
 fn next_layout(layout: LayoutMode) -> LayoutMode {
@@ -515,4 +607,20 @@ fn display_keystroke(value: &str) -> String {
         .replace("shift-", "⇧")
         .replace("alt-", "⌥")
         .replace("ctrl-", "⌃")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short_version_from_plist;
+
+    #[test]
+    fn reads_short_version_from_bundle_plist() {
+        let plist = r#"
+            <key>CFBundleName</key><string>FlowFile</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.4.2</string>
+        "#;
+
+        assert_eq!(short_version_from_plist(plist).as_deref(), Some("1.4.2"));
+    }
 }
