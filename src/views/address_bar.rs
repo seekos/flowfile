@@ -15,8 +15,8 @@ use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, KeyDownEvent,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    Render, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, div,
-    fill, point, prelude::*, px, relative, size,
+    Render, ShapedLine, SharedString, Style, Subscription, TextRun, UTF16Selection, UnderlineStyle,
+    Window, div, fill, point, prelude::*, px, relative, size,
 };
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
@@ -34,6 +34,7 @@ pub struct AddressBar {
     editing: bool,
     edit_buffer: String,
     focus_handle: FocusHandle,
+    blur_subscription: Option<Subscription>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -51,6 +52,7 @@ impl AddressBar {
             editing: false,
             edit_buffer: String::new(),
             focus_handle: cx.focus_handle(),
+            blur_subscription: None,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -806,7 +808,18 @@ impl Element for AddressTextElement {
 }
 
 impl Render for AddressBar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.blur_subscription.is_none() {
+            self.blur_subscription =
+                Some(cx.on_blur(&self.focus_handle, window, |this, _window, cx| {
+                    if this.editing {
+                        this.editing = false;
+                        this.marked_range = None;
+                        this.is_selecting = false;
+                        cx.notify();
+                    }
+                }));
+        }
         let (path, can_go_back, can_go_forward, can_go_up, error) = {
             let pane = self.pane.read(cx);
             (
