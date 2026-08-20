@@ -554,10 +554,19 @@ impl MainListView {
                     .border_1()
                     .border_color(color.opacity(0.78))
                     .bg(theme::surface_subtle())
+                    .overflow_hidden()
                     .text_size(theme::font(9.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(color)
-                    .child(label),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .w_full()
+                            .px_1()
+                            .truncate()
+                            .text_center()
+                            .child(label),
+                    ),
             )
             .into_any_element()
     }
