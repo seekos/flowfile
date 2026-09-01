@@ -112,7 +112,7 @@ impl AddressBar {
                 let input = self.edit_buffer.trim().to_string();
                 if !input.is_empty() {
                     self.pane
-                        .update(cx, |pane, cx| pane.navigate_to(PathBuf::from(input), cx));
+                        .update(cx, |pane, cx| pane.navigate_to_address(input, cx));
                 }
                 self.editing = false;
                 cx.notify();
@@ -377,7 +377,7 @@ impl AddressBar {
             .text_size(theme::font(13.0))
             .text_color(theme::text_secondary())
             .hover(|style| style.bg(theme::accent_soft()).text_color(theme::accent()))
-            .tooltip(delayed_tooltip("编辑当前路径"))
+            .tooltip(delayed_tooltip("编辑路径或连接 SMB 服务器"))
             .on_click(cx.listener(|this, _, window, cx| {
                 this.begin_edit(window, cx);
             }))
@@ -436,7 +436,12 @@ impl AddressBar {
                                         input.begin_edit(window, cx);
                                     });
                                 } else {
-                                    pane.update(cx, |pane, cx| pane.navigate_to(path.clone(), cx));
+                                    pane.update(cx, |pane, cx| {
+                                        pane.navigate_to_address(
+                                            path.to_string_lossy().into_owned(),
+                                            cx,
+                                        )
+                                    });
                                 }
                             })
                             .child(label)
@@ -458,7 +463,7 @@ impl AddressBar {
                     .h_full()
                     .min_w(px(24.0))
                     .flex_1()
-                    .tooltip(delayed_tooltip("编辑当前路径"))
+                    .tooltip(delayed_tooltip("编辑路径或连接 SMB 服务器"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.begin_edit(window, cx);
                     })),
@@ -901,6 +906,15 @@ impl Render for AddressBar {
 }
 
 fn breadcrumb_nodes(path: &Path) -> Vec<(String, PathBuf)> {
+    let display = path.to_string_lossy();
+    if let Some(server) = display.strip_prefix("smb://") {
+        let path = path.to_path_buf();
+        return vec![
+            ("SMB".to_string(), path.clone()),
+            (server.to_string(), path),
+        ];
+    }
+
     let mut nodes = vec![("Mac".to_string(), PathBuf::from("/"))];
     let mut current = PathBuf::from("/");
 

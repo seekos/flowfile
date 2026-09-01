@@ -781,10 +781,22 @@ impl WorkspaceView {
     }
 
     fn on_new_folder(&mut self, _: &NewFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_pane(cx).read(cx).is_smb_server_root() {
+            self.operations.update(cx, |operations, cx| {
+                operations.show_notice("请先打开一个 SMB 共享文件夹再新建项目", true, cx)
+            });
+            return;
+        }
         self.open_name_modal(CreateItemKind::Folder, "新建文件夹".to_string(), window, cx);
     }
 
     fn on_new_text_file(&mut self, _: &NewTextFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_pane(cx).read(cx).is_smb_server_root() {
+            self.operations.update(cx, |operations, cx| {
+                operations.show_notice("请先打开一个 SMB 共享文件夹再新建项目", true, cx)
+            });
+            return;
+        }
         self.open_name_modal(
             CreateItemKind::TextFile,
             "未命名.txt".to_string(),
@@ -856,7 +868,15 @@ impl WorkspaceView {
     }
 
     fn on_open_terminal(&mut self, _: &OpenTerminal, _window: &mut Window, cx: &mut Context<Self>) {
-        let path = self.active_pane(cx).read(cx).current_path.clone();
+        let pane = self.active_pane(cx);
+        let pane = pane.read(cx);
+        if pane.is_smb_server_root() {
+            self.operations.update(cx, |operations, cx| {
+                operations.show_notice("请先打开一个 SMB 共享文件夹再打开终端", true, cx)
+            });
+            return;
+        }
+        let path = pane.current_path.clone();
         self.terminal.open(path);
     }
 

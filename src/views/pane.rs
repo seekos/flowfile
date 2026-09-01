@@ -7,7 +7,9 @@ use crate::{
     services::{ThumbnailEngine, TransferMode},
     theme,
 };
-use gpui::{AnyElement, Context, Entity, IntoElement, Render, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, Entity, ExternalPaths, IntoElement, Render, Window, div, prelude::*, px,
+};
 
 pub struct PaneView {
     index: usize,
@@ -71,6 +73,8 @@ impl Render for PaneView {
         let multi_pane = self.multi_pane.clone();
         let pane_model = self.pane.clone();
         let operations = self.operations.clone();
+        let external_pane_model = self.pane.clone();
+        let external_operations = self.operations.clone();
         let index = self.index;
 
         div()
@@ -101,7 +105,9 @@ impl Render for PaneView {
                     .bg(theme::accent_soft().opacity(0.35))
             })
             .on_drop(move |payload: &FileDragPayload, window, cx| {
-                if payload.source_pane_index == index && !window.modifiers().alt {
+                if pane_model.read(cx).is_smb_server_root()
+                    || payload.source_pane_index == index && !window.modifiers().alt
+                {
                     return;
                 }
                 let destination = pane_model.read(cx).current_path.clone();
@@ -112,6 +118,31 @@ impl Render for PaneView {
                 };
                 operations.update(cx, |operations, cx| {
                     operations.transfer_to_path(payload.paths.clone(), destination, mode, cx);
+                });
+            })
+            .drag_over::<ExternalPaths>(|style, _, _, _| {
+                style
+                    .border_color(theme::accent())
+                    .bg(theme::accent_soft().opacity(0.35))
+            })
+            .on_drop(move |payload: &ExternalPaths, window, cx| {
+                if external_pane_model.read(cx).is_smb_server_root() {
+                    return;
+                }
+                let destination = external_pane_model.read(cx).current_path.clone();
+                let paths = payload.paths().to_vec();
+                if paths.iter().all(|path| {
+                    path == &destination || path.parent() == Some(destination.as_path())
+                }) {
+                    return;
+                }
+                let mode = if window.modifiers().alt {
+                    TransferMode::Copy
+                } else {
+                    TransferMode::Move
+                };
+                external_operations.update(cx, |operations, cx| {
+                    operations.transfer_to_path(paths, destination, mode, cx);
                 });
             })
             .child(

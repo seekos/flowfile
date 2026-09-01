@@ -19,12 +19,22 @@ impl VolumeInfo {
         self.filesystem.eq_ignore_ascii_case("ntfs")
     }
 
+    pub fn is_smb(&self) -> bool {
+        self.filesystem.eq_ignore_ascii_case("smbfs")
+    }
+
     pub fn status_label(&self) -> Option<&'static str> {
-        self.is_ntfs().then_some(if self.read_only {
-            "NTFS · 只读"
+        if self.is_smb() {
+            Some("SMB · 网络共享")
+        } else if self.is_ntfs() {
+            Some(if self.read_only {
+                "NTFS · 只读"
+            } else {
+                "NTFS · 可写"
+            })
         } else {
-            "NTFS · 可写"
-        })
+            None
+        }
     }
 }
 
@@ -133,15 +143,32 @@ pub(crate) fn eject(path: &Path) -> Result<()> {
         anyhow::bail!("只能弹出外置卷");
     }
 
-    let output = Command::new("/usr/sbin/diskutil")
-        .arg("eject")
-        .arg(path)
-        .output()
-        .with_context(|| format!("无法弹出 {}", path.display()))?;
+    let is_network_volume = read_mounts()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|mount| mount.path == path)
+        .is_some_and(|mount| mount.filesystem.eq_ignore_ascii_case("smbfs"));
+    let output = if is_network_volume {
+        Command::new("/sbin/umount")
+            .arg(path)
+            .output()
+            .with_context(|| format!("无法断开网络共享 {}", path.display()))?
+    } else {
+        Command::new("/usr/sbin/diskutil")
+            .arg("eject")
+            .arg(path)
+            .output()
+            .with_context(|| format!("无法弹出 {}", path.display()))?
+    };
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         anyhow::bail!(
-            "无法弹出 {}{}",
+            "无法{} {}{}",
+            if is_network_volume {
+                "断开网络共享"
+            } else {
+                "弹出"
+            },
             path.file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("该卷"),

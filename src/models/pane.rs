@@ -1,6 +1,7 @@
-use super::{FileItem, SortMode};
+use super::{FileItem, FileKind, SortMode};
 use crate::services::{
     DirectorySnapshot, FileEngine, FileOperationEngine, FileWatcher, SearchEngine, SearchScope,
+    SmbNavigation, SmbShare,
 };
 use gpui::{Context, Timer};
 use serde::{Deserialize, Serialize};
@@ -68,10 +69,17 @@ impl ExplorerTab {
     }
 }
 
+#[derive(Clone, Copy)]
 enum NavigationIntent {
     Push,
     History(usize),
     Refresh,
+}
+
+#[derive(Clone)]
+struct SmbMountContext {
+    server_address: String,
+    mount_path: PathBuf,
 }
 
 pub struct Pane {
@@ -101,6 +109,8 @@ pub struct Pane {
     load_generation: u64,
     watcher_generation: u64,
     watcher: Option<FileWatcher>,
+    smb_server_root: bool,
+    smb_mount: Option<SmbMountContext>,
 }
 
 impl Pane {
@@ -134,6 +144,8 @@ impl Pane {
             load_generation: 0,
             watcher_generation: 0,
             watcher: None,
+            smb_server_root: false,
+            smb_mount: None,
         }
     }
 
@@ -154,7 +166,7 @@ impl Pane {
     }
 
     pub fn can_go_up(&self) -> bool {
-        self.current_path.parent().is_some()
+        !self.smb_server_root && self.current_path.parent().is_some()
     }
 
     pub fn load_initial(&mut self, cx: &mut Context<Self>) {
@@ -167,12 +179,71 @@ impl Pane {
         self.load_path(path, NavigationIntent::Push, cx);
     }
 
+    pub fn navigate_to_address(&mut self, input: String, cx: &mut Context<Self>) {
+        if !FileEngine::looks_like_smb_address(&input) {
+            self.navigate_to(PathBuf::from(input), cx);
+            return;
+        }
+
+        self.cancel_search_state();
+        self.load_smb_address(input, NavigationIntent::Push, cx);
+    }
+
+    fn load_smb_address(
+        &mut self,
+        input: String,
+        intent: NavigationIntent,
+        cx: &mut Context<Self>,
+    ) {
+        self.load_generation += 1;
+        let generation = self.load_generation;
+        let engine = self.engine.clone();
+        self.watcher_generation += 1;
+        self.watcher = None;
+        self.is_loading = true;
+        self.error_message = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = engine.connect_smb(input).await;
+            let _ = this.update(cx, |pane, cx| {
+                if pane.load_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(SmbNavigation::Directory {
+                        path,
+                        server_address,
+                        mount_path,
+                    }) => {
+                        pane.smb_mount = Some(SmbMountContext {
+                            server_address,
+                            mount_path,
+                        });
+                        pane.load_path(path, intent, cx);
+                    }
+                    Ok(SmbNavigation::Server { address, shares }) => {
+                        pane.is_loading = false;
+                        pane.apply_smb_server(address, shares, intent);
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        pane.is_loading = false;
+                        pane.error_message = Some(error.to_string());
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn go_back(&mut self, cx: &mut Context<Self>) {
         self.cancel_search_state();
         let tab = self.active_tab();
         if tab.can_go_back() {
             let index = tab.history_index - 1;
-            self.load_path(
+            self.load_navigation_path(
                 tab.history[index].clone(),
                 NavigationIntent::History(index),
                 cx,
@@ -185,7 +256,7 @@ impl Pane {
         let tab = self.active_tab();
         if tab.can_go_forward() {
             let index = tab.history_index + 1;
-            self.load_path(
+            self.load_navigation_path(
                 tab.history[index].clone(),
                 NavigationIntent::History(index),
                 cx,
@@ -195,13 +266,20 @@ impl Pane {
 
     pub fn go_up(&mut self, cx: &mut Context<Self>) {
         self.cancel_search_state();
+        if self.smb_server_root {
+            return;
+        }
+        if let Some(server_address) = self.smb_parent_address() {
+            self.load_smb_address(server_address, NavigationIntent::Push, cx);
+            return;
+        }
         if let Some(parent) = self.current_path.parent() {
             self.load_path(parent.to_path_buf(), NavigationIntent::Push, cx);
         }
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.load_path(self.current_path.clone(), NavigationIntent::Refresh, cx);
+        self.load_navigation_path(self.current_path.clone(), NavigationIntent::Refresh, cx);
     }
 
     pub fn toggle_hidden(&mut self, cx: &mut Context<Self>) {
@@ -225,6 +303,11 @@ impl Pane {
     }
 
     pub fn begin_search(&mut self, cx: &mut Context<Self>) {
+        if self.smb_server_root {
+            self.error_message = Some("请先打开一个 SMB 共享文件夹再搜索".to_string());
+            cx.notify();
+            return;
+        }
         if !self.search_active {
             self.search_original_items = self.items.clone();
             self.search_active = true;
@@ -372,6 +455,9 @@ impl Pane {
     }
 
     pub fn selected_paths(&self) -> Vec<PathBuf> {
+        if self.smb_server_root {
+            return Vec::new();
+        }
         self.selected_indices
             .iter()
             .filter_map(|index| self.items.get(*index))
@@ -427,6 +513,11 @@ impl Pane {
             return;
         };
 
+        if self.smb_server_root {
+            self.navigate_to_address(item.path.to_string_lossy().into_owned(), cx);
+            return;
+        }
+
         if should_navigate_to(&item) {
             self.navigate_to(item.path, cx);
         } else {
@@ -435,6 +526,9 @@ impl Pane {
     }
 
     pub fn begin_rename(&mut self) {
+        if self.smb_server_root {
+            return;
+        }
         if self.selection_count() != 1 {
             return;
         }
@@ -553,6 +647,71 @@ impl Pane {
         .detach();
     }
 
+    fn load_navigation_path(
+        &mut self,
+        path: PathBuf,
+        intent: NavigationIntent,
+        cx: &mut Context<Self>,
+    ) {
+        let address = path.to_string_lossy();
+        if FileEngine::looks_like_smb_address(&address) {
+            self.load_smb_address(address.into_owned(), intent, cx);
+        } else {
+            self.load_path(path, intent, cx);
+        }
+    }
+
+    fn apply_smb_server(
+        &mut self,
+        address: String,
+        shares: Vec<SmbShare>,
+        intent: NavigationIntent,
+    ) {
+        let path = PathBuf::from(&address);
+        match intent {
+            NavigationIntent::Push => self.active_tab_mut().push_path(path.clone()),
+            NavigationIntent::History(index) => {
+                self.active_tab_mut().move_to_history(index, path.clone())
+            }
+            NavigationIntent::Refresh => {
+                let tab = self.active_tab_mut();
+                tab.path = path.clone();
+                tab.title = path_title(&path);
+            }
+        }
+        self.current_path = path;
+        self.items = shares
+            .into_iter()
+            .map(|share| FileItem {
+                path: PathBuf::from(share.address),
+                name: share.name,
+                is_dir: true,
+                extension: None,
+                size: 0,
+                modified_unix: 0,
+                modified: "SMB 共享".to_string(),
+                is_hidden: false,
+                kind: FileKind::Folder,
+            })
+            .collect();
+        FileItem::sort_items(&mut self.items, self.sort_mode);
+        self.selected_index = None;
+        self.selected_indices.clear();
+        self.rename_index = None;
+        self.rename_in_progress = false;
+        self.error_message = None;
+        self.smb_server_root = true;
+        if self
+            .smb_mount
+            .as_ref()
+            .is_some_and(|mount| mount.server_address != address)
+        {
+            self.smb_mount = None;
+        }
+        self.watcher_generation += 1;
+        self.watcher = None;
+    }
+
     fn apply_snapshot(&mut self, snapshot: DirectorySnapshot, intent: NavigationIntent) {
         if self.search_active && matches!(&intent, NavigationIntent::Refresh) {
             self.search_original_items = snapshot.items;
@@ -576,6 +735,14 @@ impl Pane {
             }
         }
         self.current_path = snapshot.path;
+        self.smb_server_root = false;
+        if self
+            .smb_mount
+            .as_ref()
+            .is_some_and(|mount| !self.current_path.starts_with(&mount.mount_path))
+        {
+            self.smb_mount = None;
+        }
         self.items = snapshot.items;
         self.selected_indices = self
             .items
@@ -587,6 +754,24 @@ impl Pane {
         self.selected_index = self.selected_indices.iter().next_back().copied();
         self.rename_index = None;
         self.rename_in_progress = false;
+    }
+
+    pub fn is_smb_server_root(&self) -> bool {
+        self.smb_server_root
+    }
+
+    pub fn smb_server_for_mount(&self, mount_path: &Path) -> Option<String> {
+        self.smb_mount
+            .as_ref()
+            .filter(|mount| mount.mount_path == mount_path)
+            .map(|mount| mount.server_address.clone())
+    }
+
+    fn smb_parent_address(&self) -> Option<String> {
+        self.smb_mount
+            .as_ref()
+            .filter(|mount| self.current_path == mount.mount_path)
+            .map(|mount| mount.server_address.clone())
     }
 
     fn start_watching(&mut self, cx: &mut Context<Self>) {
@@ -660,7 +845,9 @@ pub fn home_directory() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExplorerTab, NAVIGATION_HISTORY_LIMIT, Pane, ViewMode, should_navigate_to};
+    use super::{
+        ExplorerTab, NAVIGATION_HISTORY_LIMIT, Pane, SmbMountContext, ViewMode, should_navigate_to,
+    };
     use crate::{
         models::{FileItem, FileKind},
         services::FileEngine,
@@ -816,5 +1003,24 @@ mod tests {
 
         assert!(!should_navigate_to(&application));
         assert!(should_navigate_to(&folder));
+    }
+
+    #[test]
+    fn mounted_share_root_has_the_smb_server_as_its_parent() {
+        let mut pane = Pane::new(
+            PathBuf::from("/Volumes/Media"),
+            FileEngine::new().expect("file engine"),
+        );
+        pane.smb_mount = Some(SmbMountContext {
+            server_address: "smb://192.168.70.10".to_string(),
+            mount_path: PathBuf::from("/Volumes/Media"),
+        });
+
+        assert_eq!(
+            pane.smb_parent_address().as_deref(),
+            Some("smb://192.168.70.10")
+        );
+        pane.current_path.push("Movies");
+        assert_eq!(pane.smb_parent_address(), None);
     }
 }

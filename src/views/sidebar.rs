@@ -7,8 +7,8 @@ use crate::{
     theme,
 };
 use gpui::{
-    Context, Entity, FontWeight, IntoElement, Render, SharedString, Timer, Window, div, prelude::*,
-    px,
+    Context, Entity, ExternalPaths, FontWeight, IntoElement, Render, SharedString, Timer, Window,
+    div, prelude::*, px,
 };
 use std::{
     collections::HashSet,
@@ -230,7 +230,14 @@ impl SidebarView {
                         let panes = sidebar.model.read(cx).panes.clone();
                         for pane in panes {
                             if pane.read(cx).current_path.starts_with(&path) {
-                                pane.update(cx, |pane, cx| pane.navigate_to(fallback.clone(), cx));
+                                let server_address = pane.read(cx).smb_server_for_mount(&path);
+                                pane.update(cx, |pane, cx| {
+                                    if let Some(server_address) = server_address {
+                                        pane.navigate_to_address(server_address, cx);
+                                    } else {
+                                        pane.navigate_to(fallback.clone(), cx);
+                                    }
+                                });
                             }
                         }
                         operations.update(cx, |operations, cx| {
@@ -260,6 +267,8 @@ impl SidebarView {
         let operations = self.operations.clone();
         let path = location.path.clone();
         let drop_path = path.clone();
+        let external_drop_path = path.clone();
+        let external_operations = self.operations.clone();
         let tooltip = format!("在当前面板中打开 {}", path.display());
         let label: SharedString = location.label.into();
         let detail = location.detail.map(SharedString::from);
@@ -299,6 +308,26 @@ impl SidebarView {
                 };
                 operations.update(cx, |operations, cx| {
                     operations.transfer_to_path(payload.paths.clone(), drop_path.clone(), mode, cx);
+                });
+            })
+            .drag_over::<ExternalPaths>(|style, _, _, _| {
+                style.bg(theme::accent_soft()).text_color(theme::accent())
+            })
+            .on_drop(move |payload: &ExternalPaths, window, cx| {
+                let paths = payload.paths().to_vec();
+                if paths.iter().all(|path| {
+                    path == &external_drop_path
+                        || path.parent() == Some(external_drop_path.as_path())
+                }) {
+                    return;
+                }
+                let mode = if window.modifiers().alt {
+                    TransferMode::Copy
+                } else {
+                    TransferMode::Move
+                };
+                external_operations.update(cx, |operations, cx| {
+                    operations.transfer_to_path(paths, external_drop_path.clone(), mode, cx);
                 });
             })
             .on_click(move |_, _, cx| {

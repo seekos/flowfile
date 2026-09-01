@@ -5,24 +5,21 @@ use super::{
 };
 use crate::{
     actions::{CopyFiles, CutFiles, PasteFiles, RenameSelected},
-    models::{
-        FileDragPayload, FileItem, FileKind, FileOperationController, Model, Pane, SortMode,
-        ViewMode,
-    },
-    services::ThumbnailEngine,
+    models::{FileItem, FileKind, FileOperationController, Model, Pane, SortMode, ViewMode},
+    services::{ThumbnailEngine, begin_external_file_drag, end_external_file_drag},
     theme,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Element, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
-    GlobalElementId, Half, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    GlobalElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, Pixels, Point, Render, RenderImage,
     ScrollWheelEvent, ShapedLine, SharedString, Style, StyledImage, Subscription, TextRun,
     UTF16Selection, UnderlineStyle, Window, deferred, div, fill, img, point, prelude::*, px,
     relative, size, uniform_list,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap},
     ops::Range,
     path::PathBuf,
@@ -94,55 +91,11 @@ impl DetailColumnWidths {
     }
 }
 
-struct DragPreview {
-    label: String,
-    position: Point<Pixels>,
-}
-
 #[derive(Clone)]
 struct MarqueeSelection {
     start: Point<Pixels>,
     current: Point<Pixels>,
     base_selection: BTreeSet<usize>,
-}
-
-impl Render for DragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let preview_size = size(px(172.0), px(40.0));
-        div()
-            .pl(self.position.x - preview_size.width.half())
-            .pt(self.position.y - preview_size.height.half())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .w(preview_size.width)
-                    .h(preview_size.height + px(4.0))
-                    .px_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme::accent())
-                    .bg(theme::surface().opacity(0.96))
-                    .shadow_lg()
-                    .text_size(theme::font(10.0))
-                    .text_color(theme::text_primary())
-                    .child("↗")
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .child(self.label.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme::font(8.0))
-                            .text_color(theme::text_tertiary())
-                            .child("⌥ 复制"),
-                    ),
-            )
-    }
 }
 
 struct RenameTextElement {
@@ -875,6 +828,7 @@ impl MainListView {
     }
 
     fn finish_pointer_interaction(&mut self, cx: &mut Context<Self>) {
+        end_external_file_drag();
         self.finish_column_resize();
         if self.marquee.take().is_some() {
             cx.notify();
@@ -1037,16 +991,7 @@ impl MainListView {
         } else {
             vec![item.path.clone()]
         };
-        let drag_payload = FileDragPayload {
-            paths: drag_paths.clone(),
-            source_pane_index: self.pane_index,
-        };
-        let drag_label = if drag_paths.len() == 1 {
-            item.name.clone()
-        } else {
-            format!("{} 个项目", drag_paths.len())
-        };
-
+        let drag_armed = Rc::new(Cell::new(false));
         div()
             .on_children_prepainted(move |bounds, _, _| {
                 if let Some(bounds) = bounds.into_iter().reduce(|left, right| left.union(&right)) {
@@ -1070,7 +1015,31 @@ impl MainListView {
             .when(is_folder, |row| row.cursor_default())
             .when(!is_folder, |row| row.cursor_move())
             .hover(|style| style.bg(theme::accent_soft().opacity(0.7)))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Left, {
+                let drag_armed = drag_armed.clone();
+                move |_, _, cx| {
+                    drag_armed.set(true);
+                    cx.stop_propagation();
+                }
+            })
+            .on_mouse_move({
+                let drag_paths = drag_paths.clone();
+                let drag_armed = drag_armed.clone();
+                move |event: &MouseMoveEvent, window, cx| {
+                    if event.dragging()
+                        && drag_armed.get()
+                        && begin_external_file_drag(&drag_paths, window)
+                    {
+                        drag_armed.set(false);
+                        cx.stop_propagation();
+                    }
+                }
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let drag_armed = drag_armed.clone();
+                move |_, _, _| drag_armed.set(false)
+            })
+            .on_mouse_up_out(MouseButton::Left, move |_, _, _| drag_armed.set(false))
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                 context_focus_handle.focus(window);
                 context_menu.update(cx, |menu, cx| {
@@ -1092,10 +1061,6 @@ impl MainListView {
                         cx.notify();
                     }
                 });
-            })
-            .on_drag(drag_payload, move |_, position, _, cx| {
-                let label = drag_label.clone();
-                cx.new(|_| DragPreview { label, position })
             })
             .child(
                 div()
@@ -1227,15 +1192,7 @@ impl MainListView {
         } else {
             vec![item.path.clone()]
         };
-        let drag_payload = FileDragPayload {
-            paths: drag_paths.clone(),
-            source_pane_index: self.pane_index,
-        };
-        let drag_label = if drag_paths.len() == 1 {
-            item.name.clone()
-        } else {
-            format!("{} 个项目", drag_paths.len())
-        };
+        let drag_armed = Rc::new(Cell::new(false));
         let file_visual = div()
             .flex()
             .items_center()
@@ -1279,7 +1236,31 @@ impl MainListView {
             .when(!is_selected, |card| {
                 card.hover(|style| style.border_color(theme::accent().opacity(0.42)))
             })
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Left, {
+                let drag_armed = drag_armed.clone();
+                move |_, _, cx| {
+                    drag_armed.set(true);
+                    cx.stop_propagation();
+                }
+            })
+            .on_mouse_move({
+                let drag_paths = drag_paths.clone();
+                let drag_armed = drag_armed.clone();
+                move |event: &MouseMoveEvent, window, cx| {
+                    if event.dragging()
+                        && drag_armed.get()
+                        && begin_external_file_drag(&drag_paths, window)
+                    {
+                        drag_armed.set(false);
+                        cx.stop_propagation();
+                    }
+                }
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let drag_armed = drag_armed.clone();
+                move |_, _, _| drag_armed.set(false)
+            })
+            .on_mouse_up_out(MouseButton::Left, move |_, _, _| drag_armed.set(false))
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                 context_focus_handle.focus(window);
                 context_menu.update(cx, |menu, cx| {
@@ -1301,10 +1282,6 @@ impl MainListView {
                         cx.notify();
                     }
                 });
-            })
-            .on_drag(drag_payload, move |_, position, _, cx| {
-                let label = drag_label.clone();
-                cx.new(|_| DragPreview { label, position })
             })
             .child(file_visual)
             .child(name_element)

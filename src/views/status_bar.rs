@@ -67,6 +67,8 @@ impl Render for StatusBar {
             "正在读取"
         } else if pane.error_message.is_some() {
             "读取出错"
+        } else if pane.is_smb_server_root() {
+            "SMB 共享列表"
         } else {
             "实时监听"
         };

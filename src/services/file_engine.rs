@@ -1,4 +1,4 @@
-use super::{quick_look::is_text_extension, volume};
+use super::{SmbNavigation, quick_look::is_text_extension, smb, volume};
 use crate::models::{FileItem, FileKind, SortMode};
 use anyhow::{Context as _, Result};
 use std::{
@@ -68,6 +68,17 @@ impl FileEngine {
             })
             .await
             .context("挂载卷读取任务异常终止")?
+    }
+
+    pub(crate) fn looks_like_smb_address(input: &str) -> bool {
+        smb::looks_like_address(input)
+    }
+
+    pub(crate) async fn connect_smb(&self, address: String) -> Result<SmbNavigation> {
+        self.runtime
+            .spawn_blocking(move || smb::connect(&address))
+            .await
+            .context("SMB 连接任务异常终止")?
     }
 
     pub fn ntfs_auto_mount_available(&self) -> bool {

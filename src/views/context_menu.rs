@@ -735,10 +735,12 @@ impl ContextMenuView {
         selection_count: usize,
         quick_look_enabled: bool,
         has_other_pane: bool,
+        file_operations_enabled: bool,
         selected_folder_is_favorite: Option<bool>,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let has_selection = selection_count > 0;
+        let has_file_selection = has_selection && file_operations_enabled;
         let mut items = vec![
             Self::item(
                 "context-open",
@@ -765,7 +767,7 @@ impl ContextMenuView {
                 "✂",
                 "剪切",
                 "⌘X",
-                has_selection,
+                has_file_selection,
                 MenuCommand::Cut,
                 cx,
             ),
@@ -774,7 +776,7 @@ impl ContextMenuView {
                 "📋",
                 "复制",
                 "⌘C",
-                has_selection,
+                has_file_selection,
                 MenuCommand::Copy,
                 cx,
             ),
@@ -792,7 +794,7 @@ impl ContextMenuView {
                 "➡",
                 "复制到另一面板",
                 "",
-                has_selection && has_other_pane,
+                has_file_selection && has_other_pane,
                 MenuCommand::CopyToOther,
                 cx,
             ),
@@ -801,7 +803,7 @@ impl ContextMenuView {
                 "🚚",
                 "移动到另一面板",
                 "",
-                has_selection && has_other_pane,
+                has_file_selection && has_other_pane,
                 MenuCommand::MoveToOther,
                 cx,
             ),
@@ -811,7 +813,7 @@ impl ContextMenuView {
                 "✏",
                 "重命名",
                 "F2",
-                selection_count == 1,
+                selection_count == 1 && file_operations_enabled,
                 MenuCommand::Rename,
                 cx,
             ),
@@ -820,7 +822,7 @@ impl ContextMenuView {
                 "🗑",
                 "移至废纸篓",
                 "⌘⌫",
-                has_selection,
+                has_file_selection,
                 MenuCommand::Trash,
                 cx,
             ),
@@ -847,7 +849,7 @@ impl ContextMenuView {
                 "ⓘ",
                 "显示简介",
                 "⌘I",
-                has_selection,
+                has_file_selection,
                 MenuCommand::GetInfo,
                 cx,
             ),
@@ -855,14 +857,19 @@ impl ContextMenuView {
         items
     }
 
-    fn background_menu(&self, can_paste: bool, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn background_menu(
+        &self,
+        can_paste: bool,
+        file_operations_enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         vec![
             Self::item(
                 "context-new-folder",
                 "📁",
                 "新建文件夹",
                 "⌘N",
-                true,
+                file_operations_enabled,
                 MenuCommand::NewFolder,
                 cx,
             ),
@@ -871,7 +878,7 @@ impl ContextMenuView {
                 "📄",
                 "新建文本文件",
                 "⇧⌘N",
-                true,
+                file_operations_enabled,
                 MenuCommand::NewTextFile,
                 cx,
             ),
@@ -881,7 +888,7 @@ impl ContextMenuView {
                 "📥",
                 "粘贴",
                 "⌘V",
-                can_paste,
+                can_paste && file_operations_enabled,
                 MenuCommand::Paste,
                 cx,
             ),
@@ -891,7 +898,7 @@ impl ContextMenuView {
                 "⌘",
                 "在系统终端中打开",
                 "",
-                true,
+                file_operations_enabled,
                 MenuCommand::OpenTerminal,
                 cx,
             ),
@@ -905,13 +912,14 @@ impl Render for ContextMenuView {
             return div().into_any_element();
         };
         let pane = state.pane.read(cx);
+        let file_operations_enabled = !pane.is_smb_server_root();
         let selection_count = pane.selection_count();
         let quick_look_enabled = selection_count == 1
             && pane
                 .selected_index
                 .and_then(|index| pane.items.get(index))
                 .is_some_and(|item| !item.is_dir);
-        let selected_folder_is_favorite = (selection_count == 1)
+        let selected_folder_is_favorite = (selection_count == 1 && file_operations_enabled)
             .then(|| pane.selected_index.and_then(|index| pane.items.get(index)))
             .flatten()
             .filter(|item| item.is_dir)
@@ -923,10 +931,13 @@ impl Render for ContextMenuView {
                 selection_count,
                 quick_look_enabled,
                 has_other_pane,
+                file_operations_enabled,
                 selected_folder_is_favorite,
                 cx,
             ),
-            ContextMenuTarget::Background => self.background_menu(can_paste, cx),
+            ContextMenuTarget::Background => {
+                self.background_menu(can_paste, file_operations_enabled, cx)
+            }
         };
         let open_with_submenu = self.open_with_submenu(state.position, window.viewport_size(), cx);
 

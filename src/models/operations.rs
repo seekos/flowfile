@@ -123,6 +123,10 @@ impl FileOperationController {
     }
 
     pub fn paste_into_active(&mut self, cx: &mut Context<Self>) {
+        if !self.active_accepts_file_operations(cx) {
+            self.set_notice("请先打开一个 SMB 共享文件夹再粘贴", true, cx);
+            return;
+        }
         let Some(payload) = self.read_clipboard(cx) else {
             self.set_notice("剪贴板中没有可粘贴的文件路径", true, cx);
             return;
@@ -157,7 +161,12 @@ impl FileOperationController {
                 self.set_notice("当前布局中没有其他目标面板", true, cx);
                 return;
             };
-            model.panes[index].read(cx).current_path.clone()
+            let pane = model.panes[index].read(cx);
+            if pane.is_smb_server_root() {
+                self.set_notice("请先在目标面板打开一个 SMB 共享文件夹", true, cx);
+                return;
+            }
+            pane.current_path.clone()
         };
         self.start_transfer(paths, destination, mode, cx);
     }
@@ -220,6 +229,10 @@ impl FileOperationController {
     }
 
     pub fn create_item(&mut self, kind: CreateItemKind, name: String, cx: &mut Context<Self>) {
+        if !self.active_accepts_file_operations(cx) {
+            self.set_notice("请先打开一个 SMB 共享文件夹再新建项目", true, cx);
+            return;
+        }
         let parent = self.active_path(cx);
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {
@@ -279,6 +292,13 @@ impl FileOperationController {
             .read(cx)
             .current_path
             .clone()
+    }
+
+    fn active_accepts_file_operations(&self, cx: &gpui::App) -> bool {
+        let model = self.model.read(cx);
+        !model.panes[model.active_pane_index]
+            .read(cx)
+            .is_smb_server_root()
     }
 
     fn read_clipboard(&self, cx: &gpui::App) -> Option<ClipboardPayload> {
