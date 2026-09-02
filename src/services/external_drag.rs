@@ -88,7 +88,8 @@ pub fn begin_external_file_drag(paths: &[PathBuf], window: &Window) -> bool {
 
         let workspace = NSWorkspace::sharedWorkspace();
         let location = view.convertPoint_fromView(event.locationInWindow(), None);
-        let icon_size = 48.0;
+        let item_count = existing_paths.len();
+        let icon_size = if item_count > 1 { 56.0 } else { 64.0 };
         let mut dragging_items = Vec::with_capacity(existing_paths.len());
 
         for (index, path) in existing_paths.into_iter().enumerate() {
@@ -98,7 +99,7 @@ pub fn begin_external_file_drag(paths: &[PathBuf], window: &Window) -> bool {
             let dragging_item =
                 NSDraggingItem::initWithPasteboardWriter(NSDraggingItem::alloc(), writer);
             let icon = workspace.iconForFile(&path_string);
-            let offset = (index.min(6) as f64) * 3.0;
+            let offset = (index.min(6) as f64) * 4.0;
             let frame = NSRect::new(
                 NSPoint::new(
                     location.x - icon_size / 2.0 + offset,
@@ -127,7 +128,11 @@ pub fn begin_external_file_drag(paths: &[PathBuf], window: &Window) -> bool {
 
         let session =
             view.beginDraggingSessionWithItems_event_source(&items, &event, source_protocol);
-        session.setDraggingFormation(NSDraggingFormation::Stack);
+        session.setDraggingFormation(if item_count > 1 {
+            NSDraggingFormation::Stack
+        } else {
+            NSDraggingFormation::Default
+        });
         true
     }
 }

@@ -19,7 +19,7 @@ use gpui::{
     relative, size, uniform_list,
 };
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{BTreeSet, HashMap},
     ops::Range,
     path::PathBuf,
@@ -29,6 +29,7 @@ use std::{
 
 const DETAILS_ICON_WIDTH: f32 = 42.0;
 const GRID_CARD_TARGET_WIDTH: f32 = 112.0;
+const FILE_DRAG_THRESHOLD: f64 = 4.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DetailColumn {
@@ -96,6 +97,11 @@ struct MarqueeSelection {
     start: Point<Pixels>,
     current: Point<Pixels>,
     base_selection: BTreeSet<usize>,
+}
+
+struct PendingFileDrag {
+    start: Point<Pixels>,
+    paths: Vec<PathBuf>,
 }
 
 struct RenameTextElement {
@@ -277,6 +283,7 @@ pub struct MainListView {
     resizing_column: Option<DetailColumn>,
     resize_last_x: Option<Pixels>,
     marquee: Option<MarqueeSelection>,
+    pending_file_drag: Option<PendingFileDrag>,
     item_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
     visible_indices: Rc<RefCell<BTreeSet<usize>>>,
     viewport_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
@@ -314,6 +321,7 @@ impl MainListView {
             resizing_column: None,
             resize_last_x: None,
             marquee: None,
+            pending_file_drag: None,
             item_bounds: Rc::new(RefCell::new(HashMap::new())),
             visible_indices: Rc::new(RefCell::new(BTreeSet::new())),
             viewport_bounds: Rc::new(RefCell::new(None)),
@@ -756,6 +764,7 @@ impl MainListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pending_file_drag = None;
         self.focus_handle.focus(window);
         self.pane.update(cx, |pane, cx| {
             if pane.rename_index.is_some() {
@@ -824,10 +833,41 @@ impl MainListView {
         cx: &mut Context<Self>,
     ) {
         self.resize_column_on_mouse_move(event, window, cx);
+        if self.try_begin_file_drag(event, window, cx) {
+            return;
+        }
         self.update_marquee(event, window, cx);
     }
 
+    fn arm_file_drag(&mut self, start: Point<Pixels>, paths: Vec<PathBuf>) {
+        self.pending_file_drag = Some(PendingFileDrag { start, paths });
+    }
+
+    fn try_begin_file_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pending) = self.pending_file_drag.as_ref() else {
+            return false;
+        };
+        if !event.dragging() || !file_drag_threshold_reached(pending.start, event.position) {
+            return false;
+        }
+
+        let paths = pending.paths.clone();
+        if !begin_external_file_drag(&paths, window) {
+            return false;
+        }
+
+        self.pending_file_drag = None;
+        cx.stop_propagation();
+        true
+    }
+
     fn finish_pointer_interaction(&mut self, cx: &mut Context<Self>) {
+        self.pending_file_drag = None;
         end_external_file_drag();
         self.finish_column_resize();
         if self.marquee.take().is_some() {
@@ -991,7 +1031,7 @@ impl MainListView {
         } else {
             vec![item.path.clone()]
         };
-        let drag_armed = Rc::new(Cell::new(false));
+        let drag_input = input_entity.clone();
         div()
             .on_children_prepainted(move |bounds, _, _| {
                 if let Some(bounds) = bounds.into_iter().reduce(|left, right| left.union(&right)) {
@@ -1015,31 +1055,12 @@ impl MainListView {
             .when(is_folder, |row| row.cursor_default())
             .when(!is_folder, |row| row.cursor_move())
             .hover(|style| style.bg(theme::accent_soft().opacity(0.7)))
-            .on_mouse_down(MouseButton::Left, {
-                let drag_armed = drag_armed.clone();
-                move |_, _, cx| {
-                    drag_armed.set(true);
-                    cx.stop_propagation();
-                }
+            .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                drag_input.update(cx, |input, _| {
+                    input.arm_file_drag(event.position, drag_paths.clone());
+                });
+                cx.stop_propagation();
             })
-            .on_mouse_move({
-                let drag_paths = drag_paths.clone();
-                let drag_armed = drag_armed.clone();
-                move |event: &MouseMoveEvent, window, cx| {
-                    if event.dragging()
-                        && drag_armed.get()
-                        && begin_external_file_drag(&drag_paths, window)
-                    {
-                        drag_armed.set(false);
-                        cx.stop_propagation();
-                    }
-                }
-            })
-            .on_mouse_up(MouseButton::Left, {
-                let drag_armed = drag_armed.clone();
-                move |_, _, _| drag_armed.set(false)
-            })
-            .on_mouse_up_out(MouseButton::Left, move |_, _, _| drag_armed.set(false))
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                 context_focus_handle.focus(window);
                 context_menu.update(cx, |menu, cx| {
@@ -1129,6 +1150,7 @@ impl MainListView {
         let context_menu = self.context_menu.clone();
         let item_bounds = self.item_bounds.clone();
         let pane_index = self.pane_index;
+        let drag_input = input_entity.clone();
         let file_name = item.name.clone();
         let name_element = if renaming {
             deferred(
@@ -1192,7 +1214,6 @@ impl MainListView {
         } else {
             vec![item.path.clone()]
         };
-        let drag_armed = Rc::new(Cell::new(false));
         let file_visual = div()
             .flex()
             .items_center()
@@ -1236,31 +1257,12 @@ impl MainListView {
             .when(!is_selected, |card| {
                 card.hover(|style| style.border_color(theme::accent().opacity(0.42)))
             })
-            .on_mouse_down(MouseButton::Left, {
-                let drag_armed = drag_armed.clone();
-                move |_, _, cx| {
-                    drag_armed.set(true);
-                    cx.stop_propagation();
-                }
+            .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                drag_input.update(cx, |input, _| {
+                    input.arm_file_drag(event.position, drag_paths.clone());
+                });
+                cx.stop_propagation();
             })
-            .on_mouse_move({
-                let drag_paths = drag_paths.clone();
-                let drag_armed = drag_armed.clone();
-                move |event: &MouseMoveEvent, window, cx| {
-                    if event.dragging()
-                        && drag_armed.get()
-                        && begin_external_file_drag(&drag_paths, window)
-                    {
-                        drag_armed.set(false);
-                        cx.stop_propagation();
-                    }
-                }
-            })
-            .on_mouse_up(MouseButton::Left, {
-                let drag_armed = drag_armed.clone();
-                move |_, _, _| drag_armed.set(false)
-            })
-            .on_mouse_up_out(MouseButton::Left, move |_, _, _| drag_armed.set(false))
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                 context_focus_handle.focus(window);
                 context_menu.update(cx, |menu, cx| {
@@ -1502,6 +1504,11 @@ impl MainListView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && self.pending_file_drag.take().is_some() {
+            end_external_file_drag();
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key == "escape" && self.cancel_marquee(cx) {
             return;
         }
@@ -2078,6 +2085,10 @@ fn grid_columns_for_width(width: Pixels) -> usize {
     (f32::from(width) / GRID_CARD_TARGET_WIDTH).floor().max(1.0) as usize
 }
 
+fn file_drag_threshold_reached(start: Point<Pixels>, current: Point<Pixels>) -> bool {
+    (current - start).magnitude() > FILE_DRAG_THRESHOLD
+}
+
 fn file_type_label(item: &FileItem) -> String {
     match item.kind {
         FileKind::Application => return "应用程序".to_string(),
@@ -2108,8 +2119,8 @@ fn initial_rename_selection(item: &FileItem) -> Range<usize> {
 #[cfg(test)]
 mod grid_name_tests {
     use super::{
-        DetailColumn, DetailColumnWidths, MainListView, grid_columns_for_width,
-        initial_rename_selection, is_vertical_scroll, marquee_bounds,
+        DetailColumn, DetailColumnWidths, MainListView, file_drag_threshold_reached,
+        grid_columns_for_width, initial_rename_selection, is_vertical_scroll, marquee_bounds,
     };
     use crate::models::{FileItem, FileKind};
     use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
@@ -2154,6 +2165,20 @@ mod grid_name_tests {
         assert_eq!(forward.origin, point(px(12.0), px(18.0)));
         assert_eq!(forward.size.width, px(60.0));
         assert_eq!(forward.size.height, px(36.0));
+    }
+
+    #[test]
+    fn file_drag_requires_a_deliberate_pointer_movement() {
+        let start = point(px(100.0), px(100.0));
+
+        assert!(!file_drag_threshold_reached(
+            start,
+            point(px(103.0), px(102.0))
+        ));
+        assert!(file_drag_threshold_reached(
+            start,
+            point(px(106.0), px(100.0))
+        ));
     }
 
     #[test]

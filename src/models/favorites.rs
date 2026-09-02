@@ -1,7 +1,10 @@
 use super::home_directory;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -21,8 +24,21 @@ impl Favorites {
         &self.paths
     }
 
-    pub fn contains(&self, path: &std::path::Path) -> bool {
+    pub fn contains(&self, path: &Path) -> bool {
         self.paths.iter().any(|favorite| favorite == path)
+    }
+
+    pub fn remove(&mut self, path: &Path) -> Result<bool> {
+        let Some(index) = self.paths.iter().position(|favorite| favorite == path) else {
+            return Ok(false);
+        };
+
+        let removed = self.paths.remove(index);
+        if let Err(error) = self.save() {
+            self.paths.insert(index, removed);
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub fn toggle(&mut self, path: PathBuf) -> Result<bool> {

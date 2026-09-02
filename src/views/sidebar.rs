@@ -255,11 +255,35 @@ impl SidebarView {
         .detach();
     }
 
+    fn remove_favorite(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("文件夹")
+            .to_string();
+        let result = self.favorites.update(cx, |favorites, cx| {
+            let result = favorites.remove(&path);
+            cx.notify();
+            result
+        });
+
+        match result {
+            Ok(true) => self.operations.update(cx, |operations, cx| {
+                operations.show_notice(format!("已取消收藏 {label}"), false, cx);
+            }),
+            Ok(false) => {}
+            Err(error) => self.operations.update(cx, |operations, cx| {
+                operations.show_notice(error.to_string(), true, cx);
+            }),
+        }
+    }
+
     fn item(
         &self,
         id: usize,
         location: SidebarLocation,
         is_active: bool,
+        can_remove_favorite: bool,
         can_eject: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -272,11 +296,14 @@ impl SidebarView {
         let tooltip = format!("在当前面板中打开 {}", path.display());
         let label: SharedString = location.label.into();
         let detail = location.detail.map(SharedString::from);
+        let favorite_path = location.path.clone();
         let eject_path = location.path.clone();
         let is_ejecting = self.ejecting_volumes.contains(&eject_path);
+        let hover_group: SharedString = format!("sidebar-location-{id}").into();
 
         div()
             .id(("sidebar-location", id))
+            .group(hover_group.clone())
             .flex()
             .items_center()
             .gap_2()
@@ -363,6 +390,30 @@ impl SidebarView {
                             .child(detail)
                     }),
             )
+            .when(can_remove_favorite, |item| {
+                item.child(
+                    div()
+                        .id(("sidebar-remove-favorite", id))
+                        .w(px(24.0))
+                        .h(px(24.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .invisible()
+                        .group_hover(hover_group, |style| style.visible())
+                        .text_size(theme::font(14.0))
+                        .text_color(theme::text_tertiary())
+                        .hover(|style| style.bg(theme::surface()).text_color(theme::danger()))
+                        .tooltip(delayed_tooltip("取消收藏".to_string()))
+                        .child("×")
+                        .on_click(cx.listener(move |sidebar, _, _, cx| {
+                            cx.stop_propagation();
+                            sidebar.remove_favorite(favorite_path.clone(), cx);
+                        })),
+                )
+            })
             .when(can_eject, |item| {
                 item.child(
                     div()
@@ -437,7 +488,7 @@ impl Render for SidebarView {
                     .enumerate()
                     .map(|(index, location)| {
                         let is_active = current_path == location.path;
-                        self.item(index, location, is_active, false, cx)
+                        self.item(index, location, is_active, false, false, cx)
                     }),
             )
             .child(Self::section_title("收藏夹"))
@@ -453,7 +504,7 @@ impl Render for SidebarView {
             })
             .children(favorites.into_iter().enumerate().map(|(index, location)| {
                 let is_active = current_path == location.path;
-                self.item(50 + index, location, is_active, false, cx)
+                self.item(50 + index, location, is_active, true, false, cx)
             }))
             .child(Self::section_title("卷"))
             .when(self.volumes_loading, |sidebar| {
@@ -468,7 +519,7 @@ impl Render for SidebarView {
             .children(volumes.into_iter().enumerate().map(|(index, location)| {
                 let is_active = current_path == location.path;
                 let can_eject = location.path.starts_with(Path::new("/Volumes"));
-                self.item(100 + index, location, is_active, can_eject, cx)
+                self.item(100 + index, location, is_active, false, can_eject, cx)
             }))
             .child(
                 div()
