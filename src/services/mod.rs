@@ -20,7 +20,7 @@ pub use file_operations::{ConflictPolicy, FileOperationEngine, TransferMode, Tra
 pub use file_watcher::FileWatcher;
 pub use quick_look::{PreviewKind, QuickLookService};
 pub use search_engine::{SearchEngine, SearchScope};
-pub(crate) use smb::{SmbNavigation, SmbShare};
+pub(crate) use smb::{SmbMountInfo, SmbNavigation, SmbShare};
 pub use terminal_session::SystemTerminal;
 pub use thumbnail_engine::ThumbnailEngine;
 pub use update_checker::{AvailableUpdate, UpdateChecker};

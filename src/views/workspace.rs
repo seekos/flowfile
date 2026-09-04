@@ -21,7 +21,7 @@ use crate::{
     },
     models::{
         AppPreferences, CreateItemKind, Favorites, FileKind, FileOperationController, LayoutMode,
-        Model, MultiPaneModel, Pane, SessionState, home_directory,
+        Model, MultiPaneModel, Pane, PaneEvent, SessionState, home_directory,
     },
     services::{
         AvailableUpdate, FileEngine, FileInspector, FileOperationEngine, PreviewKind,
@@ -92,7 +92,7 @@ impl Element for ModalNameTextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
-        let value = input.modal_name().unwrap_or_default();
+        let value = input.modal_input_display().unwrap_or_default();
         let content: SharedString = value.clone().into();
         let selected_range = input
             .modal_selection
@@ -211,8 +211,27 @@ impl Element for ModalNameTextElement {
 
 #[derive(Clone)]
 enum ModalState {
-    NameInput { kind: CreateItemKind, value: String },
-    PermanentDelete { paths: Vec<PathBuf> },
+    NameInput {
+        kind: CreateItemKind,
+        value: String,
+    },
+    SmbAuthentication {
+        pane: Model<Pane>,
+        address: String,
+        username: String,
+        password: String,
+        active_field: SmbAuthField,
+        submitting: bool,
+    },
+    PermanentDelete {
+        paths: Vec<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SmbAuthField {
+    Username,
+    Password,
 }
 
 #[derive(Clone)]
@@ -361,6 +380,10 @@ impl WorkspaceView {
             cx.observe(pane, |this, _, cx| {
                 this.schedule_session_save(cx);
                 cx.notify();
+            })
+            .detach();
+            cx.subscribe_in(pane, window, |this, pane, event: &PaneEvent, window, cx| {
+                this.on_pane_event(pane.clone(), event, window, cx);
             })
             .detach();
             pane.update(cx, |pane, cx| pane.load_initial(cx));
@@ -599,7 +622,7 @@ impl WorkspaceView {
                     })
                     .collect();
                 PaneSnapshot {
-                    path: pane.current_path.display().to_string(),
+                    path: pane.display_path(),
                     active: pane_index == model.active_pane_index,
                     search: pane
                         .search_active
@@ -638,6 +661,20 @@ impl WorkspaceView {
                 match &self.modal_error {
                     Some(error) => format!("{title}，名称：{value}，错误：{error}"),
                     None => format!("{title}，名称：{value}"),
+                }
+            }
+            ModalState::SmbAuthentication {
+                address,
+                username,
+                submitting,
+                ..
+            } => {
+                let state = if *submitting { "正在连接" } else { "等待认证" };
+                match &self.modal_error {
+                    Some(error) => {
+                        format!("SMB 登录，服务器：{address}，用户名：{username}，{state}，错误：{error}")
+                    }
+                    None => format!("SMB 登录，服务器：{address}，用户名：{username}，{state}"),
                 }
             }
             ModalState::PermanentDelete { paths } => {
@@ -704,7 +741,17 @@ impl WorkspaceView {
     }
 
     fn on_copy(&mut self, _: &CopyFiles, _window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.modal, Some(ModalState::NameInput { .. })) {
+        if self.modal_input_value().is_some() {
+            if matches!(
+                self.modal,
+                Some(ModalState::SmbAuthentication {
+                    active_field: SmbAuthField::Password,
+                    ..
+                })
+            ) {
+                cx.stop_propagation();
+                return;
+            }
             if let Some(text) = self.selected_modal_text() {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
@@ -716,7 +763,17 @@ impl WorkspaceView {
     }
 
     fn on_cut(&mut self, _: &CutFiles, _window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.modal, Some(ModalState::NameInput { .. })) {
+        if self.modal_input_value().is_some() {
+            if matches!(
+                self.modal,
+                Some(ModalState::SmbAuthentication {
+                    active_field: SmbAuthField::Password,
+                    ..
+                })
+            ) {
+                cx.stop_propagation();
+                return;
+            }
             if let Some(text) = self.selected_modal_text() {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.replace_modal_text("");
@@ -733,7 +790,7 @@ impl WorkspaceView {
     fn on_paste(&mut self, _: &PasteFiles, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let text = text.replace(['\n', '\r'], " ");
-            if matches!(self.modal, Some(ModalState::NameInput { .. })) {
+            if self.modal_input_value().is_some() {
                 self.replace_modal_text(&text);
                 self.modal_error = None;
                 cx.notify();
@@ -1084,15 +1141,99 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn modal_name(&self) -> Option<String> {
+    fn on_pane_event(
+        &mut self,
+        pane: Model<Pane>,
+        event: &PaneEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            PaneEvent::AuthRequired {
+                address,
+                suggested_username,
+            } => {
+                let username = suggested_username.clone().unwrap_or_default();
+                let cursor_offset = username.len();
+                self.modal = Some(ModalState::SmbAuthentication {
+                    pane,
+                    address: address.clone(),
+                    username,
+                    password: String::new(),
+                    active_field: SmbAuthField::Username,
+                    submitting: false,
+                });
+                self.modal_cursor_offset = cursor_offset;
+                self.modal_selection = None;
+                self.modal_marked_range = None;
+                self.modal_selection_anchor = None;
+                self.modal_is_selecting = false;
+                self.modal_name_layout = None;
+                self.modal_name_bounds = None;
+                self.modal_error = None;
+                self.modal_focus_handle.focus(window);
+                cx.notify();
+            }
+            PaneEvent::Connected { address } => {
+                if matches!(
+                    &self.modal,
+                    Some(ModalState::SmbAuthentication {
+                        address: modal_address,
+                        ..
+                    }) if modal_address == address
+                ) {
+                    self.close_modal(window, cx);
+                }
+            }
+            PaneEvent::ConnectionFailed { address, message } => {
+                if let Some(ModalState::SmbAuthentication {
+                    address: modal_address,
+                    submitting,
+                    ..
+                }) = &mut self.modal
+                    && modal_address == address
+                {
+                    *submitting = false;
+                    self.modal_error = Some(message.clone());
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn modal_input_value(&self) -> Option<String> {
         match &self.modal {
             Some(ModalState::NameInput { value, .. }) => Some(value.clone()),
+            Some(ModalState::SmbAuthentication {
+                username,
+                password,
+                active_field,
+                ..
+            }) => Some(match active_field {
+                SmbAuthField::Username => username.clone(),
+                SmbAuthField::Password => password.clone(),
+            }),
             _ => None,
         }
     }
 
+    fn modal_input_display(&self) -> Option<String> {
+        let value = self.modal_input_value()?;
+        if matches!(
+            self.modal,
+            Some(ModalState::SmbAuthentication {
+                active_field: SmbAuthField::Password,
+                ..
+            })
+        ) {
+            Some("*".repeat(value.len()))
+        } else {
+            Some(value)
+        }
+    }
+
     fn selected_modal_text(&self) -> Option<String> {
-        let value = self.modal_name()?;
+        let value = self.modal_input_value()?;
         let range = clamp_char_range(&value, self.modal_selection.clone()?);
         (!range.is_empty()).then(|| value[range].to_string())
     }
@@ -1126,7 +1267,7 @@ impl WorkspaceView {
     }
 
     fn replace_modal_text(&mut self, text: &str) {
-        let Some(value) = self.modal_name() else {
+        let Some(value) = self.modal_input_value() else {
             return;
         };
         let range = self
@@ -1139,11 +1280,69 @@ impl WorkspaceView {
             });
         let mut replacement = value;
         replacement.replace_range(range.clone(), text);
-        if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
-            *value = replacement;
+        match &mut self.modal {
+            Some(ModalState::NameInput { value, .. }) => *value = replacement,
+            Some(ModalState::SmbAuthentication {
+                username,
+                password,
+                active_field,
+                ..
+            }) => match active_field {
+                SmbAuthField::Username => *username = replacement,
+                SmbAuthField::Password => *password = replacement,
+            },
+            _ => return,
         }
         self.modal_cursor_offset = range.start + text.len();
         self.modal_selection_anchor = None;
+    }
+
+    fn activate_smb_auth_field(
+        &mut self,
+        field: SmbAuthField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ModalState::SmbAuthentication {
+            username,
+            password,
+            active_field,
+            ..
+        }) = &mut self.modal
+        else {
+            return;
+        };
+        *active_field = field;
+        self.modal_cursor_offset = match field {
+            SmbAuthField::Username => username.len(),
+            SmbAuthField::Password => password.len(),
+        };
+        self.modal_selection = None;
+        self.modal_marked_range = None;
+        self.modal_selection_anchor = None;
+        self.modal_name_layout = None;
+        self.modal_name_bounds = None;
+        self.modal_focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn on_smb_auth_field_mouse_down(
+        &mut self,
+        field: SmbAuthField,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let already_active = matches!(
+            &self.modal,
+            Some(ModalState::SmbAuthentication { active_field, .. }) if *active_field == field
+        );
+        if already_active {
+            self.on_modal_mouse_down(event, window, cx);
+        } else {
+            self.activate_smb_auth_field(field, window, cx);
+            cx.stop_propagation();
+        }
     }
 
     fn on_modal_mouse_down(
@@ -1204,6 +1403,33 @@ impl WorkspaceView {
                     operations.create_item(kind, name.to_string(), cx);
                 });
             }
+            ModalState::SmbAuthentication {
+                pane,
+                address,
+                username,
+                password,
+                submitting,
+                ..
+            } => {
+                if submitting {
+                    return;
+                }
+                let username = username.trim().to_string();
+                if username.is_empty() {
+                    self.modal_error = Some("请输入 NAS 用户名".to_string());
+                    self.activate_smb_auth_field(SmbAuthField::Username, window, cx);
+                    return;
+                }
+                if let Some(ModalState::SmbAuthentication { submitting, .. }) = &mut self.modal {
+                    *submitting = true;
+                }
+                self.modal_error = None;
+                pane.update(cx, |pane, cx| {
+                    pane.authenticate_smb(address, username, password, cx);
+                });
+                cx.notify();
+                return;
+            }
             ModalState::PermanentDelete { paths } => {
                 self.operations.update(cx, |operations, cx| {
                     operations.delete_permanently(paths, cx);
@@ -1236,7 +1462,7 @@ impl WorkspaceView {
         }
         if event.keystroke.modifiers.platform
             && event.keystroke.key == "a"
-            && let Some(ModalState::NameInput { value, .. }) = &self.modal
+            && let Some(value) = self.modal_input_value()
         {
             self.modal_selection = Some(0..value.len());
             self.modal_selection_anchor = None;
@@ -1248,10 +1474,19 @@ impl WorkspaceView {
         match event.keystroke.key.as_str() {
             "escape" => self.close_modal(window, cx),
             "enter" => self.confirm_modal(window, cx),
+            "tab" => {
+                if let Some(ModalState::SmbAuthentication { active_field, .. }) = &self.modal {
+                    let next = match active_field {
+                        SmbAuthField::Username => SmbAuthField::Password,
+                        SmbAuthField::Password => SmbAuthField::Username,
+                    };
+                    self.activate_smb_auth_field(next, window, cx);
+                }
+            }
             "left" => {
-                if let Some(ModalState::NameInput { value, .. }) = &self.modal {
+                if let Some(value) = self.modal_input_value() {
                     self.modal_cursor_offset = self.modal_selection.as_ref().map_or_else(
-                        || previous_char_boundary(value, self.modal_cursor_offset),
+                        || previous_char_boundary(&value, self.modal_cursor_offset),
                         |range| range.start,
                     );
                     self.modal_selection = None;
@@ -1259,9 +1494,9 @@ impl WorkspaceView {
                 }
             }
             "right" => {
-                if let Some(ModalState::NameInput { value, .. }) = &self.modal {
+                if let Some(value) = self.modal_input_value() {
                     self.modal_cursor_offset = self.modal_selection.as_ref().map_or_else(
-                        || next_char_boundary(value, self.modal_cursor_offset),
+                        || next_char_boundary(&value, self.modal_cursor_offset),
                         |range| range.end,
                     );
                     self.modal_selection = None;
@@ -1269,14 +1504,14 @@ impl WorkspaceView {
                 }
             }
             "home" => {
-                if matches!(self.modal, Some(ModalState::NameInput { .. })) {
+                if self.modal_input_value().is_some() {
                     self.modal_cursor_offset = 0;
                     self.modal_selection = None;
                     cx.notify();
                 }
             }
             "end" => {
-                if let Some(ModalState::NameInput { value, .. }) = &self.modal {
+                if let Some(value) = self.modal_input_value() {
                     self.modal_cursor_offset = value.len();
                     self.modal_selection = None;
                     cx.notify();
@@ -1287,8 +1522,21 @@ impl WorkspaceView {
                     self.replace_modal_text("");
                     self.modal_error = None;
                     cx.notify();
-                } else if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
-                    backspace_at_cursor(value, &mut self.modal_cursor_offset);
+                } else if let Some(mut value) = self.modal_input_value() {
+                    backspace_at_cursor(&mut value, &mut self.modal_cursor_offset);
+                    match &mut self.modal {
+                        Some(ModalState::NameInput { value: target, .. }) => *target = value,
+                        Some(ModalState::SmbAuthentication {
+                            username,
+                            password,
+                            active_field,
+                            ..
+                        }) => match active_field {
+                            SmbAuthField::Username => *username = value,
+                            SmbAuthField::Password => *password = value,
+                        },
+                        _ => {}
+                    }
                     self.modal_error = None;
                     cx.notify();
                 }
@@ -1298,8 +1546,21 @@ impl WorkspaceView {
                     self.replace_modal_text("");
                     self.modal_error = None;
                     cx.notify();
-                } else if let Some(ModalState::NameInput { value, .. }) = &mut self.modal {
-                    delete_at_cursor(value, &mut self.modal_cursor_offset);
+                } else if let Some(mut value) = self.modal_input_value() {
+                    delete_at_cursor(&mut value, &mut self.modal_cursor_offset);
+                    match &mut self.modal {
+                        Some(ModalState::NameInput { value: target, .. }) => *target = value,
+                        Some(ModalState::SmbAuthentication {
+                            username,
+                            password,
+                            active_field,
+                            ..
+                        }) => match active_field {
+                            SmbAuthField::Username => *username = value,
+                            SmbAuthField::Password => *password = value,
+                        },
+                        _ => {}
+                    }
                     self.modal_error = None;
                     cx.notify();
                 }
@@ -1629,6 +1890,111 @@ impl WorkspaceView {
             .child(self.toolbar(cx))
     }
 
+    fn render_smb_auth_input(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        field: SmbAuthField,
+        value: String,
+        input_entity: Entity<Self>,
+    ) -> AnyElement {
+        let active = matches!(
+            &self.modal,
+            Some(ModalState::SmbAuthentication { active_field, .. }) if *active_field == field
+        );
+        let has_error = self.modal_error.is_some();
+        let mouse_down_input = input_entity.clone();
+        let mouse_move_input = input_entity.clone();
+        let mouse_up_input = input_entity.clone();
+        let mouse_up_out_input = input_entity.clone();
+        let display_value = if field == SmbAuthField::Password {
+            "*".repeat(value.len())
+        } else {
+            value
+        };
+        let content = if active {
+            div()
+                .min_w_0()
+                .flex_1()
+                .h(px(16.0))
+                .overflow_hidden()
+                .child(ModalNameTextElement {
+                    input: input_entity,
+                })
+                .into_any_element()
+        } else {
+            div()
+                .min_w_0()
+                .flex_1()
+                .h(px(16.0))
+                .overflow_hidden()
+                .child(display_value)
+                .into_any_element()
+        };
+
+        div()
+            .mt_3()
+            .child(
+                div()
+                    .mb_1()
+                    .text_size(theme::font(9.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text_secondary())
+                    .child(label),
+            )
+            .child(
+                div()
+                    .id(id)
+                    .flex()
+                    .items_center()
+                    .h(px(34.0))
+                    .px_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if has_error {
+                        theme::danger()
+                    } else if active {
+                        theme::accent()
+                    } else {
+                        theme::border()
+                    })
+                    .bg(theme::surface_subtle())
+                    .font_family("SF Mono")
+                    .text_size(theme::font(11.0))
+                    .text_color(theme::text_primary())
+                    .cursor_text()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        move |event: &MouseDownEvent, window, cx| {
+                            mouse_down_input.update(cx, |input, cx| {
+                                input.on_smb_auth_field_mouse_down(field, event, window, cx)
+                            });
+                            cx.stop_propagation();
+                        },
+                    )
+                    .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+                        mouse_move_input
+                            .update(cx, |input, cx| input.on_modal_mouse_move(event, window, cx));
+                    })
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        move |event: &MouseUpEvent, window, cx| {
+                            mouse_up_input
+                                .update(cx, |input, cx| input.on_modal_mouse_up(event, window, cx));
+                        },
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        move |event: &MouseUpEvent, window, cx| {
+                            mouse_up_out_input
+                                .update(cx, |input, cx| input.on_modal_mouse_up(event, window, cx));
+                        },
+                    )
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
     fn render_modal(
         &self,
         cx: &mut Context<Self>,
@@ -1744,6 +2110,59 @@ impl WorkspaceView {
                     .child(self.modal_buttons(button, false, cx))
                     .into_any_element()
             }
+            ModalState::SmbAuthentication {
+                address,
+                username,
+                password,
+                submitting,
+                ..
+            } => div()
+                .w(px(420.0))
+                .p_5()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme::border_strong())
+                .bg(theme::surface())
+                .shadow_lg()
+                .child(
+                    div()
+                        .text_size(theme::font(15.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_primary())
+                        .child("连接 SMB 服务器"),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .text_size(theme::font(10.0))
+                        .text_color(theme::text_tertiary())
+                        .child(format!("登录 {address} 以显示共享文件夹")),
+                )
+                .child(self.render_smb_auth_input(
+                    "smb-auth-username",
+                    "用户名",
+                    SmbAuthField::Username,
+                    username,
+                    input_entity.clone(),
+                ))
+                .child(self.render_smb_auth_input(
+                    "smb-auth-password",
+                    "密码",
+                    SmbAuthField::Password,
+                    password,
+                    input_entity.clone(),
+                ))
+                .when_some(modal_error, |card, error| {
+                    card.child(
+                        div()
+                            .mt_2()
+                            .text_size(theme::font(9.0))
+                            .text_color(theme::danger())
+                            .child(error),
+                    )
+                })
+                .child(self.modal_buttons(if submitting { "连接中…" } else { "连接" }, false, cx))
+                .into_any_element(),
             ModalState::PermanentDelete { paths } => {
                 let count = paths.len();
                 let first_name = paths
@@ -2109,7 +2528,7 @@ impl EntityInputHandler for WorkspaceView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let value = self.modal_name()?;
+        let value = self.modal_input_value()?;
         let range = clamp_char_range(
             &value,
             utf16_to_utf8_offset(&value, range_utf16.start)
@@ -2127,7 +2546,7 @@ impl EntityInputHandler for WorkspaceView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let value = self.modal_name()?;
+        let value = self.modal_input_value()?;
         let range = self
             .modal_selection
             .clone()
@@ -2144,7 +2563,7 @@ impl EntityInputHandler for WorkspaceView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        let value = self.modal_name()?;
+        let value = self.modal_input_value()?;
         self.modal_marked_range.as_ref().map(|range| {
             utf8_to_utf16_offset(&value, range.start)..utf8_to_utf16_offset(&value, range.end)
         })
@@ -2161,7 +2580,7 @@ impl EntityInputHandler for WorkspaceView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(value) = self.modal_name() else {
+        let Some(value) = self.modal_input_value() else {
             return;
         };
         self.modal_selection = range_utf16
@@ -2184,7 +2603,7 @@ impl EntityInputHandler for WorkspaceView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(value) = self.modal_name() else {
+        let Some(value) = self.modal_input_value() else {
             return;
         };
         let range = range_utf16
@@ -2215,7 +2634,7 @@ impl EntityInputHandler for WorkspaceView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        self.modal_name()?;
+        self.modal_input_value()?;
         let Some(line) = self.modal_name_layout.as_ref() else {
             return Some(element_bounds);
         };
@@ -2238,7 +2657,7 @@ impl EntityInputHandler for WorkspaceView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let value = self.modal_name()?;
+        let value = self.modal_input_value()?;
         Some(utf8_to_utf16_offset(
             &value,
             self.modal_index_for_mouse_position(point),

@@ -16,7 +16,18 @@ pub(crate) struct SmbShare {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SmbMountInfo {
+    pub server_address: String,
+    pub share_name: String,
+    pub mount_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SmbNavigation {
+    AuthenticationRequired {
+        address: String,
+        suggested_username: Option<String>,
+    },
     Server {
         address: String,
         shares: Vec<SmbShare>,
@@ -24,6 +35,7 @@ pub(crate) enum SmbNavigation {
     Directory {
         path: PathBuf,
         server_address: String,
+        share_name: String,
         mount_path: PathBuf,
     },
 }
@@ -85,22 +97,60 @@ pub(crate) fn connect(input: &str) -> Result<SmbNavigation> {
     directory_navigation(&location, mount_path)
 }
 
+pub(crate) fn connect_with_credentials(
+    input: &str,
+    username: &str,
+    password: &str,
+) -> Result<SmbNavigation> {
+    let location = parse_location(input)?;
+    if location.share.is_some() {
+        return connect(input);
+    }
+    list_server_shares_with_credentials(&location, username, password)
+}
+
 fn directory_navigation(location: &SmbLocation, mount_path: PathBuf) -> Result<SmbNavigation> {
     let path = destination_within_share(location, mount_path.clone())?;
     Ok(SmbNavigation::Directory {
         path,
-        server_address: format!("smb://{}", location.authority),
+        server_address: format!("smb://{}", location.server),
+        share_name: location
+            .share
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("请指定 SMB 共享目录"))?,
         mount_path,
     })
 }
 
 fn list_server_shares(location: &SmbLocation) -> Result<SmbNavigation> {
-    let mut result = run_smbutil_view(location);
-    if result.is_err() {
-        authenticate_server(location)?;
-        result = run_smbutil_view(location);
-    }
-    let output = result?;
+    let output = match run_smbutil_view(location, None)? {
+        ShareQuery::Output(output) => output,
+        ShareQuery::AuthenticationRequired => {
+            return Ok(SmbNavigation::AuthenticationRequired {
+                address: format!("smb://{}", location.server),
+                suggested_username: username_from_authority(&location.authority),
+            });
+        }
+    };
+    server_navigation(location, output)
+}
+
+fn list_server_shares_with_credentials(
+    location: &SmbLocation,
+    username: &str,
+    password: &str,
+) -> Result<SmbNavigation> {
+    let credentials = SmbCredentials { username, password };
+    let output = match run_smbutil_view(location, Some(credentials))? {
+        ShareQuery::Output(output) => output,
+        ShareQuery::AuthenticationRequired => {
+            anyhow::bail!("用户名或密码不正确，请重试");
+        }
+    };
+    server_navigation(location, output)
+}
+
+fn server_navigation(location: &SmbLocation, output: String) -> Result<SmbNavigation> {
     let shares = parse_smbutil_shares(&output)
         .into_iter()
         .map(|name| SmbShare {
@@ -117,47 +167,90 @@ fn list_server_shares(location: &SmbLocation) -> Result<SmbNavigation> {
     })
 }
 
-fn run_smbutil_view(location: &SmbLocation) -> Result<String> {
-    let output = Command::new("/usr/bin/smbutil")
-        .args(["view", "-N", "-G"])
-        .arg(format!("//{}", location.authority))
+#[derive(Clone, Copy)]
+struct SmbCredentials<'a> {
+    username: &'a str,
+    password: &'a str,
+}
+
+enum ShareQuery {
+    Output(String),
+    AuthenticationRequired,
+}
+
+fn run_smbutil_view(
+    location: &SmbLocation,
+    credentials: Option<SmbCredentials<'_>>,
+) -> Result<ShareQuery> {
+    let target = credentials.map_or_else(
+        || format!("//{}", location.authority),
+        |credentials| {
+            format!(
+                "//{}:{}@{}",
+                encode_username(credentials.username),
+                percent_encode(credentials.password),
+                location.server
+            )
+        },
+    );
+    let mut command = Command::new("/usr/bin/smbutil");
+    command.args(["view", "-N"]);
+    if credentials.is_none() {
+        command.arg("-G");
+    }
+    let output = command
+        .arg(target)
         .output()
         .context("无法启动 macOS SMB 共享查询服务")?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if is_authentication_error(output.status.code(), &message) {
+            return Ok(ShareQuery::AuthenticationRequired);
+        }
+        if credentials.is_some() {
+            anyhow::bail!("无法连接 SMB 服务器，请检查 NAS 地址、网络和访问权限");
+        }
         if message.is_empty() {
-            anyhow::bail!("无法读取 SMB 服务器共享列表");
+            anyhow::bail!("无法直接读取 SMB 服务器共享列表，请检查网络或访问权限");
         }
         anyhow::bail!("无法读取 SMB 服务器共享列表：{message}");
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(ShareQuery::Output(
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    ))
 }
 
-fn authenticate_server(location: &SmbLocation) -> Result<()> {
-    let output = Command::new("/usr/bin/osascript")
-        .args(["-e", MOUNT_SMB_SCRIPT, "--"])
-        .arg(format!("smb://{}", location.authority))
-        .output()
-        .context("无法启动 macOS SMB 认证服务")?;
-    if output.status.success() {
-        return Ok(());
+fn username_from_authority(authority: &str) -> Option<String> {
+    authority
+        .rsplit_once('@')
+        .map(|(username, _)| username)
+        .filter(|username| !username.is_empty())
+        .and_then(|username| percent_decode(username).ok())
+}
+
+fn encode_username(username: &str) -> String {
+    if let Some((domain, account)) = username.split_once(['\\', ';']) {
+        format!("{};{}", percent_encode(domain), percent_encode(account))
+    } else {
+        percent_encode(username)
     }
-    let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if message.contains("(-128)") {
-        anyhow::bail!("已取消连接 SMB 服务器");
-    }
-    if message.is_empty() {
-        anyhow::bail!("SMB 服务器认证失败");
-    }
-    anyhow::bail!("SMB 服务器认证失败：{message}")
+}
+
+fn is_authentication_error(status_code: Option<i32>, message: &str) -> bool {
+    status_code == Some(77)
+        || message
+            .to_ascii_lowercase()
+            .contains("authentication error")
+        || message
+            .to_ascii_lowercase()
+            .contains("server rejected the authentication")
 }
 
 fn parse_smbutil_shares(output: &str) -> Vec<String> {
     let lines = output.lines().collect::<Vec<_>>();
     let Some((header_index, type_column)) = lines.iter().enumerate().find_map(|(index, line)| {
-        let share_column = line.find("Share")?;
-        let type_column = line[share_column + 5..].find("Type")? + share_column + 5;
-        Some((index, type_column))
+        line.find("Share")?;
+        Some((index, line.find("Type")?))
     }) else {
         return Vec::new();
     };
@@ -165,11 +258,8 @@ fn parse_smbutil_shares(output: &str) -> Vec<String> {
     let mut shares = lines[header_index + 1..]
         .iter()
         .filter_map(|line| {
-            if line.len() <= type_column {
-                return None;
-            }
-            let name = line[..type_column].trim();
-            let resource_type = line[type_column..].split_whitespace().next()?;
+            let (type_index, resource_type) = smbutil_resource_type(line, type_column)?;
+            let name = line[..type_index].trim();
             if name.is_empty() || !resource_type.eq_ignore_ascii_case("disk") {
                 return None;
             }
@@ -179,6 +269,22 @@ fn parse_smbutil_shares(output: &str) -> Vec<String> {
     shares.sort_by_key(|name| name.to_lowercase());
     shares.dedup();
     shares
+}
+
+fn smbutil_resource_type(line: &str, expected_column: usize) -> Option<(usize, &str)> {
+    const RESOURCE_TYPES: &[&str] = &["Disk", "Pipe", "Printer", "Comm"];
+    let mut search_from = 0;
+    line.split_whitespace()
+        .filter_map(|token| {
+            let relative_index = line[search_from..].find(token)?;
+            let index = search_from + relative_index;
+            search_from = index + token.len();
+            RESOURCE_TYPES
+                .iter()
+                .any(|resource_type| token.eq_ignore_ascii_case(resource_type))
+                .then_some((index, token))
+        })
+        .min_by_key(|(index, _)| index.abs_diff(expected_column))
 }
 
 fn mount_url(location: &SmbLocation) -> Result<String> {
@@ -211,7 +317,35 @@ fn find_existing_mount(location: &SmbLocation) -> Option<PathBuf> {
         .find_map(|line| parse_matching_mount(line, location))
 }
 
+pub(crate) fn mounted_location_for_path(path: &std::path::Path) -> Option<SmbMountInfo> {
+    if !path.starts_with("/Volumes") {
+        return None;
+    }
+    let output = Command::new("/sbin/mount").output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout))?
+        .lines()
+        .filter_map(parse_smb_mount)
+        .filter(|mount| path.starts_with(&mount.mount_path))
+        .max_by_key(|mount| mount.mount_path.components().count())
+}
+
 fn parse_matching_mount(line: &str, location: &SmbLocation) -> Option<PathBuf> {
+    let mount = parse_smb_mount(line)?;
+    if !mount
+        .server_address
+        .strip_prefix("smb://")?
+        .eq_ignore_ascii_case(&location.server)
+        || location.share.as_deref() != Some(mount.share_name.as_str())
+    {
+        return None;
+    }
+    Some(mount.mount_path)
+}
+
+fn parse_smb_mount(line: &str) -> Option<SmbMountInfo> {
     let (source, mounted) = line.split_once(" on ")?;
     let options_start = mounted.rfind(" (")?;
     let options = mounted[options_start + 2..].strip_suffix(')')?;
@@ -224,13 +358,11 @@ fn parse_matching_mount(line: &str, location: &SmbLocation) -> Option<PathBuf> {
     let (server, share) = server_and_share.split_once('/')?;
     let server = decode_mount_field(server)?;
     let share = decode_mount_field(share)?;
-    if !server.eq_ignore_ascii_case(&location.server)
-        || location.share.as_deref() != Some(share.as_str())
-    {
-        return None;
-    }
-
-    Some(PathBuf::from(&mounted[..options_start]))
+    Some(SmbMountInfo {
+        server_address: format!("smb://{server}"),
+        share_name: share,
+        mount_path: PathBuf::from(&mounted[..options_start]),
+    })
 }
 
 fn decode_mount_field(value: &str) -> Option<String> {
@@ -391,7 +523,10 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SmbLocation, looks_like_address, parse_location, parse_matching_mount};
+    use super::{
+        SmbLocation, encode_username, is_authentication_error, looks_like_address, parse_location,
+        parse_matching_mount,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -443,6 +578,25 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_authentication_failures_without_masking_network_errors() {
+        assert!(is_authentication_error(
+            Some(77),
+            "server rejected the authentication: Authentication error"
+        ));
+        assert!(is_authentication_error(Some(1), "Authentication error"));
+        assert!(!is_authentication_error(
+            Some(68),
+            "server connection failed: No route to host"
+        ));
+    }
+
+    #[test]
+    fn encodes_domain_and_username_for_smbutil() {
+        assert_eq!(encode_username(r"OFFICE\张三"), "OFFICE;%E5%BC%A0%E4%B8%89");
+        assert_eq!(encode_username("local user"), "local%20user");
+    }
+
+    #[test]
     fn accepts_a_server_root_without_a_share_name() {
         let root = parse_location("smb://nas.local").unwrap();
         assert_eq!(root.authority, "nas.local");
@@ -489,6 +643,33 @@ mod tests {
                 "备份视频".to_string(),
                 "数据备份".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn parses_long_utf8_share_names_without_splitting_a_character() {
+        let output = format!(
+            "Share                                           Type    Comments\n\
+             -------------------------------\n\
+             {}中 Disk    Archive\n\
+             1 share listed\n",
+            "a".repeat(47)
+        );
+        assert_eq!(
+            super::parse_smbutil_shares(&output),
+            vec![format!("{}中", "a".repeat(47))]
+        );
+    }
+
+    #[test]
+    fn finds_the_type_column_when_a_share_name_contains_the_word_disk() {
+        let output = "Share                                           Type    Comments\n\
+                      -------------------------------\n\
+                      Disk Images                                     Disk    Backups\n\
+                      Office Disk                                     Pipe    IPC\n";
+        assert_eq!(
+            super::parse_smbutil_shares(output),
+            vec!["Disk Images".to_string()]
         );
     }
 }

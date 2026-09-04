@@ -64,7 +64,7 @@ impl AddressBar {
     }
 
     fn begin_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.edit_buffer = self.pane.read(cx).current_path.display().to_string();
+        self.edit_buffer = self.pane.read(cx).display_path();
         self.editing = true;
         self.selected_range = 0..self.edit_buffer.len();
         self.selection_reversed = false;
@@ -828,7 +828,7 @@ impl Render for AddressBar {
         let (path, can_go_back, can_go_forward, can_go_up, error) = {
             let pane = self.pane.read(cx);
             (
-                pane.current_path.clone(),
+                PathBuf::from(pane.display_path()),
                 pane.can_go_back(),
                 pane.can_go_forward(),
                 pane.can_go_up(),
@@ -907,12 +907,23 @@ impl Render for AddressBar {
 
 fn breadcrumb_nodes(path: &Path) -> Vec<(String, PathBuf)> {
     let display = path.to_string_lossy();
-    if let Some(server) = display.strip_prefix("smb://") {
-        let path = path.to_path_buf();
-        return vec![
-            ("SMB".to_string(), path.clone()),
-            (server.to_string(), path),
+    if let Some(server_and_path) = display.strip_prefix("smb://") {
+        let mut parts = server_and_path.split('/').filter(|part| !part.is_empty());
+        let Some(server) = parts.next() else {
+            return Vec::new();
+        };
+        let server_address = format!("smb://{server}");
+        let mut nodes = vec![
+            ("SMB".to_string(), PathBuf::from(&server_address)),
+            (server.to_string(), PathBuf::from(&server_address)),
         ];
+        let mut address = server_address;
+        for component in parts {
+            address.push('/');
+            address.push_str(component);
+            nodes.push((component.to_string(), PathBuf::from(&address)));
+        }
+        return nodes;
     }
 
     let mut nodes = vec![("Mac".to_string(), PathBuf::from("/"))];
@@ -925,4 +936,34 @@ fn breadcrumb_nodes(path: &Path) -> Vec<(String, PathBuf)> {
         }
     }
     nodes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::breadcrumb_nodes;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn smb_breadcrumbs_keep_clickable_server_share_and_subdirectory_addresses() {
+        assert_eq!(
+            breadcrumb_nodes(Path::new(
+                "smb://192.168.70.2/c微信公众号文章I小助手/已发布"
+            )),
+            vec![
+                ("SMB".to_string(), PathBuf::from("smb://192.168.70.2")),
+                (
+                    "192.168.70.2".to_string(),
+                    PathBuf::from("smb://192.168.70.2")
+                ),
+                (
+                    "c微信公众号文章I小助手".to_string(),
+                    PathBuf::from("smb://192.168.70.2/c微信公众号文章I小助手")
+                ),
+                (
+                    "已发布".to_string(),
+                    PathBuf::from("smb://192.168.70.2/c微信公众号文章I小助手/已发布")
+                ),
+            ]
+        );
+    }
 }

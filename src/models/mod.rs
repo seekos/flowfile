@@ -10,7 +10,7 @@ pub use favorites::Favorites;
 pub use file_item::{FileItem, FileKind, SortMode};
 pub use multi_pane::{LayoutMode, MultiPaneModel};
 pub use operations::{CreateItemKind, FileDragPayload, FileOperationController};
-pub use pane::{ExplorerTab, Pane, ViewMode, home_directory};
+pub use pane::{ExplorerTab, Pane, PaneEvent, ViewMode, home_directory};
 pub use preferences::{AppPreferences, ThemePreference};
 pub use session::SessionState;
 

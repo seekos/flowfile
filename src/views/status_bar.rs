@@ -45,7 +45,7 @@ impl Render for StatusBar {
         let pane = model.panes[active_index].read(cx);
         let item_count = pane.items.len();
         let folder_count = pane.items.iter().filter(|item| item.is_dir).count();
-        let path = pane.current_path.display().to_string();
+        let path = pane.display_path();
         let terminal_path = pane.current_path.clone();
         let selection = match pane.selection_count() {
             0 => "未选择项目".to_string(),

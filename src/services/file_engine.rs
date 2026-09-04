@@ -1,4 +1,4 @@
-use super::{SmbNavigation, quick_look::is_text_extension, smb, volume};
+use super::{SmbMountInfo, SmbNavigation, quick_look::is_text_extension, smb, volume};
 use crate::models::{FileItem, FileKind, SortMode};
 use anyhow::{Context as _, Result};
 use std::{
@@ -74,11 +74,27 @@ impl FileEngine {
         smb::looks_like_address(input)
     }
 
+    pub(crate) fn mounted_smb_for_path(path: &Path) -> Option<SmbMountInfo> {
+        smb::mounted_location_for_path(path)
+    }
+
     pub(crate) async fn connect_smb(&self, address: String) -> Result<SmbNavigation> {
         self.runtime
             .spawn_blocking(move || smb::connect(&address))
             .await
             .context("SMB 连接任务异常终止")?
+    }
+
+    pub(crate) async fn connect_smb_with_credentials(
+        &self,
+        address: String,
+        username: String,
+        password: String,
+    ) -> Result<SmbNavigation> {
+        self.runtime
+            .spawn_blocking(move || smb::connect_with_credentials(&address, &username, &password))
+            .await
+            .context("SMB 认证任务异常终止")?
     }
 
     pub fn ntfs_auto_mount_available(&self) -> bool {

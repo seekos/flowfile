@@ -3,7 +3,7 @@ use crate::services::{
     DirectorySnapshot, FileEngine, FileOperationEngine, FileWatcher, SearchEngine, SearchScope,
     SmbNavigation, SmbShare,
 };
-use gpui::{Context, Timer};
+use gpui::{Context, EventEmitter, Timer};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashSet},
@@ -76,9 +76,27 @@ enum NavigationIntent {
     Refresh,
 }
 
+#[derive(Clone, Debug)]
+pub enum PaneEvent {
+    AuthRequired {
+        address: String,
+        suggested_username: Option<String>,
+    },
+    Connected {
+        address: String,
+    },
+    ConnectionFailed {
+        address: String,
+        message: String,
+    },
+}
+
+impl EventEmitter<PaneEvent> for Pane {}
+
 #[derive(Clone)]
 struct SmbMountContext {
     server_address: String,
+    share_name: String,
     mount_path: PathBuf,
 }
 
@@ -111,12 +129,18 @@ pub struct Pane {
     watcher: Option<FileWatcher>,
     smb_server_root: bool,
     smb_mount: Option<SmbMountContext>,
+    pending_smb_auth: Option<(String, NavigationIntent)>,
 }
 
 impl Pane {
     pub fn new(path: PathBuf, engine: FileEngine) -> Self {
         let operation_engine = FileOperationEngine::new(&engine);
         let search_engine = SearchEngine::new(&engine);
+        let smb_mount = FileEngine::mounted_smb_for_path(&path).map(|mount| SmbMountContext {
+            server_address: mount.server_address,
+            share_name: mount.share_name,
+            mount_path: mount.mount_path,
+        });
         Self {
             current_path: path.clone(),
             tabs: vec![ExplorerTab::new(path)],
@@ -145,7 +169,8 @@ impl Pane {
             watcher_generation: 0,
             watcher: None,
             smb_server_root: false,
-            smb_mount: None,
+            smb_mount,
+            pending_smb_auth: None,
         }
     }
 
@@ -202,6 +227,7 @@ impl Pane {
         self.watcher = None;
         self.is_loading = true;
         self.error_message = None;
+        self.pending_smb_auth = None;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -211,13 +237,28 @@ impl Pane {
                     return;
                 }
                 match result {
+                    Ok(SmbNavigation::AuthenticationRequired {
+                        address,
+                        suggested_username,
+                    }) => {
+                        pane.is_loading = false;
+                        pane.pending_smb_auth = Some((address.clone(), intent));
+                        pane.error_message = None;
+                        cx.emit(PaneEvent::AuthRequired {
+                            address,
+                            suggested_username,
+                        });
+                        cx.notify();
+                    }
                     Ok(SmbNavigation::Directory {
                         path,
                         server_address,
+                        share_name,
                         mount_path,
                     }) => {
                         pane.smb_mount = Some(SmbMountContext {
                             server_address,
+                            share_name,
                             mount_path,
                         });
                         pane.load_path(path, intent, cx);
@@ -233,6 +274,78 @@ impl Pane {
                         cx.notify();
                     }
                 }
+            });
+        })
+        .detach();
+    }
+
+    pub fn authenticate_smb(
+        &mut self,
+        address: String,
+        username: String,
+        password: String,
+        cx: &mut Context<Self>,
+    ) {
+        let intent = self
+            .pending_smb_auth
+            .as_ref()
+            .filter(|(pending_address, _)| pending_address == &address)
+            .map(|(_, intent)| *intent)
+            .unwrap_or(NavigationIntent::Push);
+        self.load_generation += 1;
+        let generation = self.load_generation;
+        let engine = self.engine.clone();
+        self.is_loading = true;
+        self.error_message = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .connect_smb_with_credentials(address.clone(), username, password)
+                .await;
+            let _ = this.update(cx, |pane, cx| {
+                if pane.load_generation != generation {
+                    return;
+                }
+                pane.is_loading = false;
+                match result {
+                    Ok(SmbNavigation::Server {
+                        address: connected_address,
+                        shares,
+                    }) => {
+                        pane.pending_smb_auth = None;
+                        pane.apply_smb_server(connected_address, shares, intent);
+                        cx.emit(PaneEvent::Connected { address });
+                    }
+                    Ok(SmbNavigation::Directory {
+                        path,
+                        server_address,
+                        share_name,
+                        mount_path,
+                    }) => {
+                        pane.pending_smb_auth = None;
+                        pane.smb_mount = Some(SmbMountContext {
+                            server_address,
+                            share_name,
+                            mount_path,
+                        });
+                        pane.load_path(path, intent, cx);
+                        cx.emit(PaneEvent::Connected { address });
+                    }
+                    Ok(SmbNavigation::AuthenticationRequired { .. }) => {
+                        cx.emit(PaneEvent::ConnectionFailed {
+                            address,
+                            message: "用户名或密码不正确，请重试".to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        cx.emit(PaneEvent::ConnectionFailed {
+                            address,
+                            message: error.to_string(),
+                        });
+                    }
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -760,6 +873,30 @@ impl Pane {
         self.smb_server_root
     }
 
+    pub fn display_path(&self) -> String {
+        let Some(mount) = self
+            .smb_mount
+            .as_ref()
+            .filter(|mount| self.current_path.starts_with(&mount.mount_path))
+        else {
+            return self.current_path.display().to_string();
+        };
+        let mut address = format!(
+            "{}/{}",
+            mount.server_address.trim_end_matches('/'),
+            mount.share_name
+        );
+        if let Ok(relative) = self.current_path.strip_prefix(&mount.mount_path) {
+            for component in relative.components() {
+                if let std::path::Component::Normal(name) = component {
+                    address.push('/');
+                    address.push_str(&name.to_string_lossy());
+                }
+            }
+        }
+        address
+    }
+
     pub fn smb_server_for_mount(&self, mount_path: &Path) -> Option<String> {
         self.smb_mount
             .as_ref()
@@ -1013,6 +1150,7 @@ mod tests {
         );
         pane.smb_mount = Some(SmbMountContext {
             server_address: "smb://192.168.70.10".to_string(),
+            share_name: "Media".to_string(),
             mount_path: PathBuf::from("/Volumes/Media"),
         });
 
@@ -1020,7 +1158,9 @@ mod tests {
             pane.smb_parent_address().as_deref(),
             Some("smb://192.168.70.10")
         );
+        assert_eq!(pane.display_path(), "smb://192.168.70.10/Media");
         pane.current_path.push("Movies");
         assert_eq!(pane.smb_parent_address(), None);
+        assert_eq!(pane.display_path(), "smb://192.168.70.10/Media/Movies");
     }
 }
