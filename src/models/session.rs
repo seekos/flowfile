@@ -106,7 +106,7 @@ impl Default for PaneSession {
             tabs: Vec::new(),
             active_tab_index: 0,
             show_hidden: false,
-            sort_mode: SortMode::Name,
+            sort_mode: SortMode::default(),
             view_mode: ViewMode::Grid,
         }
     }

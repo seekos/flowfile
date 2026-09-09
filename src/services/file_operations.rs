@@ -659,6 +659,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_move_places_every_source_in_the_destination() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let destination_directory = tempfile::tempdir().expect("destination directory");
+        let first = source_directory.path().join("first.txt");
+        let second = source_directory.path().join("second.txt");
+        fs::write(&first, b"first").expect("write first source");
+        fs::write(&second, b"second").expect("write second source");
+        let (progress, _receiver) = async_channel::bounded(8);
+
+        let destinations = execute_transfer(
+            vec![first.clone(), second.clone()],
+            destination_directory.path().to_path_buf(),
+            TransferMode::Move,
+            ConflictPolicy::AutoRename,
+            progress,
+        )
+        .await
+        .expect("move batch");
+
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert_eq!(destinations.len(), 2);
+        assert_eq!(fs::read(&destinations[0]).unwrap(), b"first");
+        assert_eq!(fs::read(&destinations[1]).unwrap(), b"second");
+    }
+
+    #[tokio::test]
     async fn available_path_preserves_extension() {
         let directory = tempfile::tempdir().expect("temp directory");
         let path = directory.path().join("archive.tar.gz");

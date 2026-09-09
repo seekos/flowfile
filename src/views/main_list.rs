@@ -4,17 +4,17 @@ use super::{
     tooltip::delayed_tooltip,
 };
 use crate::{
-    actions::{CopyFiles, CutFiles, PasteFiles, RenameSelected},
+    actions::{CopyFiles, CutFiles, PasteFiles, RenameSelected, SelectAllFiles},
     models::{FileItem, FileKind, FileOperationController, Model, Pane, SortMode, ViewMode},
-    services::{ThumbnailEngine, begin_external_file_drag, end_external_file_drag},
+    services::{ThumbnailEngine, TransferMode, begin_external_file_drag, end_external_file_drag},
     theme,
 };
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
-    GlobalElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    ElementInputHandler, Entity, EntityInputHandler, ExternalPaths, FocusHandle, Focusable,
+    FontWeight, GlobalElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, Pixels, Point, Render, RenderImage,
-    ScrollWheelEvent, ShapedLine, SharedString, Style, StyledImage, Subscription, TextRun,
+    ScrollWheelEvent, ShapedLine, SharedString, Style, StyledImage, Subscription, TextRun, Timer,
     UTF16Selection, UnderlineStyle, Window, deferred, div, fill, img, point, prelude::*, px,
     relative, size, uniform_list,
 };
@@ -22,14 +22,16 @@ use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap},
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 
 const DETAILS_ICON_WIDTH: f32 = 42.0;
 const GRID_CARD_TARGET_WIDTH: f32 = 112.0;
 const FILE_DRAG_THRESHOLD: f64 = 4.0;
+const FOLDER_DROP_HOVER_DELAY: Duration = Duration::from_millis(450);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DetailColumn {
@@ -101,6 +103,7 @@ struct MarqueeSelection {
 
 struct PendingFileDrag {
     start: Point<Pixels>,
+    visual_origin: Point<Pixels>,
     paths: Vec<PathBuf>,
 }
 
@@ -284,7 +287,12 @@ pub struct MainListView {
     resize_last_x: Option<Pixels>,
     marquee: Option<MarqueeSelection>,
     pending_file_drag: Option<PendingFileDrag>,
+    dragging_paths: BTreeSet<PathBuf>,
+    folder_drop_candidate: Option<PathBuf>,
+    folder_drop_target: Option<PathBuf>,
+    folder_drop_generation: u64,
     item_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    drag_visual_origins: Rc<RefCell<HashMap<usize, Point<Pixels>>>>,
     visible_indices: Rc<RefCell<BTreeSet<usize>>>,
     viewport_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     grid_columns: usize,
@@ -322,7 +330,12 @@ impl MainListView {
             resize_last_x: None,
             marquee: None,
             pending_file_drag: None,
+            dragging_paths: BTreeSet::new(),
+            folder_drop_candidate: None,
+            folder_drop_target: None,
+            folder_drop_generation: 0,
             item_bounds: Rc::new(RefCell::new(HashMap::new())),
+            drag_visual_origins: Rc::new(RefCell::new(HashMap::new())),
             visible_indices: Rc::new(RefCell::new(BTreeSet::new())),
             viewport_bounds: Rc::new(RefCell::new(None)),
             grid_columns: 4,
@@ -839,8 +852,17 @@ impl MainListView {
         self.update_marquee(event, window, cx);
     }
 
-    fn arm_file_drag(&mut self, start: Point<Pixels>, paths: Vec<PathBuf>) {
-        self.pending_file_drag = Some(PendingFileDrag { start, paths });
+    fn arm_file_drag(
+        &mut self,
+        start: Point<Pixels>,
+        visual_origin: Point<Pixels>,
+        paths: Vec<PathBuf>,
+    ) {
+        self.pending_file_drag = Some(PendingFileDrag {
+            start,
+            visual_origin,
+            paths,
+        });
     }
 
     fn try_begin_file_drag(
@@ -857,7 +879,33 @@ impl MainListView {
         }
 
         let paths = pending.paths.clone();
-        if !begin_external_file_drag(&paths, window) {
+        self.dragging_paths = paths.iter().cloned().collect();
+        cx.notify();
+        let (drag_ended_sender, drag_ended_receiver) = async_channel::bounded(1);
+        cx.spawn(async move |this, cx| {
+            if drag_ended_receiver.recv().await.is_ok() {
+                let _ = this.update(cx, |this, cx| {
+                    if !this.dragging_paths.is_empty() {
+                        this.dragging_paths.clear();
+                    }
+                    this.clear_folder_drop_hover(cx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        if !begin_external_file_drag(
+            &paths,
+            pending.start,
+            pending.visual_origin,
+            event.position,
+            window,
+            move || {
+                let _ = drag_ended_sender.try_send(());
+            },
+        ) {
+            self.dragging_paths.clear();
+            cx.notify();
             return false;
         }
 
@@ -869,8 +917,85 @@ impl MainListView {
     fn finish_pointer_interaction(&mut self, cx: &mut Context<Self>) {
         self.pending_file_drag = None;
         end_external_file_drag();
+        if !self.dragging_paths.is_empty() {
+            self.dragging_paths.clear();
+            cx.notify();
+        }
+        self.clear_folder_drop_hover(cx);
         self.finish_column_resize();
         if self.marquee.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn update_folder_drop_hover(&mut self, path: PathBuf, hovered: bool, cx: &mut Context<Self>) {
+        if !hovered {
+            if self.folder_drop_candidate.as_ref() == Some(&path)
+                || self.folder_drop_target.as_ref() == Some(&path)
+            {
+                self.clear_folder_drop_hover(cx);
+            }
+            return;
+        }
+        if self.folder_drop_candidate.as_ref() == Some(&path) {
+            return;
+        }
+
+        self.folder_drop_generation = self.folder_drop_generation.wrapping_add(1);
+        let generation = self.folder_drop_generation;
+        self.folder_drop_candidate = Some(path.clone());
+        if self.folder_drop_target.take().is_some() {
+            cx.notify();
+        }
+        cx.spawn(async move |this, cx| {
+            Timer::after(FOLDER_DROP_HOVER_DELAY).await;
+            let activated = this
+                .update(cx, |this, cx| {
+                    if this.folder_drop_generation == generation
+                        && this.folder_drop_candidate.as_ref() == Some(&path)
+                    {
+                        this.folder_drop_target = Some(path.clone());
+                        cx.notify();
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if !activated {
+                return;
+            }
+
+            loop {
+                Timer::after(Duration::from_millis(100)).await;
+                let keep_monitoring = this
+                    .update(cx, |this, cx| {
+                        if this.folder_drop_generation != generation
+                            || this.folder_drop_target.as_ref() != Some(&path)
+                        {
+                            return false;
+                        }
+                        if cx.has_active_drag() {
+                            true
+                        } else {
+                            this.clear_folder_drop_hover(cx);
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_monitoring {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn clear_folder_drop_hover(&mut self, cx: &mut Context<Self>) {
+        self.folder_drop_generation = self.folder_drop_generation.wrapping_add(1);
+        let changed =
+            self.folder_drop_candidate.take().is_some() || self.folder_drop_target.take().is_some();
+        if changed {
             cx.notify();
         }
     }
@@ -1011,6 +1136,7 @@ impl MainListView {
         item: FileItem,
         is_selected: bool,
         is_cut: bool,
+        is_dragging: bool,
         renaming: bool,
         rename_buffer: String,
         selected_paths: Vec<std::path::PathBuf>,
@@ -1025,6 +1151,15 @@ impl MainListView {
         let context_focus_handle = self.focus_handle.clone();
         let context_menu = self.context_menu.clone();
         let item_bounds = self.item_bounds.clone();
+        let drag_visual_origins = self.drag_visual_origins.clone();
+        let drag_visual_origins_for_mouse_down = self.drag_visual_origins.clone();
+        let folder_drop_move_input = input_entity.clone();
+        let folder_drop_style_input = input_entity.clone();
+        let folder_drop_finish_input = input_entity.clone();
+        let folder_drop_path = item.path.clone();
+        let folder_drop_path_for_style = item.path.clone();
+        let folder_drop_path_for_drop = item.path.clone();
+        let folder_drop_operations = self.operations.clone();
         let pane_index = self.pane_index;
         let drag_paths = if is_selected && !selected_paths.is_empty() {
             selected_paths
@@ -1051,13 +1186,63 @@ impl MainListView {
             } else {
                 theme::surface()
             })
-            .opacity(if is_cut { 0.5 } else { 1.0 })
+            .opacity(if is_dragging {
+                0.0
+            } else if is_cut {
+                0.5
+            } else {
+                1.0
+            })
             .when(is_folder, |row| row.cursor_default())
             .when(!is_folder, |row| row.cursor_move())
+            .when(is_folder, move |row| {
+                row.on_drag_move::<ExternalPaths>(move |event, _, cx| {
+                    let hovered = event.bounds.contains(&event.event.position)
+                        && can_transfer_to_folder(
+                            event.drag(cx).paths(),
+                            folder_drop_path.as_path(),
+                        );
+                    let _ = folder_drop_move_input.update(cx, |input, cx| {
+                        input.update_folder_drop_hover(folder_drop_path.clone(), hovered, cx);
+                    });
+                })
+                .drag_over::<ExternalPaths>(move |style, payload, _, cx| {
+                    if can_transfer_to_folder(payload.paths(), &folder_drop_path_for_style)
+                        && folder_drop_style_input.read(cx).folder_drop_target.as_ref()
+                            == Some(&folder_drop_path_for_style)
+                    {
+                        style.border_color(theme::accent()).bg(theme::accent_soft())
+                    } else {
+                        style
+                    }
+                })
+                .on_drop(move |payload: &ExternalPaths, _, cx| {
+                    let paths = payload.paths().to_vec();
+                    let _ = folder_drop_finish_input.update(cx, |input, cx| {
+                        input.clear_folder_drop_hover(cx);
+                    });
+                    if !can_transfer_to_folder(&paths, &folder_drop_path_for_drop) {
+                        return;
+                    }
+                    folder_drop_operations.update(cx, |operations, cx| {
+                        operations.transfer_to_path(
+                            paths,
+                            folder_drop_path_for_drop.clone(),
+                            TransferMode::Move,
+                            cx,
+                        );
+                    });
+                })
+            })
             .hover(|style| style.bg(theme::accent_soft().opacity(0.7)))
             .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                let visual_origin = drag_visual_origins_for_mouse_down
+                    .borrow()
+                    .get(&index)
+                    .copied()
+                    .unwrap_or(event.position);
                 drag_input.update(cx, |input, _| {
-                    input.arm_file_drag(event.position, drag_paths.clone());
+                    input.arm_file_drag(event.position, visual_origin, drag_paths.clone());
                 });
                 cx.stop_propagation();
             })
@@ -1085,6 +1270,15 @@ impl MainListView {
             })
             .child(
                 div()
+                    .on_children_prepainted(move |bounds, _, _| {
+                        if let Some(bounds) =
+                            bounds.into_iter().reduce(|left, right| left.union(&right))
+                        {
+                            drag_visual_origins
+                                .borrow_mut()
+                                .insert(index, bounds.center());
+                        }
+                    })
                     .flex()
                     .items_center()
                     .flex_shrink_0()
@@ -1137,6 +1331,7 @@ impl MainListView {
         item: FileItem,
         is_selected: bool,
         is_cut: bool,
+        is_dragging: bool,
         renaming: bool,
         rename_buffer: String,
         selected_paths: Vec<PathBuf>,
@@ -1149,10 +1344,21 @@ impl MainListView {
         let context_focus_handle = self.focus_handle.clone();
         let context_menu = self.context_menu.clone();
         let item_bounds = self.item_bounds.clone();
+        let drag_visual_origins = self.drag_visual_origins.clone();
+        let drag_visual_origins_for_mouse_down = self.drag_visual_origins.clone();
+        let folder_drop_move_input = input_entity.clone();
+        let folder_drop_style_input = input_entity.clone();
+        let folder_drop_finish_input = input_entity.clone();
+        let folder_drop_path = item.path.clone();
+        let folder_drop_path_for_style = item.path.clone();
+        let folder_drop_path_for_drop = item.path.clone();
+        let folder_drop_operations = self.operations.clone();
         let pane_index = self.pane_index;
         let drag_input = input_entity.clone();
         let file_name = item.name.clone();
-        let name_element = if renaming {
+        let name_element = if is_dragging {
+            div().into_any_element()
+        } else if renaming {
             deferred(
                 div()
                     .absolute()
@@ -1215,6 +1421,13 @@ impl MainListView {
             vec![item.path.clone()]
         };
         let file_visual = div()
+            .on_children_prepainted(move |bounds, _, _| {
+                if let Some(bounds) = bounds.into_iter().reduce(|left, right| left.union(&right)) {
+                    drag_visual_origins
+                        .borrow_mut()
+                        .insert(index, bounds.center());
+                }
+            })
             .flex()
             .items_center()
             .justify_center()
@@ -1251,15 +1464,67 @@ impl MainListView {
             .border_1()
             .border_color(theme::surface())
             .bg(theme::surface())
-            .opacity(if is_cut { 0.5 } else { 1.0 })
+            .opacity(if is_dragging {
+                0.0
+            } else if is_cut {
+                0.5
+            } else {
+                1.0
+            })
             .when(is_folder, |card| card.cursor_default())
             .when(!is_folder, |card| card.cursor_move())
+            .when(is_folder, move |card| {
+                card.on_drag_move::<ExternalPaths>(move |event, _, cx| {
+                    let hovered = event.bounds.contains(&event.event.position)
+                        && can_transfer_to_folder(
+                            event.drag(cx).paths(),
+                            folder_drop_path.as_path(),
+                        );
+                    let _ = folder_drop_move_input.update(cx, |input, cx| {
+                        input.update_folder_drop_hover(folder_drop_path.clone(), hovered, cx);
+                    });
+                })
+                .drag_over::<ExternalPaths>(move |style, payload, _, cx| {
+                    if can_transfer_to_folder(payload.paths(), &folder_drop_path_for_style)
+                        && folder_drop_style_input.read(cx).folder_drop_target.as_ref()
+                            == Some(&folder_drop_path_for_style)
+                    {
+                        style
+                            .border_color(theme::accent())
+                            .bg(theme::accent_soft().opacity(0.72))
+                    } else {
+                        style
+                    }
+                })
+                .on_drop(move |payload: &ExternalPaths, _, cx| {
+                    let paths = payload.paths().to_vec();
+                    let _ = folder_drop_finish_input.update(cx, |input, cx| {
+                        input.clear_folder_drop_hover(cx);
+                    });
+                    if !can_transfer_to_folder(&paths, &folder_drop_path_for_drop) {
+                        return;
+                    }
+                    folder_drop_operations.update(cx, |operations, cx| {
+                        operations.transfer_to_path(
+                            paths,
+                            folder_drop_path_for_drop.clone(),
+                            TransferMode::Move,
+                            cx,
+                        );
+                    });
+                })
+            })
             .when(!is_selected, |card| {
                 card.hover(|style| style.border_color(theme::accent().opacity(0.42)))
             })
             .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                let visual_origin = drag_visual_origins_for_mouse_down
+                    .borrow()
+                    .get(&index)
+                    .copied()
+                    .unwrap_or(event.position);
                 drag_input.update(cx, |input, _| {
-                    input.arm_file_drag(event.position, drag_paths.clone());
+                    input.arm_file_drag(event.position, visual_origin, drag_paths.clone());
                 });
                 cx.stop_propagation();
             })
@@ -1304,6 +1569,7 @@ impl MainListView {
 
     fn on_copy_rename(&mut self, _: &CopyFiles, _window: &mut Window, cx: &mut Context<Self>) {
         if self.pane.read(cx).rename_index.is_none() {
+            cx.propagate();
             return;
         }
         let value = self.pane.read(cx).rename_buffer.clone();
@@ -1316,6 +1582,7 @@ impl MainListView {
 
     fn on_cut_rename(&mut self, _: &CutFiles, _window: &mut Window, cx: &mut Context<Self>) {
         if self.pane.read(cx).rename_index.is_none() {
+            cx.propagate();
             return;
         }
         let value = self.pane.read(cx).rename_buffer.clone();
@@ -1331,12 +1598,20 @@ impl MainListView {
 
     fn on_paste_rename(&mut self, _: &PasteFiles, _window: &mut Window, cx: &mut Context<Self>) {
         if self.pane.read(cx).rename_index.is_none() {
+            cx.propagate();
             return;
         }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.replace_rename_selection(&text.replace(['\n', '\r'], " "), cx);
         }
         cx.stop_propagation();
+    }
+
+    fn select_all(&mut self, _: &SelectAllFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        self.pane.update(cx, |pane, cx| {
+            pane.select_all();
+            cx.notify();
+        });
     }
 
     fn replace_rename_selection(&mut self, new_text: &str, cx: &mut Context<Self>) {
@@ -1826,6 +2101,7 @@ impl Render for MainListView {
                                     )
                                 };
                                 let is_cut = this.operations.read(cx).is_cut_path(&item.path);
+                                let is_dragging = this.dragging_paths.contains(&item.path);
                                 let thumbnail = this
                                     .thumbnails
                                     .update(cx, |engine, _| engine.image_for(&item));
@@ -1834,6 +2110,7 @@ impl Render for MainListView {
                                     item,
                                     is_selected,
                                     is_cut,
+                                    is_dragging,
                                     rename_index == Some(index),
                                     rename_buffer,
                                     selected_paths,
@@ -1883,6 +2160,7 @@ impl Render for MainListView {
                                         )
                                     };
                                     let is_cut = this.operations.read(cx).is_cut_path(&item.path);
+                                    let is_dragging = this.dragging_paths.contains(&item.path);
                                     let thumbnail = this
                                         .thumbnails
                                         .update(cx, |engine, _| engine.image_for(&item));
@@ -1891,6 +2169,7 @@ impl Render for MainListView {
                                         item,
                                         is_selected,
                                         is_cut,
+                                        is_dragging,
                                         rename_index == Some(index),
                                         rename_buffer,
                                         selected_paths,
@@ -1920,7 +2199,13 @@ impl Render for MainListView {
                 sort_mode,
                 cx,
             );
-            let kind = self.detail_column_header("类型", DetailColumn::Kind, None, sort_mode, cx);
+            let kind = self.detail_column_header(
+                "类型",
+                DetailColumn::Kind,
+                Some(SortMode::Kind),
+                sort_mode,
+                cx,
+            );
             let size = self.detail_column_header(
                 "大小",
                 DetailColumn::Size,
@@ -1990,6 +2275,7 @@ impl Render for MainListView {
             .on_action(cx.listener(Self::on_copy_rename))
             .on_action(cx.listener(Self::on_cut_rename))
             .on_action(cx.listener(Self::on_paste_rename))
+            .on_action(cx.listener(Self::select_all))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_move(cx.listener(Self::on_pointer_move))
             .on_mouse_up(
@@ -2089,6 +2375,15 @@ fn file_drag_threshold_reached(start: Point<Pixels>, current: Point<Pixels>) -> 
     (current - start).magnitude() > FILE_DRAG_THRESHOLD
 }
 
+fn can_transfer_to_folder(paths: &[PathBuf], destination: &Path) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|source| {
+            source != destination
+                && !destination.starts_with(source)
+                && source.parent() != Some(destination)
+        })
+}
+
 fn file_type_label(item: &FileItem) -> String {
     match item.kind {
         FileKind::Application => return "应用程序".to_string(),
@@ -2119,8 +2414,9 @@ fn initial_rename_selection(item: &FileItem) -> Range<usize> {
 #[cfg(test)]
 mod grid_name_tests {
     use super::{
-        DetailColumn, DetailColumnWidths, MainListView, file_drag_threshold_reached,
-        grid_columns_for_width, initial_rename_selection, is_vertical_scroll, marquee_bounds,
+        DetailColumn, DetailColumnWidths, MainListView, can_transfer_to_folder,
+        file_drag_threshold_reached, grid_columns_for_width, initial_rename_selection,
+        is_vertical_scroll, marquee_bounds,
     };
     use crate::models::{FileItem, FileKind};
     use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
@@ -2178,6 +2474,28 @@ mod grid_name_tests {
         assert!(file_drag_threshold_reached(
             start,
             point(px(106.0), px(100.0))
+        ));
+    }
+
+    #[test]
+    fn folder_drop_rejects_self_descendants_and_existing_parent() {
+        let destination = PathBuf::from("/tmp/target");
+
+        assert!(can_transfer_to_folder(
+            &[PathBuf::from("/tmp/one.txt"), PathBuf::from("/tmp/two")],
+            &destination,
+        ));
+        assert!(!can_transfer_to_folder(
+            &[destination.clone()],
+            &destination,
+        ));
+        assert!(!can_transfer_to_folder(
+            &[PathBuf::from("/tmp")],
+            &destination,
+        ));
+        assert!(!can_transfer_to_folder(
+            &[PathBuf::from("/tmp/target/already-there.txt")],
+            &destination,
         ));
     }
 

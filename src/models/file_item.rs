@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum FileKind {
     Folder,
     Application,
@@ -24,8 +24,9 @@ pub enum FileKind {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SortMode {
-    #[default]
     Name,
+    #[default]
+    Kind,
     Size,
     Modified,
 }
@@ -128,8 +129,12 @@ impl FileItem {
 
     pub fn sort_items(items: &mut [Self], mode: SortMode) {
         items.sort_by(|left, right| {
-            right.is_dir.cmp(&left.is_dir).then_with(|| match mode {
+            let ordering = match mode {
                 SortMode::Name => natural_name_cmp(left, right),
+                SortMode::Kind => left
+                    .kind
+                    .cmp(&right.kind)
+                    .then_with(|| natural_name_cmp(left, right)),
                 SortMode::Size => left
                     .size
                     .cmp(&right.size)
@@ -138,7 +143,13 @@ impl FileItem {
                     .modified_unix
                     .cmp(&left.modified_unix)
                     .then_with(|| natural_name_cmp(left, right)),
-            })
+            };
+
+            if mode == SortMode::Kind {
+                ordering
+            } else {
+                right.is_dir.cmp(&left.is_dir).then(ordering)
+            }
         });
     }
 }
@@ -207,7 +218,7 @@ fn format_modified_time(time: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileItem, FileKind};
+    use super::{FileItem, FileKind, SortMode};
     use std::{fs, path::PathBuf};
     use tempfile::tempdir;
 
@@ -308,6 +319,44 @@ mod tests {
                 "wrong kind for .{extension}"
             );
         }
+    }
+
+    #[test]
+    fn kind_sort_groups_types_then_sorts_each_group_by_name() {
+        assert_eq!(SortMode::default(), SortMode::Kind);
+
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        for name in ["zeta.txt", "photo.png", "Alpha.txt", "Beta"] {
+            let path = directory.path().join(name);
+            if name == "Beta" {
+                fs::create_dir(&path).expect("create directory");
+            } else {
+                fs::write(&path, b"contents").expect("create file");
+            }
+        }
+
+        let mut items = ["zeta.txt", "photo.png", "Alpha.txt", "Beta"]
+            .into_iter()
+            .map(|name| {
+                let path = directory.path().join(name);
+                FileItem::from_metadata(
+                    path.clone(),
+                    name.to_string(),
+                    fs::metadata(path).expect("read metadata"),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        FileItem::sort_items(&mut items, SortMode::Kind);
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Beta", "Alpha.txt", "zeta.txt", "photo.png"]
+        );
     }
 
     #[cfg(unix)]

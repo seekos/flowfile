@@ -147,7 +147,7 @@ impl Pane {
             active_tab_index: 0,
             items: Vec::new(),
             show_hidden: false,
-            sort_mode: SortMode::Name,
+            sort_mode: SortMode::default(),
             view_mode: ViewMode::Grid,
             selected_index: None,
             selected_indices: BTreeSet::new(),
@@ -581,6 +581,13 @@ impl Pane {
     pub fn clear_selection(&mut self) {
         self.selected_index = None;
         self.selected_indices.clear();
+        self.rename_index = None;
+        self.rename_buffer.clear();
+    }
+
+    pub fn select_all(&mut self) {
+        self.selected_indices = (0..self.items.len()).collect();
+        self.selected_index = self.selected_indices.iter().next_back().copied();
         self.rename_index = None;
         self.rename_buffer.clear();
     }
@@ -1093,6 +1100,33 @@ mod tests {
         assert_eq!(pane.selected_indices, BTreeSet::from([0, 2]));
         assert_eq!(pane.selected_index, Some(2));
         assert!(!pane.set_selection_indices(BTreeSet::from([0, 2])));
+    }
+
+    #[test]
+    fn select_all_selects_every_visible_item() {
+        let mut pane = Pane::new(
+            PathBuf::from("/tmp"),
+            FileEngine::new().expect("file engine"),
+        );
+        pane.items = (0..3)
+            .map(|index| FileItem {
+                path: PathBuf::from(format!("/tmp/{index}.txt")),
+                name: format!("{index}.txt"),
+                is_dir: false,
+                extension: Some("txt".to_string()),
+                size: 0,
+                modified_unix: 0,
+                modified: String::new(),
+                is_hidden: false,
+                kind: FileKind::Document,
+            })
+            .collect();
+        pane.select(1, false, false);
+
+        pane.select_all();
+
+        assert_eq!(pane.selected_indices, BTreeSet::from([0, 1, 2]));
+        assert_eq!(pane.selected_index, Some(2));
     }
 
     #[test]
