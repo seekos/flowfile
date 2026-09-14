@@ -30,6 +30,8 @@ use std::{
 
 const DETAILS_ICON_WIDTH: f32 = 42.0;
 const GRID_CARD_TARGET_WIDTH: f32 = 112.0;
+const GRID_RENAME_MIN_WIDTH: f32 = 160.0;
+const GRID_RENAME_MAX_WIDTH: f32 = 320.0;
 const FILE_DRAG_THRESHOLD: f64 = 4.0;
 const FOLDER_DROP_HOVER_DELAY: Duration = Duration::from_millis(450);
 
@@ -115,6 +117,7 @@ struct RenamePrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    horizontal_offset: Pixels,
 }
 
 impl IntoElement for RenameTextElement {
@@ -204,40 +207,36 @@ impl Element for RenameTextElement {
             .text_system()
             .shape_line(content, font_size, &runs, None);
         let cursor_x = line.x_for_index(cursor);
-        let (selection, cursor) = if selected_range.is_empty() {
-            (
-                None,
-                Some(fill(
-                    Bounds::new(
-                        point(bounds.left() + cursor_x, bounds.top()),
-                        size(px(1.0), bounds.size.height),
+        let horizontal_offset = rename_horizontal_offset(cursor_x, bounds.size.width);
+        let text_left = bounds.left() - horizontal_offset;
+        let selection = (!selected_range.is_empty()).then(|| {
+            fill(
+                Bounds::from_corners(
+                    point(
+                        text_left + line.x_for_index(selected_range.start),
+                        bounds.top(),
                     ),
-                    theme::accent(),
-                )),
-            )
-        } else {
-            (
-                Some(fill(
-                    Bounds::from_corners(
-                        point(
-                            bounds.left() + line.x_for_index(selected_range.start),
-                            bounds.top(),
-                        ),
-                        point(
-                            bounds.left() + line.x_for_index(selected_range.end),
-                            bounds.bottom(),
-                        ),
+                    point(
+                        text_left + line.x_for_index(selected_range.end),
+                        bounds.bottom(),
                     ),
-                    theme::accent_soft(),
-                )),
-                None,
+                ),
+                theme::accent_soft(),
             )
-        };
+        });
+        let cursor = Some(fill(
+            Bounds::new(
+                point(text_left + cursor_x, bounds.top()),
+                size(px(2.0), bounds.size.height),
+            ),
+            theme::accent(),
+        ));
 
         RenamePrepaintState {
             line: Some(line),
             cursor,
             selection,
+            horizontal_offset,
         }
     }
 
@@ -261,7 +260,11 @@ impl Element for RenameTextElement {
             window.paint_quad(selection);
         }
         let line = prepaint.line.take().expect("rename line was shaped");
-        line.paint(bounds.origin, window.line_height(), window, cx)
+        let text_origin = point(
+            bounds.origin.x - prepaint.horizontal_offset,
+            bounds.origin.y,
+        );
+        line.paint(text_origin, window.line_height(), window, cx)
             .expect("rename line should paint");
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
@@ -271,6 +274,7 @@ impl Element for RenameTextElement {
         self.input.update(cx, |input, _| {
             input.rename_layout = Some(line);
             input.rename_bounds = Some(bounds);
+            input.rename_horizontal_offset = prepaint.horizontal_offset;
         });
     }
 }
@@ -301,6 +305,7 @@ pub struct MainListView {
     rename_marked_range: Option<Range<usize>>,
     rename_layout: Option<ShapedLine>,
     rename_bounds: Option<Bounds<Pixels>>,
+    rename_horizontal_offset: Pixels,
     rename_is_selecting: bool,
     rename_blur_subscription: Option<Subscription>,
     last_rename_index: Option<usize>,
@@ -344,6 +349,7 @@ impl MainListView {
             rename_marked_range: None,
             rename_layout: None,
             rename_bounds: None,
+            rename_horizontal_offset: px(0.0),
             rename_is_selecting: false,
             rename_blur_subscription: None,
             last_rename_index: None,
@@ -1046,6 +1052,7 @@ impl MainListView {
         let mouse_move_input = input_entity.clone();
         let mouse_up_input = input_entity.clone();
         let mouse_up_out_input = input_entity.clone();
+        let mouse_down_out_input = input_entity.clone();
 
         div()
             .id(("rename-editor", self.pane_index))
@@ -1097,6 +1104,14 @@ impl MainListView {
                     cx.stop_propagation();
                 },
             )
+            .on_mouse_down_out(move |_, _, cx| {
+                mouse_down_out_input.update(cx, |input, cx| {
+                    input.rename_is_selecting = false;
+                    if input.pane.read(cx).rename_index.is_some() {
+                        input.pane.update(cx, |pane, cx| pane.commit_rename(cx));
+                    }
+                });
+            })
             .on_click(|_, _, cx| cx.stop_propagation())
             .child(RenameTextElement {
                 input: input_entity,
@@ -1356,6 +1371,8 @@ impl MainListView {
         let pane_index = self.pane_index;
         let drag_input = input_entity.clone();
         let file_name = item.name.clone();
+        let grid_column = index % self.grid_columns;
+        let grid_rename_width = grid_rename_editor_width(&rename_buffer);
         let name_element = if is_dragging {
             div().into_any_element()
         } else if renaming {
@@ -1367,7 +1384,14 @@ impl MainListView {
                     .right_0()
                     .flex()
                     .justify_center()
-                    .child(self.rename_editor(&rename_buffer, 104.0, input_entity)),
+                    .when(self.grid_columns > 1 && grid_column == 0, |editor| {
+                        editor.justify_start()
+                    })
+                    .when(
+                        self.grid_columns > 1 && grid_column + 1 == self.grid_columns,
+                        |editor| editor.justify_end(),
+                    )
+                    .child(self.rename_editor(&rename_buffer, grid_rename_width, input_entity)),
             )
             .with_priority(30)
             .into_any_element()
@@ -1703,7 +1727,7 @@ impl MainListView {
         if position.x >= bounds.right() {
             return line.text.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + self.rename_horizontal_offset)
     }
 
     fn on_rename_mouse_down(
@@ -1993,11 +2017,12 @@ impl EntityInputHandler for MainListView {
         let range = self.rename_range_from_utf16(&range_utf16, cx);
         Some(Bounds::from_corners(
             point(
-                element_bounds.left() + line.x_for_index(range.start),
+                element_bounds.left() - self.rename_horizontal_offset
+                    + line.x_for_index(range.start),
                 element_bounds.top(),
             ),
             point(
-                element_bounds.left() + line.x_for_index(range.end),
+                element_bounds.left() - self.rename_horizontal_offset + line.x_for_index(range.end),
                 element_bounds.bottom(),
             ),
         ))
@@ -2043,6 +2068,7 @@ impl Render for MainListView {
             self.rename_marked_range = None;
             self.rename_layout = None;
             self.rename_bounds = None;
+            self.rename_horizontal_offset = px(0.0);
             self.rename_is_selecting = false;
             if let Some(index) = rename_index {
                 self.rename_selected_range = items
@@ -2371,6 +2397,19 @@ fn grid_columns_for_width(width: Pixels) -> usize {
     (f32::from(width) / GRID_CARD_TARGET_WIDTH).floor().max(1.0) as usize
 }
 
+fn grid_rename_editor_width(value: &str) -> f32 {
+    let estimated_text_width = value
+        .chars()
+        .map(|character| if character.is_ascii() { 7.0 } else { 12.0 })
+        .sum::<f32>();
+    (estimated_text_width + 20.0).clamp(GRID_RENAME_MIN_WIDTH, GRID_RENAME_MAX_WIDTH)
+}
+
+fn rename_horizontal_offset(cursor_x: Pixels, viewport_width: Pixels) -> Pixels {
+    let visible_right = (viewport_width - px(2.0)).max(px(0.0));
+    (cursor_x - visible_right).max(px(0.0))
+}
+
 fn file_drag_threshold_reached(start: Point<Pixels>, current: Point<Pixels>) -> bool {
     (current - start).magnitude() > FILE_DRAG_THRESHOLD
 }
@@ -2414,9 +2453,10 @@ fn initial_rename_selection(item: &FileItem) -> Range<usize> {
 #[cfg(test)]
 mod grid_name_tests {
     use super::{
-        DetailColumn, DetailColumnWidths, MainListView, can_transfer_to_folder,
-        file_drag_threshold_reached, grid_columns_for_width, initial_rename_selection,
-        is_vertical_scroll, marquee_bounds,
+        DetailColumn, DetailColumnWidths, GRID_RENAME_MAX_WIDTH, GRID_RENAME_MIN_WIDTH,
+        MainListView, can_transfer_to_folder, file_drag_threshold_reached, grid_columns_for_width,
+        grid_rename_editor_width, initial_rename_selection, is_vertical_scroll, marquee_bounds,
+        rename_horizontal_offset,
     };
     use crate::models::{FileItem, FileKind};
     use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
@@ -2504,6 +2544,22 @@ mod grid_name_tests {
         assert_eq!(grid_columns_for_width(px(80.0)), 1);
         assert_eq!(grid_columns_for_width(px(450.0)), 4);
         assert_eq!(grid_columns_for_width(px(900.0)), 8);
+    }
+
+    #[test]
+    fn grid_rename_editor_expands_for_long_names_with_a_safe_cap() {
+        assert_eq!(grid_rename_editor_width("short.txt"), GRID_RENAME_MIN_WIDTH);
+        assert!(grid_rename_editor_width("一份比较长的中文文件名称.txt") > GRID_RENAME_MIN_WIDTH);
+        assert_eq!(
+            grid_rename_editor_width(&"a".repeat(100)),
+            GRID_RENAME_MAX_WIDTH
+        );
+    }
+
+    #[test]
+    fn rename_text_scroll_keeps_the_caret_inside_the_editor() {
+        assert_eq!(rename_horizontal_offset(px(80.0), px(160.0)), px(0.0));
+        assert_eq!(rename_horizontal_offset(px(220.0), px(160.0)), px(62.0));
     }
 
     #[test]
