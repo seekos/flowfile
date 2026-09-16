@@ -45,6 +45,7 @@ enum MenuCommand {
     Cut,
     Copy,
     Paste,
+    PasteMove,
     CopyToOther,
     MoveToOther,
     Rename,
@@ -227,6 +228,11 @@ impl ContextMenuView {
             MenuCommand::Paste => {
                 self.operations
                     .update(cx, |operations, cx| operations.paste_into_active(cx));
+            }
+            MenuCommand::PasteMove => {
+                self.operations.update(cx, |operations, cx| {
+                    operations.move_clipboard_into_active(cx)
+                });
             }
             MenuCommand::CopyToOther => {
                 self.operations.update(cx, |operations, cx| {
@@ -890,6 +896,15 @@ impl ContextMenuView {
                 "⌘V",
                 can_paste && file_operations_enabled,
                 MenuCommand::Paste,
+                cx,
+            ),
+            Self::item(
+                "context-background-paste-move",
+                "🚚",
+                "移动到此处",
+                "⌥⌘V",
+                can_paste && file_operations_enabled,
+                MenuCommand::PasteMove,
                 cx,
             ),
             Self::separator(),

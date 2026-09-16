@@ -1,6 +1,9 @@
 use super::{Model, MultiPaneModel};
-use crate::services::{ConflictPolicy, FileOperationEngine, TransferMode, TransferProgress};
-use gpui::{ClipboardItem, Context};
+use crate::services::{
+    ConflictPolicy, FileOperationEngine, TransferMode, TransferProgress, clear_file_clipboard,
+    file_clipboard_change_count, read_file_clipboard, write_file_clipboard,
+};
+use gpui::Context;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -17,6 +20,18 @@ struct ClipboardPayload {
     signature: String,
     mode: ClipboardMode,
     paths: Vec<PathBuf>,
+}
+
+fn native_clipboard_mode(
+    native_paths: &[PathBuf],
+    internal: Option<&ClipboardPayload>,
+    internal_change_count: Option<isize>,
+    current_change_count: Option<isize>,
+) -> ClipboardMode {
+    internal
+        .filter(|clipboard| clipboard.paths == native_paths)
+        .filter(|_| internal_change_count == current_change_count)
+        .map_or(ClipboardMode::Copy, |clipboard| clipboard.mode)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +69,7 @@ pub struct FileOperationController {
     model: Model<MultiPaneModel>,
     engine: FileOperationEngine,
     clipboard: Option<ClipboardPayload>,
+    clipboard_change_count: Option<isize>,
     pub transfer: Option<TransferActivity>,
     pub notice: Option<String>,
     pub notice_is_error: bool,
@@ -66,6 +82,7 @@ impl FileOperationController {
             model,
             engine,
             clipboard: None,
+            clipboard_change_count: None,
             transfer: None,
             notice: None,
             notice_is_error: false,
@@ -74,6 +91,9 @@ impl FileOperationController {
     }
 
     pub fn is_cut_path(&self, path: &Path) -> bool {
+        if self.clipboard_change_count != file_clipboard_change_count() {
+            return false;
+        }
         self.clipboard
             .as_ref()
             .filter(|clipboard| clipboard.mode == ClipboardMode::Cut)
@@ -100,18 +120,16 @@ impl FileOperationController {
             mode,
             paths,
         };
-        let text = payload
-            .paths
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
-            text,
-            payload.clone(),
-        ));
+        let change_count = match write_file_clipboard(&payload.paths) {
+            Ok(change_count) => change_count,
+            Err(error) => {
+                self.set_notice(error.to_string(), true, cx);
+                return;
+            }
+        };
         let count = payload.paths.len();
         self.clipboard = Some(payload);
+        self.clipboard_change_count = Some(change_count);
         self.set_notice(
             match mode {
                 ClipboardMode::Copy => format!("已复制 {count} 个项目"),
@@ -123,6 +141,18 @@ impl FileOperationController {
     }
 
     pub fn paste_into_active(&mut self, cx: &mut Context<Self>) {
+        self.paste_into_active_with_mode(None, cx);
+    }
+
+    pub fn move_clipboard_into_active(&mut self, cx: &mut Context<Self>) {
+        self.paste_into_active_with_mode(Some(TransferMode::Move), cx);
+    }
+
+    fn paste_into_active_with_mode(
+        &mut self,
+        forced_mode: Option<TransferMode>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.active_accepts_file_operations(cx) {
             self.set_notice("请先打开一个 SMB 共享文件夹再粘贴", true, cx);
             return;
@@ -132,10 +162,10 @@ impl FileOperationController {
             return;
         };
         let destination = self.active_path(cx);
-        let mode = match payload.mode {
+        let mode = forced_mode.unwrap_or(match payload.mode {
             ClipboardMode::Copy => TransferMode::Copy,
             ClipboardMode::Cut => TransferMode::Move,
-        };
+        });
         self.start_transfer(payload.paths, destination, mode, cx);
     }
 
@@ -302,6 +332,21 @@ impl FileOperationController {
     }
 
     fn read_clipboard(&self, cx: &gpui::App) -> Option<ClipboardPayload> {
+        let native_paths = read_file_clipboard();
+        if !native_paths.is_empty() {
+            let mode = native_clipboard_mode(
+                &native_paths,
+                self.clipboard.as_ref(),
+                self.clipboard_change_count,
+                file_clipboard_change_count(),
+            );
+            return Some(ClipboardPayload {
+                signature: CLIPBOARD_SIGNATURE.to_string(),
+                mode,
+                paths: native_paths,
+            });
+        }
+
         let item = cx.read_from_clipboard()?;
         if let Some(metadata) = item.metadata()
             && let Ok(payload) = serde_json::from_str::<ClipboardPayload>(metadata)
@@ -407,9 +452,13 @@ impl FileOperationController {
                             && controller.clipboard.as_ref().is_some_and(|clipboard| {
                                 clipboard.mode == ClipboardMode::Cut && clipboard.paths == sources
                             })
+                            && controller.clipboard_change_count == file_clipboard_change_count()
                         {
+                            if let Some(change_count) = controller.clipboard_change_count {
+                                clear_file_clipboard(change_count);
+                            }
                             controller.clipboard = None;
-                            cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+                            controller.clipboard_change_count = None;
                         }
                         controller.set_notice(
                             format!("已完成 {} 个项目", destinations.len()),
@@ -450,5 +499,52 @@ impl FileOperationController {
         self.notice = Some(notice.into());
         self.notice_is_error = is_error;
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CLIPBOARD_SIGNATURE, ClipboardMode, ClipboardPayload, native_clipboard_mode};
+    use std::path::PathBuf;
+
+    fn payload(mode: ClipboardMode, paths: &[&str]) -> ClipboardPayload {
+        ClipboardPayload {
+            signature: CLIPBOARD_SIGNATURE.to_string(),
+            mode,
+            paths: paths.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    #[test]
+    fn native_clipboard_keeps_internal_cut_when_pasteboard_is_unchanged() {
+        let clipboard = payload(ClipboardMode::Cut, &["/tmp/a", "/tmp/b"]);
+        let paths = vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")];
+
+        assert_eq!(
+            native_clipboard_mode(&paths, Some(&clipboard), Some(12), Some(12)),
+            ClipboardMode::Cut
+        );
+    }
+
+    #[test]
+    fn externally_replaced_clipboard_defaults_to_copy() {
+        let clipboard = payload(ClipboardMode::Cut, &["/tmp/a"]);
+        let paths = vec![PathBuf::from("/tmp/a")];
+
+        assert_eq!(
+            native_clipboard_mode(&paths, Some(&clipboard), Some(12), Some(13)),
+            ClipboardMode::Copy
+        );
+    }
+
+    #[test]
+    fn finder_paths_do_not_inherit_unrelated_internal_cut() {
+        let clipboard = payload(ClipboardMode::Cut, &["/tmp/a"]);
+        let paths = vec![PathBuf::from("/tmp/b")];
+
+        assert_eq!(
+            native_clipboard_mode(&paths, Some(&clipboard), Some(12), Some(12)),
+            ClipboardMode::Copy
+        );
     }
 }

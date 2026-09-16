@@ -16,8 +16,8 @@ use crate::{
     actions::{
         CloseContextMenu, CloseQuickLook, CopyFiles, CutFiles, Duplicate, FindFiles, GetInfo,
         LayoutDualHorizontal, LayoutDualVertical, LayoutQuad, LayoutSingle, MoveToTrash, NewFolder,
-        NewTextFile, NextPane, OpenPreferences, OpenTerminal, PasteFiles, PermanentDelete,
-        PreviousPane, Refresh, ToggleQuickLook, ViewDetails, ViewGrid,
+        NewTextFile, NextPane, OpenPreferences, OpenTerminal, PasteFiles, PasteMoveFiles,
+        PermanentDelete, PreviousPane, Refresh, ToggleQuickLook, ViewDetails, ViewGrid,
     },
     models::{
         AppPreferences, CreateItemKind, Favorites, FileKind, FileOperationController, LayoutMode,
@@ -808,6 +808,18 @@ impl WorkspaceView {
         }
         self.operations
             .update(cx, |operations, cx| operations.paste_into_active(cx));
+    }
+
+    fn on_paste_move(&mut self, _: &PasteMoveFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_input_value().is_some()
+            || self.active_pane(cx).read(cx).rename_index.is_some()
+        {
+            cx.propagate();
+            return;
+        }
+        self.operations.update(cx, |operations, cx| {
+            operations.move_clipboard_into_active(cx)
+        });
     }
 
     fn on_move_to_trash(&mut self, _: &MoveToTrash, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2688,6 +2700,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_cut))
             .on_action(cx.listener(Self::on_paste))
+            .on_action(cx.listener(Self::on_paste_move))
             .on_action(cx.listener(Self::on_move_to_trash))
             .on_action(cx.listener(Self::on_permanent_delete))
             .on_action(cx.listener(Self::on_new_folder))

@@ -9,7 +9,6 @@ resources_dir=${project_dir}/resources
 dist_dir=${project_dir}/dist
 icon_source=${resources_dir}/FlowFile.svg
 icon_output=${resources_dir}/FlowFile.icns
-sdk_path=$(xcrun --sdk macosx --show-sdk-path)
 icon_only=false
 version_override=""
 
@@ -44,19 +43,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-case "$(uname -m)" in
-    arm64)
-        export BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin="--target=arm64-apple-macos11 -isysroot ${sdk_path}"
-        ;;
-    x86_64)
-        export BINDGEN_EXTRA_CLANG_ARGS_x86_64_apple_darwin="--target=x86_64-apple-macos11 -isysroot ${sdk_path}"
-        ;;
-    *)
-        print -u2 "FlowFile packaging supports arm64 and x86_64 macOS hosts."
-        exit 1
-        ;;
-esac
 
 build_icon() {
     local work_dir
@@ -142,6 +128,9 @@ if [[ "${icon_only}" == true ]]; then
     exit 0
 fi
 
+source "${script_dir}/macos_toolchain.sh"
+flowfile_configure_macos_toolchain
+
 print "Packaging FlowFile v${version}"
 
 built_app_path=${project_dir}/target/release/bundle/osx/FlowFile.app
@@ -185,6 +174,11 @@ dmg_path=${dist_dir}/FlowFile-${version}.dmg
 /bin/rm -R "${dmg_stage}"
 
 if [[ -n "${FLOWFILE_NOTARY_PROFILE:-}" ]]; then
+    if ! xcrun --find notarytool >/dev/null 2>&1; then
+        print -u2 "Notarization requires a usable full Xcode installation."
+        print -u2 "Accept its license or set FLOWFILE_DEVELOPER_DIR to that Xcode developer directory."
+        exit 1
+    fi
     xcrun notarytool submit "${dmg_path}" \
         --keychain-profile "${FLOWFILE_NOTARY_PROFILE}" --wait
     xcrun stapler staple "${dmg_path}"

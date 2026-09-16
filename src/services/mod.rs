@@ -1,5 +1,6 @@
 #[cfg(target_os = "macos")]
 mod external_drag;
+mod file_clipboard;
 pub mod file_engine;
 mod file_inspector;
 mod file_operations;
@@ -14,6 +15,10 @@ mod volume;
 
 #[cfg(target_os = "macos")]
 pub use external_drag::{begin_external_file_drag, end_external_file_drag};
+pub use file_clipboard::{
+    change_count as file_clipboard_change_count, clear_if_unchanged as clear_file_clipboard,
+    read_file_paths as read_file_clipboard, write_file_paths as write_file_clipboard,
+};
 pub use file_engine::{DirectorySnapshot, FileEngine, OpenWithApplication};
 pub use file_inspector::FileInspector;
 pub use file_operations::{ConflictPolicy, FileOperationEngine, TransferMode, TransferProgress};

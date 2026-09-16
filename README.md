@@ -42,7 +42,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 
 ### 文件操作
 
-- 系统剪贴板复制、剪切和粘贴；剪切项目以半透明状态显示。
+- 与 macOS 访达共用原生文件剪贴板：双方复制的多文件/文件夹都可直接粘贴；`Option + Cmd + V` 按访达习惯移动到当前目录。FlowFile 内剪切项目以半透明状态显示。
 - 新建文件夹、新建空白文本文件、复制副本和原地重命名。
 - 移至 macOS 废纸篓，以及通过确认模态框执行永久删除。
 - 文件双击通常使用系统默认应用打开，`.app` 应用包会直接启动，带 Unix 执行位的普通文件会直接运行；安装 Notepad-- 后，已知文本文件优先由它打开；普通目录双击进入目录。
@@ -55,7 +55,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 ### macOS 风格右键菜单
 
 - 文件菜单：打开、打开方式、Quick Look、剪切、复制、跨面板传输、重命名、废纸篓和显示简介。
-- 空白区域菜单：新建文件夹、新建文本文件、粘贴和在系统终端中打开。
+- 空白区域菜单：新建文件夹、新建文本文件、粘贴、移动到此处和在系统终端中打开。
 - 右键未选中的项目会切换选择；右键已有多选成员会保留多选。
 - 菜单通过顶层浮层渲染，不受列表滚动或裁剪区域影响。
 - 点击外部、按 `Esc` 或执行菜单命令后自动关闭。
@@ -93,6 +93,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 | 快捷键 | 功能 |
 | --- | --- |
 | `Cmd + C` / `Cmd + X` / `Cmd + V` | 复制 / 剪切 / 粘贴 |
+| `Option + Cmd + V` | 将系统剪贴板中的访达/FlowFile 文件移动到当前目录 |
 | `Cmd + Delete` | 移至废纸篓 |
 | `Option + Cmd + Delete` | 永久删除（需要确认） |
 | `Cmd + N` | 新建文件夹 |
@@ -128,6 +129,8 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 ```
 
 脚本会根据当前 Mac 架构配置 GPUI 所需的 macOS SDK 参数，构建 Debug 二进制，将其装入固定路径 `target/debug/bundle/osx/FlowFile.app`，签名后启动。GPUI 启用了 `runtime_shaders`，只安装 Command Line Tools 时不需要构建期 `metal` 命令。
+
+如果 `xcode-select` 当前指向尚未接受许可的完整 Xcode，构建和运行脚本会自动回退到已安装的 `/Library/Developer/CommandLineTools`。需要指定其他工具链时可设置 `FLOWFILE_DEVELOPER_DIR`；使用公证功能仍需可用的完整 Xcode。
 
 检查代码：
 
@@ -220,6 +223,7 @@ src/
 ├── services/
 │   ├── file_engine.rs         # 异步目录读取、卷和 macOS 打开能力
 │   ├── file_operations.rs     # 创建、复制、移动、删除与进度
+│   ├── file_clipboard.rs      # 与访达互通的 macOS 原生文件剪贴板
 │   ├── file_watcher.rs        # notify 目录监听
 │   ├── thumbnail_engine.rs    # 二级缩略图缓存和后台 Worker
 │   ├── quick_look.rs          # 内置及 macOS Quick Look 预览

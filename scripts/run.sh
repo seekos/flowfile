@@ -4,20 +4,8 @@ set -euo pipefail
 
 script_dir=${0:A:h}
 project_dir=${script_dir:h}
-sdk_path=$(xcrun --sdk macosx --show-sdk-path)
-
-case "$(uname -m)" in
-    arm64)
-        export BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin="--target=arm64-apple-macos11 -isysroot ${sdk_path}"
-        ;;
-    x86_64)
-        export BINDGEN_EXTRA_CLANG_ARGS_x86_64_apple_darwin="--target=x86_64-apple-macos11 -isysroot ${sdk_path}"
-        ;;
-    *)
-        print -u2 "FlowFile currently supports arm64 and x86_64 macOS hosts."
-        exit 1
-        ;;
-esac
+source "${script_dir}/macos_toolchain.sh"
+flowfile_configure_macos_toolchain
 
 cd "${project_dir}"
 cargo build
