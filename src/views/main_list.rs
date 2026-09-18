@@ -1217,7 +1217,7 @@ impl MainListView {
                             event.drag(cx).paths(),
                             folder_drop_path.as_path(),
                         );
-                    let _ = folder_drop_move_input.update(cx, |input, cx| {
+                    folder_drop_move_input.update(cx, |input, cx| {
                         input.update_folder_drop_hover(folder_drop_path.clone(), hovered, cx);
                     });
                 })
@@ -1233,7 +1233,7 @@ impl MainListView {
                 })
                 .on_drop(move |payload: &ExternalPaths, _, cx| {
                     let paths = payload.paths().to_vec();
-                    let _ = folder_drop_finish_input.update(cx, |input, cx| {
+                    folder_drop_finish_input.update(cx, |input, cx| {
                         input.clear_folder_drop_hover(cx);
                     });
                     if !can_transfer_to_folder(&paths, &folder_drop_path_for_drop) {
@@ -1503,7 +1503,7 @@ impl MainListView {
                             event.drag(cx).paths(),
                             folder_drop_path.as_path(),
                         );
-                    let _ = folder_drop_move_input.update(cx, |input, cx| {
+                    folder_drop_move_input.update(cx, |input, cx| {
                         input.update_folder_drop_hover(folder_drop_path.clone(), hovered, cx);
                     });
                 })
@@ -1521,7 +1521,7 @@ impl MainListView {
                 })
                 .on_drop(move |payload: &ExternalPaths, _, cx| {
                     let paths = payload.paths().to_vec();
-                    let _ = folder_drop_finish_input.update(cx, |input, cx| {
+                    folder_drop_finish_input.update(cx, |input, cx| {
                         input.clear_folder_drop_hover(cx);
                     });
                     if !can_transfer_to_folder(&paths, &folder_drop_path_for_drop) {
@@ -2547,7 +2547,7 @@ mod grid_name_tests {
             &destination,
         ));
         assert!(!can_transfer_to_folder(
-            &[destination.clone()],
+            std::slice::from_ref(&destination),
             &destination,
         ));
         assert!(!can_transfer_to_folder(

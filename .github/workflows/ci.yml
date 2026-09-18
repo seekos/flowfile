@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Format, lint, test, and release checks
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build files
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-macos
+
+      - name: Install macOS system build dependencies
+        run: brew install cmake pkg-config
+
+      - name: Configure macOS SDK
+        shell: bash
+        run: |
+          sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+          echo "SDKROOT=$sdk_path" >> "$GITHUB_ENV"
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin=--target=arm64-apple-macos11 -isysroot $sdk_path" >> "$GITHUB_ENV"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Check Developer ID release
+        run: cargo check --release --locked
+
+      - name: Check App Store release
+        run: cargo check --release --features app-store --locked
+
+      - name: Check shell scripts
+        run: zsh -n scripts/*.sh

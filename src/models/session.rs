@@ -1,6 +1,6 @@
 use super::{
     ExplorerTab, LayoutMode, MultiPaneModel, Pane, SortMode, ViewMode, home_directory,
-    pane::NAVIGATION_HISTORY_LIMIT,
+    pane::NAVIGATION_HISTORY_LIMIT, persistence,
 };
 use crate::services::FileEngine;
 use anyhow::{Context as _, Result};
@@ -76,17 +76,7 @@ impl SessionState {
     }
 
     fn save_to(&self, path: PathBuf) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("无法创建会话目录 {}", parent.display()))?;
-        }
-
-        let bytes = serde_json::to_vec_pretty(self)?;
-        let temporary_path = path.with_extension(format!("json.tmp-{}", std::process::id()));
-        fs::write(&temporary_path, bytes)
-            .with_context(|| format!("无法写入临时会话文件 {}", temporary_path.display()))?;
-        fs::rename(&temporary_path, &path)
-            .with_context(|| format!("无法更新会话文件 {}", path.display()))
+        persistence::atomic_write_json(&path, self, "会话")
     }
 }
 

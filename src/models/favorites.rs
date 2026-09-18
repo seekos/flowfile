@@ -1,10 +1,7 @@
-use super::home_directory;
-use anyhow::{Context as _, Result};
+use super::{home_directory, persistence};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -14,10 +11,7 @@ pub struct Favorites {
 
 impl Favorites {
     pub fn load() -> Self {
-        fs::read(favorites_path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        persistence::load_json_or_default(favorites_path(), "收藏夹")
     }
 
     pub fn paths(&self) -> &[PathBuf] {
@@ -54,25 +48,18 @@ impl Favorites {
     }
 
     pub fn toggle(&mut self, path: PathBuf) -> Result<bool> {
-        let added = if let Some(index) = self.paths.iter().position(|favorite| favorite == &path) {
-            self.paths.remove(index);
-            false
+        if self.contains(&path) {
+            self.remove(&path)?;
+            Ok(false)
         } else {
-            self.paths.push(path);
-            true
-        };
-        self.save()?;
-        Ok(added)
+            self.ensure_present(path)?;
+            Ok(true)
+        }
     }
 
     fn save(&self) -> Result<()> {
         let path = favorites_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("无法创建收藏夹设置目录 {}", parent.display()))?;
-        }
-        let bytes = serde_json::to_vec_pretty(self)?;
-        fs::write(&path, bytes).with_context(|| format!("无法保存收藏夹 {}", path.display()))
+        persistence::atomic_write_json(&path, self, "收藏夹")
     }
 }
 

@@ -21,6 +21,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 - 使用 `tokio::fs` 异步读取真实目录和文件元数据。
 - 支持后退、前进、上级目录、刷新、面包屑跳转和可编辑路径栏。
 - 在地址栏输入 `smb://nas` 会直接在当前文件列表中显示服务器上的所有可访问共享文件夹，不弹出共享选择器；需要认证时使用应用内登录模态框，认证成功后继续显示共享列表。输入 `smb://nas/共享目录`、`//nas/共享目录` 或 `\\nas\共享目录` 则挂载并浏览指定共享。
+- SMB 地址不接受内嵌密码；登录密码只通过应用内模态框和临时认证终端传递，不会写入进程命令行、地址历史或会话文件。
 - SMB 共享按访达式网络卷处理：共享根目录的“上一级”返回 NAS 共享列表，侧边栏弹出按钮会断开当前共享并返回服务器根目录。
 - 路径输入与搜索输入支持 macOS 中文输入法组合文本。
 - 文件列表默认先按类型分组，同一类型内按名称排列；详细列表支持按名称、类型、大小和修改时间排序。
@@ -39,6 +40,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 - 网格选择仅强调图标和标题区域，不绘制大块卡片背景或标题边框。
 - 列表和网格都支持在空白处拖动框选；按住 `Cmd` 可叠加选择。
 - 使用虚拟列表仅渲染可见行，并只为当前视口中的项目请求缩略图。
+- VoiceOver 可读取面板、文件名、类型和选择状态，并可聚焦或激活文件；每个面板最多向辅助功能树暴露前 1000 项，超出时提示使用搜索缩小范围。
 
 ### 文件操作
 
@@ -50,6 +52,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 - 支持跨面板复制/移动，以及拖到其他面板或侧边栏目录。
 - 拖放默认移动，按住 `Option` 时复制。
 - 后台文件传输采用异步缓冲读写；同名项目默认生成 `name (1).ext` 一类可用名称。
+- 复制和跨卷移动先写入目标目录中的隐藏临时项目，文件内容、权限和扩展属性全部完成后才原子提交；失败会清理临时项目，不会留下可见半成品。复制、移动、删除、重命名和新建操作互斥执行，已有操作运行时会提示稍后重试。
 - 状态栏显示当前文件、进度、百分比和传输速度；进度采用最新字节快照，不会因高频事件积压而滞后。文件内容写完后仍需复制权限、扩展属性等元数据，因此运行中最高显示 99%，整个任务真正完成后才显示 100%。
 - 底部操作提示会区分成功与失败：复制、移动、创建、删除、收藏等成功提示显示 4 秒后自动消失，错误提示保留以便查看。
 
@@ -64,8 +67,8 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 ### 缩略图、Quick Look 与文件信息
 
 - 100 MB 内存 LRU 缓存保存已解码图像。
-- 磁盘缓存位于 `~/Library/Caches/FlowFile/thumbnails/`，缓存键包含文件路径和修改时间。
-- 仅为图片、音频、视频和三维模型生成缩略图；常见图片优先通过 `rayon` 工作线程和 `image` 解码为 256×256 PNG，其他可预览格式使用 macOS `qlmanage`。
+- 磁盘缓存位于 `~/Library/Caches/FlowFile/thumbnails/`，启动时按修改时间清理到 512 MB；缓存键包含文件路径、修改时间和文件大小。
+- 仅为图片、音频、视频和三维模型生成缩略图；常见图片最多使用 4 个 `rayon` 工作线程，并在受限解码内存中生成 256×256 PNG，其他可预览格式使用 macOS `qlmanage`。
 - 按 `Space` 打开或关闭预览，`Esc` 关闭预览。
 - 图片预览支持缩放和平移；文本/代码预览最多读取前 100 KB；PLY、STL、OBJ 等三维文件按模型处理，不会误用文本加载器。
 - PDF、视频、Office 文档等复杂格式交给 macOS 原生 Quick Look。
@@ -76,7 +79,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 - `Cmd + F` 激活当前面板搜索，输入后经过 150ms 防抖更新结果。
 - 支持当前目录和“整台 Mac”两种搜索范围，优先调用 Spotlight `mdfind`。
 - Spotlight 不可用时使用 `walkdir` 降级扫描；整机搜索降级时从用户主目录开始。
-- 搜索使用文件名模糊匹配并限制为最多 500 个结果，`Esc` 返回原目录。
+- 搜索使用文件名模糊匹配并限制为最多 500 个结果；新查询或 `Esc` 会立即取消旧的 Spotlight/目录扫描，候选集合在读取文件元数据前即限制为 500 项。
 - `Cmd + Backtick` 或 `Cmd + Shift + T` 在 macOS 系统 Terminal 中打开活动面板目录；FlowFile 不内嵌终端。
 - 点击顶部工具栏右侧的设置按钮或按 `Cmd + ,` 打开设置模态框，可查看当前应用版本和项目介绍、访问 GitHub 项目页面，并配置自动/浅色/深色主题、默认布局、隐藏文件以及搜索、终端、Quick Look 快捷键。
 - 启动后异步检查 GitHub Releases；发现新版本时显示可关闭的应用内横幅，可直接打开发布页面，关闭后不再重复提示同一版本。
@@ -85,6 +88,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 ### 会话与窗口生命周期
 
 - 自动保存布局、活动面板、最近活动面板、侧边栏状态，以及每个面板的路径历史、排序和视图模式。
+- 偏好设置、收藏夹、安全范围书签和会话均使用临时文件原子替换；损坏的设置文件会保留为带 `corrupt` 标记的备份后再使用默认值。
 - 不存在或已弹出的历史目录会在恢复时自动清理，并回退到有效目录。
 - 点击最后一个窗口的红色关闭按钮会完整退出进程。
 - `Cmd + Q` 全局退出；两种退出方式都会触发会话保存。
@@ -137,8 +141,10 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 
 ```bash
 cargo fmt --check
-cargo check
-cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo check --release
+cargo check --release --features app-store
 ```
 
 如果 GPUI 的 bindgen 在本机找不到 SDK，可以使用与脚本相同的配置：
@@ -207,6 +213,13 @@ FLOWFILE_NOTARY_PROFILE="notary-profile" ./scripts/build.sh
 
 `cargo-bundle` 可选；缺失时构建脚本会使用离线方式组装 `.app`。应用 Bundle ID 为 `cc.bso.flowfile`。
 
+推送 `v*` 标签时，GitHub Actions 会先执行格式、Clippy、测试和两种 Release 配置检查，然后构建 Universal 应用、Developer ID 签名、公证、装订并为真实 DMG 生成构建来源证明。仓库需要配置以下 Actions Secrets；缺少任一项时发布任务会停止，不会退回 ad-hoc 签名：
+
+- `BUILD_CERTIFICATE_BASE64`：包含 Developer ID Application 私钥的 `.p12` 文件的 Base64 内容。
+- `P12_PASSWORD`：上述 `.p12` 密码。
+- `KEYCHAIN_PASSWORD`：CI 临时钥匙串密码。
+- `APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`APPLE_TEAM_ID`：`notarytool` 公证凭据。
+
 ### Mac App Store 构建
 
 Mac App Store 版本启用 App Sandbox，并只访问应用容器和用户通过系统文件夹选择器明确授权的位置。为符合商店审核要求，该版本不提供系统终端启动、脚本或二进制文件直接执行、脚本化网络卷挂载、NTFS 重新挂载和独立更新检查；网络卷可先在访达中连接，再通过“＋ 授权文件夹”选择。
@@ -237,6 +250,7 @@ src/
 │   ├── multi_pane.rs          # 多面板布局和焦点
 │   ├── operations.rs          # 剪贴板、传输状态和文件命令
 │   ├── pane.rs                # 面板、历史、选择、搜索与目录监听
+│   ├── persistence.rs         # JSON 原子写入与损坏文件隔离
 │   ├── preferences.rs         # 持久化偏好设置
 │   └── session.rs             # 会话保存与恢复
 ├── services/

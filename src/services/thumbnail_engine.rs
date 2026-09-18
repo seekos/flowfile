@@ -1,7 +1,9 @@
 use crate::models::{FileItem, FileKind};
 use anyhow::{Context as _, Result, bail};
 use gpui::{Context, RenderImage};
-use image::{DynamicImage, GenericImage, ImageBuffer, Rgba, imageops::FilterType};
+use image::{
+    DynamicImage, GenericImage, ImageBuffer, ImageReader, Limits, Rgba, imageops::FilterType,
+};
 use lru::LruCache;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use smallvec::smallvec;
@@ -19,13 +21,22 @@ use std::{
 const THUMBNAIL_EDGE: u32 = 256;
 const MEMORY_CACHE_LIMIT: usize = 100 * 1024 * 1024;
 const MEMORY_ENTRY_LIMIT: usize = 4096;
+const DISK_CACHE_LIMIT: u64 = 512 * 1024 * 1024;
+const DECODE_ALLOCATION_LIMIT: u64 = 256 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 32_768;
+const MAX_THUMBNAIL_WORKERS: usize = 4;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ThumbnailKey(String);
 
 impl ThumbnailKey {
     pub fn for_item(item: &FileItem) -> Self {
-        let identity = format!("{}\0{}", item.path.to_string_lossy(), item.modified_unix);
+        let identity = format!(
+            "{}\0{}\0{}",
+            item.path.to_string_lossy(),
+            item.modified_unix,
+            item.size
+        );
         Self(format!("{:x}", md5::compute(identity.as_bytes())))
     }
 }
@@ -59,7 +70,13 @@ impl ThumbnailEngine {
         let cache_dir = thumbnail_cache_directory();
         fs::create_dir_all(&cache_dir)
             .with_context(|| format!("无法创建缩略图缓存 {}", cache_dir.display()))?;
+        prune_disk_cache(&cache_dir, DISK_CACHE_LIMIT);
+        let worker_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .clamp(1, MAX_THUMBNAIL_WORKERS);
         let pool = ThreadPoolBuilder::new()
+            .num_threads(worker_count)
             .thread_name(|index| format!("flowfile-thumbnail-{index}"))
             .build()
             .context("无法创建缩略图线程池")?;
@@ -229,8 +246,18 @@ fn generate_thumbnail(
 }
 
 fn render_raster(source: &Path, cache_path: &Path) -> Result<()> {
-    let source_image =
-        image::open(source).with_context(|| format!("无法解码图片 {}", source.display()))?;
+    let mut reader = ImageReader::open(source)
+        .with_context(|| format!("无法打开图片 {}", source.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("无法识别图片格式 {}", source.display()))?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(DECODE_ALLOCATION_LIMIT);
+    reader.limits(limits);
+    let source_image = reader
+        .decode()
+        .with_context(|| format!("无法解码图片 {}", source.display()))?;
     render_raster_from_image(source_image, cache_path)
 }
 
@@ -307,9 +334,44 @@ fn thumbnail_cache_directory() -> PathBuf {
         .join("thumbnails")
 }
 
+fn prune_disk_cache(cache_dir: &Path, limit: u64) {
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut cached_files = Vec::new();
+    let mut total_bytes = 0_u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() && entry.file_name().to_string_lossy().starts_with(".work-") {
+            let _ = fs::remove_dir_all(path);
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        cached_files.push((metadata.modified().ok(), metadata.len(), path));
+    }
+    if total_bytes <= limit {
+        return;
+    }
+    cached_files.sort_by_key(|(modified, _, _)| *modified);
+    for (_, bytes, path) in cached_files {
+        if total_bytes <= limit {
+            break;
+        }
+        if fs::remove_file(path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(bytes);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{THUMBNAIL_EDGE, ThumbnailEngine, ThumbnailKey, render_raster};
+    use super::{THUMBNAIL_EDGE, ThumbnailEngine, ThumbnailKey, prune_disk_cache, render_raster};
     use crate::models::{FileItem, FileKind};
     use image::{ImageBuffer, Rgba};
     use std::path::PathBuf;
@@ -334,6 +396,30 @@ mod tests {
             ThumbnailKey::for_item(&item(1)),
             ThumbnailKey::for_item(&item(2))
         );
+    }
+
+    #[test]
+    fn cache_key_changes_with_file_size() {
+        let first = item(1);
+        let mut second = first.clone();
+        second.size += 1;
+        assert_ne!(
+            ThumbnailKey::for_item(&first),
+            ThumbnailKey::for_item(&second)
+        );
+    }
+
+    #[test]
+    fn disk_cache_prunes_oldest_files_to_the_limit() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        std::fs::write(directory.path().join("first.png"), [1_u8; 8]).expect("first cache");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(directory.path().join("second.png"), [2_u8; 8]).expect("second cache");
+
+        prune_disk_cache(directory.path(), 8);
+
+        assert!(!directory.path().join("first.png").exists());
+        assert!(directory.path().join("second.png").exists());
     }
 
     #[test]

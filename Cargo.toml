@@ -19,7 +19,7 @@ chrono = "0.4.45"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 image = { version = "0.25.10", default-features = false, features = ["avif", "gif", "jpeg", "png", "rayon", "webp"] }
 kamadak-exif = "0.6"
-lru = "0.16"
+lru = "0.18.2"
 md5 = "0.8"
 notify = "8.2"
 open = "5.4"
@@ -30,6 +30,7 @@ smallvec = "1.15"
 tokio = { version = "1", features = ["full"] }
 trash = "5.2"
 walkdir = "2.5"
+zeroize = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accesskit = "0.24"
@@ -52,6 +53,7 @@ osx_minimum_system_version = "11.0"
 osx_info_plist_exts = ["resources/Info.plist.ext"]
 
 [dev-dependencies]
+grid = { path = "vendor/grid" }
 tempfile = "3"
 
 [patch.crates-io]
@@ -59,3 +61,6 @@ tempfile = "3"
 # Rust versions reject extern statics of that type, so use the API-compatible
 # local copy with an inhabited opaque FFI representation.
 block = { path = "vendor/block" }
+# GPUI 0.2.2 currently requires grid 0.18. This local source carries the
+# checked-arithmetic fix released upstream in grid 1.0.1 for GHSA-38c5-483c-4qqp.
+grid = { path = "vendor/grid" }

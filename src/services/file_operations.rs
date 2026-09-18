@@ -5,11 +5,12 @@ use async_channel::Sender;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
-    ffi::CString,
+    ffi::{CString, OsString},
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     ptr,
+    sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
 use tokio::{
@@ -19,6 +20,14 @@ use tokio::{
 };
 
 const COPY_BUFFER_SIZE: usize = 256 * 1024;
+static TRANSFER_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static FILE_MUTATION_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn begin_file_mutation() -> Result<tokio::sync::MutexGuard<'static, ()>> {
+    FILE_MUTATION_GATE
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("另一个文件操作正在进行，请完成后重试"))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TransferMode {
@@ -73,6 +82,7 @@ impl FileOperationEngine {
     ) -> Result<Vec<PathBuf>> {
         self.runtime
             .spawn(async move {
+                let _guard = begin_file_mutation()?;
                 execute_transfer(sources, destination, mode, conflict_policy, progress).await
             })
             .await
@@ -82,6 +92,7 @@ impl FileOperationEngine {
     pub async fn create_directory(&self, parent: PathBuf, name: String) -> Result<PathBuf> {
         self.runtime
             .spawn(async move {
+                let _guard = begin_file_mutation()?;
                 ensure_writable(&parent)?;
                 validate_file_name(&name)?;
                 let path = available_path(&parent.join(name)).await?;
@@ -97,6 +108,7 @@ impl FileOperationEngine {
     pub async fn create_text_file(&self, parent: PathBuf, name: String) -> Result<PathBuf> {
         self.runtime
             .spawn(async move {
+                let _guard = begin_file_mutation()?;
                 ensure_writable(&parent)?;
                 validate_file_name(&name)?;
                 let path = available_path(&parent.join(name)).await?;
@@ -111,18 +123,26 @@ impl FileOperationEngine {
 
     pub async fn rename(&self, source: PathBuf, new_name: String) -> Result<PathBuf> {
         self.runtime
-            .spawn(rename_path(source, new_name))
+            .spawn(async move {
+                let _guard = begin_file_mutation()?;
+                rename_path(source, new_name).await
+            })
             .await
             .context("重命名任务异常终止")?
     }
 
     pub async fn move_to_trash(&self, paths: Vec<PathBuf>) -> Result<()> {
         self.runtime
-            .spawn_blocking(move || {
-                for path in &paths {
-                    ensure_writable(path)?;
-                }
-                trash::delete_all(paths.iter()).context("无法将所选项目移到废纸篓")
+            .spawn(async move {
+                let _guard = begin_file_mutation()?;
+                tokio::task::spawn_blocking(move || {
+                    for path in &paths {
+                        ensure_writable(path)?;
+                    }
+                    trash::delete_all(paths.iter()).context("无法将所选项目移到废纸篓")
+                })
+                .await
+                .context("废纸篓后台任务异常终止")?
             })
             .await
             .context("废纸篓任务异常终止")?
@@ -131,6 +151,7 @@ impl FileOperationEngine {
     pub async fn delete_permanently(&self, paths: Vec<PathBuf>) -> Result<()> {
         self.runtime
             .spawn(async move {
+                let _guard = begin_file_mutation()?;
                 for path in paths {
                     ensure_writable(&path)?;
                     let metadata = fs::symlink_metadata(&path)
@@ -250,10 +271,21 @@ async fn execute_transfer(
     let mut plans = Vec::with_capacity(sources.len());
     let mut reserved_destinations = HashSet::new();
     for source in sources {
-        if source == destination || destination.starts_with(&source) {
-            bail!("不能将文件夹传输到自身内部：{}", source.display());
+        let source_metadata = fs::symlink_metadata(&source)
+            .await
+            .with_context(|| format!("无法读取 {}", source.display()))?;
+        if source_metadata.is_dir() {
+            let canonical_source = fs::canonicalize(&source)
+                .await
+                .with_context(|| format!("无法解析源文件夹 {}", source.display()))?;
+            if canonical_source == destination || destination.starts_with(&canonical_source) {
+                bail!("不能将文件夹传输到自身内部：{}", source.display());
+            }
         }
-        if mode == TransferMode::Move && source.parent() == Some(destination.as_path()) {
+        if mode == TransferMode::Move
+            && let Some(parent) = source.parent()
+            && fs::canonicalize(parent).await.ok().as_deref() == Some(destination.as_path())
+        {
             bail!("源文件已经位于目标文件夹中");
         }
         let plan = build_plan(
@@ -283,6 +315,7 @@ async fn execute_transfer(
             .to_string();
 
         if mode == TransferMode::Move
+            && conflict_policy == ConflictPolicy::AutoRename
             && fs::rename(&plan.source_root, &plan.destination_root)
                 .await
                 .is_ok()
@@ -293,15 +326,43 @@ async fn execute_transfer(
             continue;
         }
 
-        copy_plan(&plan, &progress, total_bytes, &mut bytes_done, started).await?;
+        let staging_root = unique_transfer_path(&plan.destination_root).await?;
+        if let Err(error) = copy_plan(
+            &plan,
+            &staging_root,
+            &progress,
+            total_bytes,
+            &mut bytes_done,
+            started,
+        )
+        .await
+        {
+            let _ = remove_existing(&staging_root).await;
+            return Err(error).with_context(|| {
+                format!(
+                    "传输 {} 时失败，未保留不完整目标",
+                    plan.source_root.display()
+                )
+            });
+        }
+        if let Err(error) = commit_staged_transfer(
+            &staging_root,
+            &plan.destination_root,
+            conflict_policy == ConflictPolicy::Overwrite,
+        )
+        .await
+        {
+            let _ = remove_existing(&staging_root).await;
+            return Err(error);
+        }
 
         if mode == TransferMode::Move {
-            let metadata = fs::symlink_metadata(&plan.source_root).await?;
-            if metadata.is_dir() {
-                fs::remove_dir_all(&plan.source_root).await?;
-            } else {
-                fs::remove_file(&plan.source_root).await?;
-            }
+            remove_existing(&plan.source_root).await.with_context(|| {
+                format!(
+                    "目标已完整写入，但无法删除源项目 {}",
+                    plan.source_root.display()
+                )
+            })?;
         }
         destinations.push(plan.destination_root);
     }
@@ -327,10 +388,7 @@ async fn build_plan(
         ConflictPolicy::AutoRename => {
             available_path_with_reserved(&desired_destination, reserved_destinations).await?
         }
-        ConflictPolicy::Overwrite => {
-            remove_existing(&desired_destination).await?;
-            desired_destination
-        }
+        ConflictPolicy::Overwrite => desired_destination,
     };
 
     let mut entries = Vec::new();
@@ -384,6 +442,7 @@ async fn build_plan(
 
 async fn copy_plan(
     plan: &TransferPlan,
+    destination_root: &Path,
     progress: &Sender<TransferProgress>,
     total_bytes: u64,
     bytes_done: &mut u64,
@@ -391,9 +450,9 @@ async fn copy_plan(
 ) -> Result<()> {
     for entry in &plan.entries {
         let destination = if entry.relative.as_os_str().is_empty() {
-            plan.destination_root.clone()
+            destination_root.to_path_buf()
         } else {
-            plan.destination_root.join(&entry.relative)
+            destination_root.join(&entry.relative)
         };
         match entry.kind {
             PlanEntryKind::Directory => {
@@ -441,9 +500,9 @@ async fn copy_plan(
     directories.sort_by_key(|entry| std::cmp::Reverse(entry.relative.components().count()));
     for entry in directories {
         let destination = if entry.relative.as_os_str().is_empty() {
-            plan.destination_root.clone()
+            destination_root.to_path_buf()
         } else {
-            plan.destination_root.join(&entry.relative)
+            destination_root.join(&entry.relative)
         };
         copy_metadata(entry.source.clone(), destination, false).await?;
     }
@@ -478,6 +537,57 @@ async fn copy_file_streamed(
         send_progress(progress, current_file, *bytes_done, total_bytes, started);
     }
     output.flush().await?;
+    output.sync_all().await?;
+    Ok(())
+}
+
+async fn unique_transfer_path(destination: &Path) -> Result<PathBuf> {
+    let parent = destination.parent().context("目标路径没有父目录")?;
+    let file_name = destination.file_name().unwrap_or_default();
+    loop {
+        let sequence = TRANSFER_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = OsString::from(".flowfile-transfer-");
+        temporary_name.push(format!("{}-{sequence}-", std::process::id()));
+        temporary_name.push(file_name);
+        let candidate = parent.join(temporary_name);
+        if !fs::try_exists(&candidate).await? {
+            return Ok(candidate);
+        }
+    }
+}
+
+async fn commit_staged_transfer(staging: &Path, destination: &Path, overwrite: bool) -> Result<()> {
+    if !fs::try_exists(destination).await? {
+        return fs::rename(staging, destination)
+            .await
+            .with_context(|| format!("无法提交已完成的传输到 {}", destination.display()));
+    }
+    if !overwrite {
+        bail!("目标名称在传输期间已被占用：{}", destination.display());
+    }
+
+    let backup = unique_transfer_path(destination).await?;
+    fs::rename(destination, &backup)
+        .await
+        .with_context(|| format!("无法暂存原目标 {}", destination.display()))?;
+    if let Err(error) = fs::rename(staging, destination).await {
+        let restore_result = fs::rename(&backup, destination).await;
+        return match restore_result {
+            Ok(()) => Err(error)
+                .with_context(|| format!("无法替换目标 {}，原目标已恢复", destination.display())),
+            Err(restore_error) => Err(anyhow::anyhow!(
+                "无法替换目标 {}，恢复原目标也失败：{error}；{restore_error}；原目标暂存在 {}",
+                destination.display(),
+                backup.display()
+            )),
+        };
+    }
+    if let Err(error) = remove_existing(&backup).await {
+        eprintln!(
+            "FlowFile: 已提交传输，但无法删除原目标备份 {}：{error}",
+            backup.display()
+        );
+    }
     Ok(())
 }
 
@@ -587,8 +697,12 @@ async fn available_path_with_reserved(
 }
 
 async fn remove_existing(path: &Path) -> Result<()> {
-    let Ok(metadata) = fs::symlink_metadata(path).await else {
-        return Ok(());
+    let metadata = match fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("无法读取待删除项目 {}", path.display()));
+        }
     };
     if metadata.is_dir() {
         fs::remove_dir_all(path).await?;
@@ -749,6 +863,61 @@ mod tests {
 
         assert_ne!(destinations[0], destinations[1]);
         assert!(destinations.iter().all(|path| path.exists()));
+    }
+
+    #[tokio::test]
+    async fn overwrite_commits_complete_contents_without_leaving_staging_files() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let destination_directory = tempfile::tempdir().expect("destination directory");
+        let source = source_directory.path().join("notes.txt");
+        let destination = destination_directory.path().join("notes.txt");
+        fs::write(&source, b"new complete contents").expect("write source");
+        fs::write(&destination, b"old contents").expect("write destination");
+        let (progress, _receiver) = async_channel::bounded(8);
+
+        execute_transfer(
+            vec![source],
+            destination_directory.path().to_path_buf(),
+            TransferMode::Copy,
+            ConflictPolicy::Overwrite,
+            progress,
+        )
+        .await
+        .expect("overwrite destination");
+
+        assert_eq!(fs::read(destination).unwrap(), b"new complete contents");
+        assert!(
+            fs::read_dir(destination_directory.path())
+                .expect("read destination")
+                .all(|entry| !entry
+                    .expect("destination entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".flowfile-transfer-"))
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_paths_prevent_copying_a_folder_into_itself() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("project");
+        let destination = source.join("nested");
+        fs::create_dir_all(&destination).expect("create nested destination");
+        fs::write(source.join("README.md"), b"hello").expect("write source file");
+        let aliased_source = source.join("..").join("project");
+        let (progress, _receiver) = async_channel::bounded(8);
+
+        let error = execute_transfer(
+            vec![aliased_source],
+            destination,
+            TransferMode::Copy,
+            ConflictPolicy::AutoRename,
+            progress,
+        )
+        .await
+        .expect_err("self-descendant copy must fail");
+
+        assert!(error.to_string().contains("自身内部"));
     }
 
     #[tokio::test]

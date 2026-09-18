@@ -7,11 +7,20 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   build:
     name: Build macOS Universal
     runs-on: macos-latest
+    env:
+      BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
     steps:
       - name: Check out source
@@ -41,6 +50,44 @@ jobs:
         shell: bash
         run: brew install cmake pkg-config
 
+      - name: Run release quality gates
+        shell: bash
+        run: |
+          sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+          export SDKROOT="$sdk_path"
+          export BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin="--target=arm64-apple-macos11 -isysroot $sdk_path"
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --all-targets --all-features --locked
+
+      - name: Import Developer ID certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in BUILD_CERTIFICATE_BASE64 P12_PASSWORD KEYCHAIN_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "Required release secret is missing: $variable" >&2
+              exit 1
+            fi
+          done
+          certificate_path="$RUNNER_TEMP/flowfile-certificate.p12"
+          keychain_path="$RUNNER_TEMP/flowfile-signing.keychain-db"
+          printf '%s' "$BUILD_CERTIFICATE_BASE64" | openssl base64 -d -A > "$certificate_path"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security list-keychain -d user -s "$keychain_path"
+          identity="$(security find-identity -v -p codesigning "$keychain_path" | \
+            sed -nE 's/.*"(Developer ID Application:[^"]+)".*/\1/p' | head -n 1)"
+          if [[ -z "$identity" ]]; then
+            echo "Imported certificate does not include a Developer ID Application identity." >&2
+            exit 1
+          fi
+          echo "CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
       - name: Build arm64 and x86_64 release binaries
         shell: bash
         run: |
@@ -54,10 +101,6 @@ jobs:
 
       - name: Package signed macOS Universal DMG
         shell: bash
-        env:
-          # Ad-hoc signing placeholder. Replace "-" with an imported Developer ID
-          # identity when certificate-based signing and notarization are configured.
-          CODESIGN_IDENTITY: "-"
         run: |
           set -euo pipefail
           app_path="dist/FlowFile.app"
@@ -71,6 +114,7 @@ jobs:
           chmod 755 "$contents_path/MacOS/flowfile"
           cp resources/Info.plist "$contents_path/Info.plist"
           cp resources/FlowFile.icns "$contents_path/Resources/FlowFile.icns"
+          cp resources/PrivacyInfo.xcprivacy "$contents_path/Resources/PrivacyInfo.xcprivacy"
           /usr/libexec/PlistBuddy -c \
             "Set :CFBundleShortVersionString $VERSION" "$contents_path/Info.plist"
           /usr/libexec/PlistBuddy -c \
@@ -90,6 +134,27 @@ jobs:
             -srcfolder "$dmg_stage" \
             -ov -format UDZO \
             "dist/FlowFile-$VERSION-macos-universal.dmg"
+          codesign --force --timestamp --sign "$CODESIGN_IDENTITY" \
+            "dist/FlowFile-$VERSION-macos-universal.dmg"
+
+      - name: Notarize and staple DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg_path="dist/FlowFile-$VERSION-macos-universal.dmg"
+          xcrun notarytool submit "$dmg_path" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$dmg_path"
+          xcrun stapler validate "$dmg_path"
+          codesign --verify --verbose=2 "$dmg_path"
+
+      - name: Attest release artifact provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.dmg
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4

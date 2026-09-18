@@ -3,6 +3,7 @@ mod file_item;
 mod multi_pane;
 mod operations;
 pub mod pane;
+pub(crate) mod persistence;
 mod preferences;
 mod session;
 

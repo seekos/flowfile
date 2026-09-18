@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 use tokio::runtime::{Handle, Runtime};
+use zeroize::Zeroize as _;
 
 #[derive(Clone, Debug)]
 pub struct DirectorySnapshot {
@@ -98,7 +99,7 @@ impl FileEngine {
         &self,
         address: String,
         username: String,
-        password: String,
+        mut password: String,
     ) -> Result<SmbNavigation> {
         if !distribution::allows_scripted_volume_mounts() {
             anyhow::bail!(
@@ -106,7 +107,11 @@ impl FileEngine {
             );
         }
         self.runtime
-            .spawn_blocking(move || smb::connect_with_credentials(&address, &username, &password))
+            .spawn_blocking(move || {
+                let result = smb::connect_with_credentials(&address, &username, &password);
+                password.zeroize();
+                result
+            })
             .await
             .context("SMB 认证任务异常终止")?
     }

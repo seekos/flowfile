@@ -11,7 +11,10 @@ use super::{
     tooltip::delayed_tooltip,
 };
 #[cfg(target_os = "macos")]
-use crate::accessibility::{AccessibilitySnapshot, ItemSnapshot, MacAccessibility, PaneSnapshot};
+use crate::accessibility::{
+    ACCESSIBLE_ITEM_LIMIT, AccessibilityAction, AccessibilitySnapshot, ItemSnapshot,
+    MacAccessibility, PaneSnapshot,
+};
 use crate::{
     actions::{
         CloseContextMenu, CloseQuickLook, CopyFiles, CutFiles, Duplicate, FindFiles, GetInfo,
@@ -472,6 +475,8 @@ impl WorkspaceView {
                 preferences: None,
             },
         );
+        #[cfg(target_os = "macos")]
+        let accessibility_actions = accessibility.action_receiver();
         focus_handle.focus(window);
 
         let mut workspace = Self {
@@ -525,7 +530,64 @@ impl WorkspaceView {
             workspace.check_for_updates(update_checker, dismissed_update_version, cx);
         }
 
+        #[cfg(target_os = "macos")]
+        workspace.listen_for_accessibility_actions(accessibility_actions, cx);
+
         workspace
+    }
+
+    #[cfg(target_os = "macos")]
+    fn listen_for_accessibility_actions(
+        &mut self,
+        actions: async_channel::Receiver<AccessibilityAction>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Ok(action) = actions.recv().await {
+                if this
+                    .update(cx, |workspace, cx| {
+                        workspace.handle_accessibility_action(action, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_accessibility_action(&mut self, action: AccessibilityAction, cx: &mut Context<Self>) {
+        let (pane_index, item_index, activate) = match action {
+            AccessibilityAction::FocusItem {
+                pane_index,
+                item_index,
+            } => (pane_index, item_index, false),
+            AccessibilityAction::ActivateItem {
+                pane_index,
+                item_index,
+            } => (pane_index, item_index, true),
+        };
+        let pane = self.model.update(cx, |model, _| {
+            if pane_index >= model.layout_mode.pane_count() || pane_index >= model.panes.len() {
+                return None;
+            }
+            model.set_active_pane(pane_index);
+            Some(model.panes[pane_index].clone())
+        });
+        let Some(pane) = pane else {
+            return;
+        };
+        pane.update(cx, |pane, cx| {
+            pane.select(item_index, false, false);
+            if activate {
+                pane.activate_selected(cx);
+            } else {
+                cx.notify();
+            }
+        });
+        cx.notify();
     }
 
     fn authorize_folder(&mut self, cx: &mut Context<Self>) {
@@ -714,9 +776,11 @@ impl WorkspaceView {
             .enumerate()
             .map(|(pane_index, pane)| {
                 let pane = pane.read(cx);
+                let total_count = pane.items.len();
                 let items = pane
                     .items
                     .iter()
+                    .take(ACCESSIBLE_ITEM_LIMIT)
                     .enumerate()
                     .map(|(item_index, item)| ItemSnapshot {
                         name: item.name.clone(),
@@ -731,6 +795,7 @@ impl WorkspaceView {
                         .search_active
                         .then(|| pane.search_query.trim().to_string())
                         .filter(|query| !query.is_empty()),
+                    total_count,
                     items,
                 }
             })

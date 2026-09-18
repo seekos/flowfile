@@ -159,17 +159,7 @@ impl SandboxAccess {
         if !distribution::is_app_store() {
             return Ok(());
         }
-        let path = bookmarks_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("无法创建授权书签目录 {}", parent.display()))?;
-        }
-        let bytes = serde_json::to_vec_pretty(&self.records)?;
-        let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
-        fs::write(&temporary, bytes)
-            .with_context(|| format!("无法写入授权书签 {}", temporary.display()))?;
-        fs::rename(&temporary, &path)
-            .with_context(|| format!("无法更新授权书签 {}", path.display()))
+        crate::models::persistence::atomic_write_json(&bookmarks_path(), &self.records, "授权书签")
     }
 }
 

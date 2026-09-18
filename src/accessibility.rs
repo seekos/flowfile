@@ -1,5 +1,6 @@
 use accesskit::{
-    ActionHandler, ActionRequest, ActivationHandler, Node, NodeId, Role, Tree, TreeId, TreeUpdate,
+    Action, ActionHandler, ActionRequest, ActivationHandler, Node, NodeId, Role, Tree, TreeId,
+    TreeUpdate,
 };
 use accesskit_macos::SubclassingAdapter;
 use gpui::Window;
@@ -16,7 +17,7 @@ const QUICK_LOOK_ID: NodeId = NodeId(6);
 const PREFERENCES_ID: NodeId = NodeId(7);
 const PANE_ID_BASE: u64 = 100;
 const PANE_ID_STRIDE: u64 = 2_000;
-const ACCESSIBLE_ITEM_LIMIT: usize = 1_000;
+pub(crate) const ACCESSIBLE_ITEM_LIMIT: usize = 1_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccessibilitySnapshot {
@@ -34,6 +35,7 @@ pub struct PaneSnapshot {
     pub path: String,
     pub active: bool,
     pub search: Option<String>,
+    pub total_count: usize,
     pub items: Vec<ItemSnapshot>,
 }
 
@@ -54,16 +56,47 @@ impl ActivationHandler for InitialTree {
     }
 }
 
-struct IgnoreActions;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccessibilityAction {
+    FocusItem {
+        pane_index: usize,
+        item_index: usize,
+    },
+    ActivateItem {
+        pane_index: usize,
+        item_index: usize,
+    },
+}
 
-impl ActionHandler for IgnoreActions {
-    fn do_action(&mut self, _request: ActionRequest) {}
+struct QueueActions {
+    sender: async_channel::Sender<AccessibilityAction>,
+}
+
+impl ActionHandler for QueueActions {
+    fn do_action(&mut self, request: ActionRequest) {
+        let Some((pane_index, item_index)) = item_indices(request.target_node) else {
+            return;
+        };
+        let action = match request.action {
+            Action::Focus => AccessibilityAction::FocusItem {
+                pane_index,
+                item_index,
+            },
+            Action::Click => AccessibilityAction::ActivateItem {
+                pane_index,
+                item_index,
+            },
+            _ => return,
+        };
+        let _ = self.sender.try_send(action);
+    }
 }
 
 pub struct MacAccessibility {
     adapter: SubclassingAdapter,
     tree: Arc<Mutex<TreeUpdate>>,
     last_snapshot: AccessibilitySnapshot,
+    action_receiver: async_channel::Receiver<AccessibilityAction>,
 }
 
 impl MacAccessibility {
@@ -78,16 +111,28 @@ impl MacAccessibility {
         let activation_handler = InitialTree {
             tree: Arc::clone(&tree),
         };
+        let (action_sender, action_receiver) = async_channel::unbounded();
         // SAFETY: GPUI owns this NSView for at least as long as WorkspaceView,
         // which owns the adapter. The constructor runs on AppKit's main thread.
         let adapter = unsafe {
-            SubclassingAdapter::new(handle.ns_view.as_ptr(), activation_handler, IgnoreActions)
+            SubclassingAdapter::new(
+                handle.ns_view.as_ptr(),
+                activation_handler,
+                QueueActions {
+                    sender: action_sender,
+                },
+            )
         };
         Self {
             adapter,
             tree,
             last_snapshot: snapshot,
+            action_receiver,
         }
+    }
+
+    pub fn action_receiver(&self) -> async_channel::Receiver<AccessibilityAction> {
+        self.action_receiver.clone()
     }
 
     pub fn update(&mut self, snapshot: AccessibilitySnapshot) {
@@ -106,6 +151,7 @@ impl MacAccessibility {
 fn build_tree(snapshot: &AccessibilitySnapshot) -> TreeUpdate {
     let mut nodes = Vec::new();
     let mut root_children = vec![TOOLBAR_ID];
+    let mut focus = ROOT_ID;
 
     let mut toolbar = Node::new(Role::Toolbar);
     toolbar.set_label("导航工具栏");
@@ -142,29 +188,34 @@ fn build_tree(snapshot: &AccessibilitySnapshot) -> TreeUpdate {
         nodes.push((location_id, location));
 
         let mut item_ids = Vec::new();
-        for (item_index, item) in pane.items.iter().take(ACCESSIBLE_ITEM_LIMIT).enumerate() {
+        for (item_index, item) in pane.items.iter().enumerate() {
             let item_id = NodeId(pane_id.0 + 10 + item_index as u64);
             item_ids.push(item_id);
             let mut item_node = Node::new(Role::ListItem);
             item_node.set_label(item.name.as_str());
             item_node.set_description(item.description.as_str());
             item_node.set_selected(item.selected);
+            item_node.add_action(Action::Focus);
+            item_node.add_action(Action::Click);
+            if pane.active && item.selected {
+                focus = item_id;
+            }
             nodes.push((item_id, item_node));
         }
-        if pane.items.len() > ACCESSIBLE_ITEM_LIMIT {
+        if pane.total_count > pane.items.len() {
             item_ids.push(truncation_id);
             let mut truncation = Node::new(Role::Label);
             truncation.set_value(format!(
                 "另有 {} 个项目未加入辅助功能树；可通过搜索缩小范围",
-                pane.items.len() - ACCESSIBLE_ITEM_LIMIT
+                pane.total_count - pane.items.len()
             ));
             nodes.push((truncation_id, truncation));
         }
 
         let mut list = Node::new(Role::List);
         list.set_label(match &pane.search {
-            Some(query) => format!("“{query}”的搜索结果，{} 项", pane.items.len()),
-            None => format!("文件列表，{} 项", pane.items.len()),
+            Some(query) => format!("“{query}”的搜索结果，{} 项", pane.total_count),
+            None => format!("文件列表，{} 项", pane.total_count),
         });
         list.set_multiselectable();
         list.set_children(item_ids);
@@ -216,8 +267,16 @@ fn build_tree(snapshot: &AccessibilitySnapshot) -> TreeUpdate {
         nodes,
         tree: Some(tree),
         tree_id: TreeId::ROOT,
-        focus: ROOT_ID,
+        focus,
     }
+}
+
+fn item_indices(node_id: NodeId) -> Option<(usize, usize)> {
+    let offset = node_id.0.checked_sub(PANE_ID_BASE)?;
+    let pane_index = usize::try_from(offset / PANE_ID_STRIDE).ok()?;
+    let within_pane = offset % PANE_ID_STRIDE;
+    let item_index = usize::try_from(within_pane.checked_sub(10)?).ok()?;
+    (item_index < ACCESSIBLE_ITEM_LIMIT).then_some((pane_index, item_index))
 }
 
 fn push_optional_dialog(
@@ -240,7 +299,9 @@ fn push_optional_dialog(
 
 #[cfg(test)]
 mod tests {
-    use super::{AccessibilitySnapshot, ItemSnapshot, PaneSnapshot, ROOT_ID, build_tree};
+    use super::{
+        AccessibilitySnapshot, ItemSnapshot, PaneSnapshot, ROOT_ID, build_tree, item_indices,
+    };
 
     #[test]
     fn tree_exposes_file_names_selection_and_dialogs() {
@@ -251,6 +312,7 @@ mod tests {
                 path: "/Users/test".to_string(),
                 active: true,
                 search: None,
+                total_count: 1,
                 items: vec![ItemSnapshot {
                     name: "文档".to_string(),
                     description: "文件夹".to_string(),
@@ -265,7 +327,6 @@ mod tests {
 
         let update = build_tree(&snapshot);
 
-        assert_eq!(update.focus, ROOT_ID);
         assert!(
             update
                 .nodes
@@ -284,5 +345,7 @@ mod tests {
                 .iter()
                 .any(|(_, node)| node.label() == Some("FlowFile 设置"))
         );
+        assert_ne!(update.focus, ROOT_ID);
+        assert_eq!(item_indices(update.focus), Some((0, 0)));
     }
 }

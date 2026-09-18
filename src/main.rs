@@ -52,3 +52,19 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod dependency_regression_tests {
+    #[test]
+    fn patched_grid_rejects_dimension_overflow_without_corrupting_state() {
+        let mut grid = grid::Grid::from_vec(vec![1_u8, 2_u8], 2);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            grid.expand_rows(usize::MAX / 2);
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(grid.size(), (1, 2));
+        assert_eq!(grid.get(0, 0), Some(&1));
+        assert_eq!(grid.get(1, 0), None);
+    }
+}

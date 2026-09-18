@@ -1,5 +1,9 @@
 use anyhow::{Context as _, Result};
-use std::{path::PathBuf, process::Command};
+use std::{
+    io::Write as _,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SmbLocation {
@@ -186,25 +190,27 @@ fn run_smbutil_view(
         || format!("//{}", location.authority),
         |credentials| {
             format!(
-                "//{}:{}@{}",
+                "//{}@{}",
                 encode_username(credentials.username),
-                percent_encode(credentials.password),
                 location.server
             )
         },
     );
-    let mut command = Command::new("/usr/bin/smbutil");
-    command.args(["view", "-N"]);
-    if credentials.is_none() {
-        command.arg("-G");
-    }
-    let output = command
-        .arg(target)
-        .output()
-        .context("无法启动 macOS SMB 共享查询服务")?;
+    let output = if let Some(credentials) = credentials {
+        run_smbutil_with_password(&target, credentials.password)?
+    } else {
+        Command::new("/usr/bin/smbutil")
+            .args(["view", "-N", "-G"])
+            .arg(target)
+            .output()
+            .context("无法启动 macOS SMB 共享查询服务")?
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if is_authentication_error(output.status.code(), &message) {
+        if is_authentication_error(output.status.code(), &message)
+            || is_authentication_error(output.status.code(), &stdout)
+        {
             return Ok(ShareQuery::AuthenticationRequired);
         }
         if credentials.is_some() {
@@ -215,9 +221,31 @@ fn run_smbutil_view(
         }
         anyhow::bail!("无法读取 SMB 服务器共享列表：{message}");
     }
-    Ok(ShareQuery::Output(
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-    ))
+    if is_authentication_error(None, &stdout) {
+        return Ok(ShareQuery::AuthenticationRequired);
+    }
+    Ok(ShareQuery::Output(stdout.into_owned()))
+}
+
+fn run_smbutil_with_password(target: &str, password: &str) -> Result<std::process::Output> {
+    // smbutil deliberately reads passwords from a terminal. `script` provides
+    // that terminal while letting FlowFile write the secret through stdin, so
+    // it never appears in argv, the environment, logs, or the session file.
+    let mut child = Command::new("/usr/bin/script")
+        .args(["-q", "/dev/null", "/usr/bin/smbutil", "view"])
+        .arg(target)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("无法启动安全的 SMB 认证终端")?;
+    let mut stdin = child.stdin.take().context("无法打开 SMB 认证输入")?;
+    stdin
+        .write_all(password.as_bytes())
+        .and_then(|_| stdin.write_all(b"\n"))
+        .context("无法提交 SMB 凭据")?;
+    drop(stdin);
+    child.wait_with_output().context("无法等待 SMB 认证完成")
 }
 
 fn username_from_authority(authority: &str) -> Option<String> {
@@ -416,6 +444,11 @@ fn parse_location(input: &str) -> Result<SmbLocation> {
     if authority.is_empty() || authority.chars().any(char::is_whitespace) {
         anyhow::bail!("SMB 服务器地址无效");
     }
+    if let Some((user_info, _)) = authority.rsplit_once('@')
+        && percent_decode(user_info)?.contains(':')
+    {
+        anyhow::bail!("SMB 地址不能包含密码，请在登录窗口中输入凭据");
+    }
     let server = authority
         .rsplit_once('@')
         .map_or(authority, |(_, server)| server);
@@ -603,6 +636,15 @@ mod tests {
         assert_eq!(root.server, "nas.local");
         assert_eq!(root.share, None);
         assert_eq!(parse_location("smb://nas.local/").unwrap(), root);
+    }
+
+    #[test]
+    fn rejects_passwords_embedded_in_smb_addresses() {
+        let error = parse_location("smb://alice:secret@nas.local/share")
+            .expect_err("inline password must be rejected");
+        assert!(error.to_string().contains("不能包含密码"));
+        assert!(parse_location("smb://alice%3Asecret@nas.local/share").is_err());
+        assert!(parse_location("smb://alice@nas.local/share").is_ok());
     }
 
     #[test]

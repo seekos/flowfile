@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -124,6 +128,7 @@ pub struct Pane {
     operation_engine: FileOperationEngine,
     search_original_items: Vec<FileItem>,
     search_generation: u64,
+    search_cancellation: Option<Arc<AtomicBool>>,
     load_generation: u64,
     watcher_generation: u64,
     watcher: Option<FileWatcher>,
@@ -165,6 +170,7 @@ impl Pane {
             operation_engine,
             search_original_items: Vec::new(),
             search_generation: 0,
+            search_cancellation: None,
             load_generation: 0,
             watcher_generation: 0,
             watcher: None,
@@ -449,6 +455,7 @@ impl Pane {
 
     pub fn exit_search(&mut self, cx: &mut Context<Self>) {
         if self.search_active {
+            self.cancel_running_search();
             self.search_generation += 1;
             self.items = std::mem::take(&mut self.search_original_items);
             self.search_active = false;
@@ -462,6 +469,7 @@ impl Pane {
     }
 
     fn cancel_search_state(&mut self) {
+        self.cancel_running_search();
         if self.search_active {
             self.search_generation += 1;
             self.search_active = false;
@@ -472,6 +480,7 @@ impl Pane {
     }
 
     fn schedule_search(&mut self, cx: &mut Context<Self>) {
+        self.cancel_running_search();
         self.search_generation += 1;
         let generation = self.search_generation;
         let query = self.search_query.clone();
@@ -488,6 +497,8 @@ impl Pane {
         let current_path = self.current_path.clone();
         let scope = self.search_scope;
         let show_hidden = self.show_hidden;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.search_cancellation = Some(cancellation.clone());
         self.is_loading = true;
         self.error_message = None;
         cx.notify();
@@ -502,7 +513,9 @@ impl Pane {
             if !still_current {
                 return;
             }
-            let result = engine.search(query, current_path, scope, show_hidden).await;
+            let result = engine
+                .search(query, current_path, scope, show_hidden, cancellation)
+                .await;
             let _ = this.update(cx, |pane, cx| {
                 if !pane.search_active || pane.search_generation != generation {
                     return;
@@ -517,10 +530,17 @@ impl Pane {
                     }
                     Err(error) => pane.error_message = Some(error.to_string()),
                 }
+                pane.search_cancellation = None;
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn cancel_running_search(&mut self) {
+        if let Some(cancellation) = self.search_cancellation.take() {
+            cancellation.store(true, Ordering::Release);
+        }
     }
 
     pub fn select(&mut self, index: usize, additive: bool, range: bool) {

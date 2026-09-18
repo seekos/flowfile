@@ -1,7 +1,7 @@
-use super::{LayoutMode, home_directory};
-use anyhow::{Context as _, Result};
+use super::{LayoutMode, home_directory, persistence};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ThemePreference {
@@ -57,20 +57,12 @@ impl Default for AppPreferences {
 
 impl AppPreferences {
     pub fn load() -> Self {
-        fs::read(preferences_path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        persistence::load_json_or_default(preferences_path(), "设置")
     }
 
     pub fn save(&self) -> Result<()> {
         let path = preferences_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("无法创建设置目录 {}", parent.display()))?;
-        }
-        let bytes = serde_json::to_vec_pretty(self)?;
-        fs::write(&path, bytes).with_context(|| format!("无法保存设置 {}", path.display()))
+        persistence::atomic_write_json(&path, self, "设置")
     }
 }
 
