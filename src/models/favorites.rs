@@ -28,6 +28,18 @@ impl Favorites {
         self.paths.iter().any(|favorite| favorite == path)
     }
 
+    pub fn ensure_present(&mut self, path: PathBuf) -> Result<bool> {
+        if self.contains(&path) {
+            return Ok(false);
+        }
+        self.paths.push(path);
+        if let Err(error) = self.save() {
+            self.paths.pop();
+            return Err(error);
+        }
+        Ok(true)
+    }
+
     pub fn remove(&mut self, path: &Path) -> Result<bool> {
         let Some(index) = self.paths.iter().position(|favorite| favorite == path) else {
             return Ok(false);

@@ -1,4 +1,5 @@
 use super::{SmbMountInfo, SmbNavigation, quick_look::is_text_extension, smb, volume};
+use crate::distribution;
 use crate::models::{FileItem, FileKind, SortMode};
 use anyhow::{Context as _, Result};
 use std::{
@@ -60,6 +61,9 @@ impl FileEngine {
     }
 
     pub async fn list_volumes(&self) -> Result<Vec<volume::VolumeInfo>> {
+        if distribution::is_app_store() {
+            return Ok(Vec::new());
+        }
         self.runtime
             .spawn(async {
                 let paths =
@@ -79,6 +83,11 @@ impl FileEngine {
     }
 
     pub(crate) async fn connect_smb(&self, address: String) -> Result<SmbNavigation> {
+        if !distribution::allows_scripted_volume_mounts() {
+            anyhow::bail!(
+                "Mac App Store 版不直接挂载 SMB。请先在访达连接服务器，再通过“授权文件夹”选择该网络卷"
+            );
+        }
         self.runtime
             .spawn_blocking(move || smb::connect(&address))
             .await
@@ -91,6 +100,11 @@ impl FileEngine {
         username: String,
         password: String,
     ) -> Result<SmbNavigation> {
+        if !distribution::allows_scripted_volume_mounts() {
+            anyhow::bail!(
+                "Mac App Store 版不直接挂载 SMB。请先在访达连接服务器，再通过“授权文件夹”选择该网络卷"
+            );
+        }
         self.runtime
             .spawn_blocking(move || smb::connect_with_credentials(&address, &username, &password))
             .await
@@ -98,7 +112,7 @@ impl FileEngine {
     }
 
     pub fn ntfs_auto_mount_available(&self) -> bool {
-        volume::ntfs_auto_mount_available()
+        distribution::allows_scripted_volume_mounts() && volume::ntfs_auto_mount_available()
     }
 
     pub async fn auto_mount_ntfs(&self, path: PathBuf) -> Result<bool> {
@@ -118,7 +132,11 @@ impl FileEngine {
     pub async fn open_path(&self, path: PathBuf) -> Result<()> {
         self.runtime
             .spawn_blocking(move || {
-                if is_unix_executable(&path) {
+                if is_unix_executable(&path) && !distribution::allows_direct_executable_launch() {
+                    anyhow::bail!(
+                        "Mac App Store 版不会直接执行脚本或二进制文件；请使用“打开方式”查看内容"
+                    )
+                } else if is_unix_executable(&path) {
                     run_unix_executable(&path)
                 } else if let Some(application) = preferred_text_application(&path) {
                     open_path_with_application(&path, &application)
@@ -135,6 +153,9 @@ impl FileEngine {
     }
 
     pub async fn applications_for_path(&self, path: PathBuf) -> Result<Vec<OpenWithApplication>> {
+        if distribution::is_app_store() {
+            return Ok(Vec::new());
+        }
         self.runtime
             .spawn_blocking(move || query_applications_for_path(&path))
             .await
@@ -167,6 +188,9 @@ impl FileEngine {
     }
 
     pub async fn choose_open_with_application(&self) -> Result<Option<PathBuf>> {
+        if distribution::is_app_store() {
+            anyhow::bail!("Mac App Store 版不提供自定义应用选择器");
+        }
         self.runtime
             .spawn_blocking(choose_open_with_application)
             .await

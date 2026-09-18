@@ -1,6 +1,7 @@
 use super::tooltip::delayed_tooltip;
 use crate::{
     actions::{CopyFiles, CutFiles, PasteFiles},
+    icons::{IconName, icon},
     models::Model,
     models::Pane,
     theme,
@@ -671,12 +672,27 @@ impl Render for SearchBar {
                     .child(
                         div()
                             .mr_2()
-                            .text_color(if active {
-                                theme::accent()
+                            .size(px(15.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(if loading {
+                                div()
+                                    .text_color(theme::text_tertiary())
+                                    .child("◌")
+                                    .into_any_element()
                             } else {
-                                theme::text_secondary()
-                            })
-                            .child(if loading { "◌" } else { "⌕" }),
+                                icon(
+                                    IconName::Search,
+                                    14.0,
+                                    if active {
+                                        theme::accent()
+                                    } else {
+                                        theme::text_secondary()
+                                    },
+                                )
+                                .into_any_element()
+                            }),
                     )
                     .child(
                         div()
@@ -741,7 +757,7 @@ impl Render for SearchBar {
                         .on_click(move |_, _, cx| {
                             pane_for_close.update(cx, |pane, cx| pane.exit_search(cx));
                         })
-                        .child("×"),
+                        .child(icon(IconName::Close, 13.0, theme::text_secondary())),
                 )
             })
     }

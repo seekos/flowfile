@@ -8,3 +8,5 @@
 <string>FlowFile 需要访问网络卷，以在面板中浏览和管理远程文件。</string>
 <key>NSRemovableVolumesUsageDescription</key>
 <string>FlowFile 需要访问移动卷，以在面板中浏览和管理外置存储设备。</string>
+<key>ITSAppUsesNonExemptEncryption</key>
+<false/>

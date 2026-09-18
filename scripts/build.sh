@@ -160,6 +160,8 @@ if [[ -d "${app_path}" ]]; then
     /bin/rm -R "${app_path}"
 fi
 cp -R "${built_app_path}" "${app_path}"
+cp "${resources_dir}/PrivacyInfo.xcprivacy" \
+    "${app_path}/Contents/Resources/PrivacyInfo.xcprivacy"
 /usr/libexec/PlistBuddy -c \
     "Set :CFBundleShortVersionString ${version}" "${app_path}/Contents/Info.plist"
 

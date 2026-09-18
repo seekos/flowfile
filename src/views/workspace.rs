@@ -19,13 +19,15 @@ use crate::{
         NewTextFile, NextPane, OpenPreferences, OpenTerminal, PasteFiles, PasteMoveFiles,
         PermanentDelete, PreviousPane, Refresh, ToggleQuickLook, ViewDetails, ViewGrid,
     },
+    icons::{IconName, icon},
     models::{
         AppPreferences, CreateItemKind, Favorites, FileKind, FileOperationController, LayoutMode,
         Model, MultiPaneModel, Pane, PaneEvent, SessionState, home_directory,
     },
     services::{
         AvailableUpdate, FileEngine, FileInspector, FileOperationEngine, PreviewKind,
-        QuickLookService, SystemTerminal, ThumbnailEngine, TransferMode, UpdateChecker,
+        QuickLookService, SandboxAccess, SystemTerminal, ThumbnailEngine, TransferMode,
+        UpdateChecker,
     },
     theme,
 };
@@ -37,7 +39,12 @@ use gpui::{
     StyledImage, TextRun, Timer, UTF16Selection, UnderlineStyle, Window, black, div, fill, img,
     point, prelude::*, px, relative, size, uniform_list,
 };
-use std::{ops::Range, path::PathBuf, time::Duration};
+use std::{
+    ops::Range,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 struct ModalNameTextElement {
     input: Entity<WorkspaceView>,
@@ -265,6 +272,9 @@ pub struct WorkspaceView {
     terminal: SystemTerminal,
     context_menu: Entity<ContextMenuView>,
     preferences: Entity<PreferencesModal>,
+    favorites: Entity<Favorites>,
+    sandbox_access: Arc<Mutex<SandboxAccess>>,
+    needs_folder_authorization: bool,
     sidebar_visible: bool,
     focus_handle: FocusHandle,
     modal_focus_handle: FocusHandle,
@@ -300,7 +310,17 @@ impl WorkspaceView {
         })
         .detach();
         let operation_engine = FileOperationEngine::new(&engine);
-        let home = home_directory();
+        let sandbox_access = Arc::new(Mutex::new(SandboxAccess::load()));
+        let authorized_paths = sandbox_access
+            .lock()
+            .map(|access| access.authorized_paths())
+            .unwrap_or_default();
+        let needs_folder_authorization =
+            crate::distribution::is_app_store() && authorized_paths.is_empty();
+        let home = authorized_paths
+            .first()
+            .cloned()
+            .unwrap_or_else(home_directory);
         let restored_session = match SessionState::load() {
             Ok(session) => session,
             Err(error) => {
@@ -308,12 +328,23 @@ impl WorkspaceView {
                 None
             }
         };
-        let candidate_paths = [
-            home.clone(),
-            home.join("Downloads"),
-            PathBuf::from("/Volumes"),
-            home.join("Desktop"),
-        ];
+        let candidate_paths = if crate::distribution::is_app_store() {
+            (0..4)
+                .map(|index| {
+                    authorized_paths
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| home.clone())
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![
+                home.clone(),
+                home.join("Downloads"),
+                PathBuf::from("/Volumes"),
+                home.join("Desktop"),
+            ]
+        };
         let panes: Vec<_> = candidate_paths
             .into_iter()
             .enumerate()
@@ -455,6 +486,9 @@ impl WorkspaceView {
             terminal,
             context_menu,
             preferences,
+            favorites,
+            sandbox_access,
+            needs_folder_authorization,
             sidebar_visible,
             focus_handle,
             modal_focus_handle: cx.focus_handle(),
@@ -487,9 +521,78 @@ impl WorkspaceView {
         })
         .detach();
 
-        workspace.check_for_updates(update_checker, dismissed_update_version, cx);
+        if crate::distribution::allows_direct_updates() {
+            workspace.check_for_updates(update_checker, dismissed_update_version, cx);
+        }
 
         workspace
+    }
+
+    fn authorize_folder(&mut self, cx: &mut Context<Self>) {
+        let result = self
+            .sandbox_access
+            .lock()
+            .map_err(|_| anyhow::anyhow!("文件夹授权状态暂时不可用"))
+            .and_then(|mut access| access.choose_and_authorize_folder());
+        match result {
+            Ok(Some(path)) => {
+                self.needs_folder_authorization = false;
+                self.favorites.update(cx, |favorites, cx| {
+                    if let Err(error) = favorites.ensure_present(path.clone()) {
+                        eprintln!("FlowFile: 无法将授权文件夹加入收藏：{error}");
+                    }
+                    cx.notify();
+                });
+                self.active_pane(cx)
+                    .update(cx, |pane, cx| pane.navigate_to(path.clone(), cx));
+                self.operations.update(cx, |operations, cx| {
+                    operations.show_notice(format!("已授权访问 {}", path.display()), false, cx);
+                });
+                cx.notify();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.operations.update(cx, |operations, cx| {
+                    operations.show_notice(error.to_string(), true, cx);
+                });
+            }
+        }
+    }
+
+    fn render_authorization_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.needs_folder_authorization.then(|| {
+            div()
+                .id("folder-authorization-notice")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(42.0))
+                .px_4()
+                .border_b_1()
+                .border_color(theme::accent().opacity(0.28))
+                .bg(theme::accent_soft())
+                .text_size(theme::font(10.0))
+                .text_color(theme::text_primary())
+                .child("选择一个文件夹后，FlowFile 才能在沙盒中浏览和管理你的文件")
+                .child(
+                    div()
+                        .id("folder-authorization-notice-button")
+                        .ml_3()
+                        .px_3()
+                        .h(px(26.0))
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .bg(theme::accent())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::surface())
+                        .cursor_pointer()
+                        .hover(|style| style.opacity(0.88))
+                        .on_click(cx.listener(|this, _, _, cx| this.authorize_folder(cx)))
+                        .child("选择并授权…"),
+                )
+                .into_any_element()
+        })
     }
 
     fn check_for_updates(
@@ -937,6 +1040,12 @@ impl WorkspaceView {
     }
 
     fn on_open_terminal(&mut self, _: &OpenTerminal, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.terminal.is_available() {
+            self.operations.update(cx, |operations, cx| {
+                operations.show_notice("Mac App Store 版不直接启动系统终端".to_string(), true, cx)
+            });
+            return;
+        }
         let pane = self.active_pane(cx);
         let pane = pane.read(cx);
         if pane.is_smb_server_root() {
@@ -1585,7 +1694,7 @@ impl WorkspaceView {
     fn layout_button(
         &self,
         mode: LayoutMode,
-        glyph: &'static str,
+        symbol: IconName,
         label: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1596,26 +1705,15 @@ impl WorkspaceView {
             .id(label)
             .flex()
             .items_center()
-            .gap_1()
-            .h(px(34.0))
-            .px_2()
-            .rounded_md()
-            .border_1()
-            .border_color(if is_active {
-                theme::accent()
-            } else {
-                theme::border()
-            })
+            .justify_center()
+            .size(px(28.0))
+            .rounded(px(5.0))
             .bg(if is_active {
                 theme::accent_soft()
             } else {
-                theme::surface()
+                gpui::transparent_black()
             })
-            .text_color(if is_active {
-                theme::accent()
-            } else {
-                theme::text_secondary()
-            })
+            .cursor_pointer()
             .hover(|style| style.bg(theme::accent_soft()))
             .tooltip(delayed_tooltip(format!("切换为{label}布局")))
             .on_click(move |_, _, cx| {
@@ -1624,13 +1722,15 @@ impl WorkspaceView {
                     cx.notify();
                 });
             })
-            .child(
-                div()
-                    .font_family("SF Mono")
-                    .text_size(theme::font(13.0))
-                    .child(glyph),
-            )
-            .child(div().text_size(theme::font(9.0)).child(label))
+            .child(icon(
+                symbol,
+                16.0,
+                if is_active {
+                    theme::accent()
+                } else {
+                    theme::text_secondary()
+                },
+            ))
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1666,22 +1766,15 @@ impl WorkspaceView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(34.0))
-                    .mr_1()
-                    .text_size(theme::font(15.0))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if sidebar_visible {
-                        theme::accent()
+                    .size(px(30.0))
+                    .mr_2()
+                    .rounded(px(6.0))
+                    .bg(if sidebar_visible {
+                        theme::accent_soft()
                     } else {
-                        theme::border()
+                        gpui::transparent_black()
                     })
-                    .bg(theme::surface())
-                    .text_color(if sidebar_visible {
-                        theme::accent()
-                    } else {
-                        theme::text_secondary()
-                    })
+                    .cursor_pointer()
                     .hover(|style| style.bg(theme::accent_soft()))
                     .tooltip(delayed_tooltip(if sidebar_visible {
                         "隐藏侧边栏"
@@ -1693,38 +1786,61 @@ impl WorkspaceView {
                         this.schedule_session_save(cx);
                         cx.notify();
                     }))
-                    .child("◧"),
+                    .child(icon(
+                        IconName::Sidebar,
+                        17.0,
+                        if sidebar_visible {
+                            theme::accent()
+                        } else {
+                            theme::text_secondary()
+                        },
+                    )),
             )
-            .child(self.layout_button(LayoutMode::Single, "□", "单窗", cx))
-            .child(self.layout_button(LayoutMode::DualVertical, "▥", "左右", cx))
-            .child(self.layout_button(LayoutMode::DualHorizontal, "▤", "上下", cx))
-            .child(self.layout_button(LayoutMode::Quad, "▦", "四格", cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(1.0))
+                    .p(px(2.0))
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(theme::border())
+                    .bg(theme::surface())
+                    .child(self.layout_button(
+                        LayoutMode::Single,
+                        IconName::LayoutSingle,
+                        "单窗",
+                        cx,
+                    ))
+                    .child(self.layout_button(
+                        LayoutMode::DualVertical,
+                        IconName::LayoutColumns,
+                        "左右",
+                        cx,
+                    ))
+                    .child(self.layout_button(
+                        LayoutMode::DualHorizontal,
+                        IconName::LayoutRows,
+                        "上下",
+                        cx,
+                    ))
+                    .child(self.layout_button(LayoutMode::Quad, IconName::LayoutGrid, "四格", cx)),
+            )
             .child(
                 div()
                     .id("hidden-files-toggle")
                     .flex()
                     .items_center()
-                    .h(px(34.0))
-                    .px_2()
-                    .ml_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if show_hidden {
-                        theme::accent()
-                    } else {
-                        theme::border()
-                    })
+                    .justify_center()
+                    .size(px(30.0))
+                    .ml_2()
+                    .rounded(px(6.0))
                     .bg(if show_hidden {
                         theme::accent_soft()
                     } else {
-                        theme::surface()
+                        gpui::transparent_black()
                     })
-                    .text_size(theme::font(9.0))
-                    .text_color(if show_hidden {
-                        theme::accent()
-                    } else {
-                        theme::text_secondary()
-                    })
+                    .cursor_pointer()
                     .hover(|style| style.bg(theme::accent_soft()))
                     .tooltip(delayed_tooltip(if show_hidden {
                         "隐藏名称以 . 开头的文件"
@@ -1734,32 +1850,32 @@ impl WorkspaceView {
                     .on_click(move |_, _, cx| {
                         hidden_pane.update(cx, |pane, cx| pane.toggle_hidden(cx));
                     })
-                    .child(if show_hidden {
-                        "隐藏点文件"
-                    } else {
-                        "点文件"
-                    }),
+                    .child(icon(
+                        if show_hidden {
+                            IconName::Eye
+                        } else {
+                            IconName::EyeSlash
+                        },
+                        17.0,
+                        if show_hidden {
+                            theme::accent()
+                        } else {
+                            theme::text_secondary()
+                        },
+                    )),
             )
             .child(
                 div()
                     .id("copy-to-other-pane")
                     .flex()
                     .items_center()
-                    .h(px(34.0))
-                    .px_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme::border())
-                    .bg(theme::surface())
-                    .text_size(theme::font(9.0))
-                    .text_color(if has_selection && has_other_pane {
-                        theme::accent()
-                    } else {
-                        theme::text_tertiary()
-                    })
+                    .justify_center()
+                    .size(px(30.0))
+                    .rounded(px(6.0))
                     .tooltip(delayed_tooltip("将选中项目复制到另一面板"))
                     .when(has_selection && has_other_pane, |button| {
                         button
+                            .cursor_pointer()
                             .hover(|style| style.bg(theme::accent_soft()))
                             .on_click(move |_, _, cx| {
                                 copy_operations.update(cx, |operations, cx| {
@@ -1767,28 +1883,28 @@ impl WorkspaceView {
                                 });
                             })
                     })
-                    .child("→ 复制"),
+                    .child(icon(
+                        IconName::CopyRight,
+                        17.0,
+                        if has_selection && has_other_pane {
+                            theme::accent()
+                        } else {
+                            theme::text_tertiary().opacity(0.45)
+                        },
+                    )),
             )
             .child(
                 div()
                     .id("move-to-other-pane")
                     .flex()
                     .items_center()
-                    .h(px(34.0))
-                    .px_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme::border())
-                    .bg(theme::surface())
-                    .text_size(theme::font(9.0))
-                    .text_color(if has_selection && has_other_pane {
-                        theme::file_green()
-                    } else {
-                        theme::text_tertiary()
-                    })
+                    .justify_center()
+                    .size(px(30.0))
+                    .rounded(px(6.0))
                     .tooltip(delayed_tooltip("将选中项目移动到另一面板"))
                     .when(has_selection && has_other_pane, |button| {
                         button
+                            .cursor_pointer()
                             .hover(|style| style.bg(theme::accent_soft()))
                             .on_click(move |_, _, cx| {
                                 move_operations.update(cx, |operations, cx| {
@@ -1796,28 +1912,28 @@ impl WorkspaceView {
                                 });
                             })
                     })
-                    .child("→ 移动"),
+                    .child(icon(
+                        IconName::MoveRight,
+                        17.0,
+                        if has_selection && has_other_pane {
+                            theme::file_green()
+                        } else {
+                            theme::text_tertiary().opacity(0.45)
+                        },
+                    )),
             )
             .child(
                 div()
                     .id("move-to-trash")
                     .flex()
                     .items_center()
-                    .h(px(34.0))
-                    .px_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme::border())
-                    .bg(theme::surface())
-                    .text_size(theme::font(9.0))
-                    .text_color(if has_selection {
-                        theme::danger()
-                    } else {
-                        theme::text_tertiary()
-                    })
+                    .justify_center()
+                    .size(px(30.0))
+                    .rounded(px(6.0))
                     .tooltip(delayed_tooltip("将选中项目移至废纸篓 (⌘⌫)"))
                     .when(has_selection, |button| {
                         button
+                            .cursor_pointer()
                             .hover(|style| style.bg(theme::danger_soft()))
                             .on_click(move |_, _, cx| {
                                 trash_operations.update(cx, |operations, cx| {
@@ -1825,8 +1941,39 @@ impl WorkspaceView {
                                 });
                             })
                     })
-                    .child("废纸篓"),
+                    .child(icon(
+                        IconName::Trash,
+                        17.0,
+                        if has_selection {
+                            theme::danger()
+                        } else {
+                            theme::text_tertiary().opacity(0.45)
+                        },
+                    )),
             )
+            .when(crate::distribution::is_app_store(), |toolbar| {
+                toolbar.child(
+                    div()
+                        .id("authorize-folder")
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .h(px(34.0))
+                        .px_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme::accent().opacity(0.55))
+                        .bg(theme::accent_soft())
+                        .text_size(theme::font(9.0))
+                        .text_color(theme::accent())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::accent().opacity(0.18)))
+                        .tooltip(delayed_tooltip("选择并持久授权一个文件夹"))
+                        .on_click(cx.listener(|this, _, _, cx| this.authorize_folder(cx)))
+                        .child(icon(IconName::FolderAdd, 16.0, theme::accent()))
+                        .child("授权文件夹"),
+                )
+            })
             .child(
                 div()
                     .id("titlebar-drag-region")
@@ -1847,21 +1994,16 @@ impl WorkspaceView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(34.0))
+                    .size(px(30.0))
                     .ml_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme::border())
-                    .bg(theme::surface())
-                    .text_size(theme::font(15.0))
-                    .text_color(theme::text_secondary())
+                    .rounded(px(6.0))
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::accent_soft()).text_color(theme::accent()))
+                    .hover(|style| style.bg(theme::accent_soft()))
                     .tooltip(delayed_tooltip("打开设置 (⌘,)"))
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(OpenPreferences), cx);
                     })
-                    .child("⚙︎"),
+                    .child(icon(IconName::Settings, 17.0, theme::text_secondary())),
             )
     }
 
@@ -2688,6 +2830,7 @@ impl Render for WorkspaceView {
         let modal = self.render_modal(cx, input_entity);
         let quick_look = self.render_quick_look(cx);
         let update_notice = self.render_update_notice(cx);
+        let authorization_notice = self.render_authorization_notice(cx);
         div()
             .id("workspace")
             .key_context("Workspace")
@@ -2727,6 +2870,9 @@ impl Render for WorkspaceView {
             .bg(theme::canvas())
             .text_color(theme::text_primary())
             .child(self.titlebar(window, cx))
+            .when_some(authorization_notice, |workspace, notice| {
+                workspace.child(notice)
+            })
             .when_some(update_notice, |workspace, notice| workspace.child(notice))
             .child(
                 div()

@@ -1,4 +1,5 @@
 use super::{FileEngine, ensure_writable};
+use crate::distribution;
 use anyhow::{Context as _, Result, bail};
 use async_channel::Sender;
 use serde::{Deserialize, Serialize};
@@ -152,6 +153,9 @@ impl FileOperationEngine {
     }
 
     pub async fn show_info(&self, path: PathBuf) -> Result<()> {
+        if distribution::is_app_store() {
+            anyhow::bail!("Mac App Store 版不通过 AppleScript 打开访达简介窗口");
+        }
         self.runtime
             .spawn_blocking(move || {
                 let status = Command::new("/usr/bin/osascript")
@@ -267,6 +271,8 @@ async fn execute_transfer(
     let started = Instant::now();
     let mut bytes_done = 0_u64;
     let mut destinations = Vec::with_capacity(plans.len());
+
+    send_progress(&progress, "准备传输", bytes_done, total_bytes, started);
 
     for plan in plans {
         let current_file = plan
@@ -537,7 +543,10 @@ fn send_progress(
     started: Instant,
 ) {
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
-    let _ = sender.try_send(TransferProgress {
+    // Progress is a snapshot rather than an event log. If the UI has not yet
+    // consumed the previous snapshot, replace it so the progress bar follows
+    // the actual copy position instead of replaying stale buffered updates.
+    let _ = sender.force_send(TransferProgress {
         current_file: current_file.to_string(),
         bytes_done,
         total_bytes,
@@ -601,12 +610,30 @@ fn validate_file_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConflictPolicy, TransferMode, available_path, execute_transfer, rename_path};
+    use super::{
+        ConflictPolicy, TransferMode, available_path, execute_transfer, rename_path, send_progress,
+    };
     use std::{
         fs,
         os::unix::fs::{PermissionsExt as _, symlink},
         process::Command,
+        time::Instant,
     };
+
+    #[test]
+    fn progress_channel_keeps_the_latest_snapshot() {
+        let (sender, receiver) = async_channel::bounded(1);
+        let started = Instant::now();
+
+        send_progress(&sender, "old.txt", 25, 100, started);
+        send_progress(&sender, "latest.txt", 75, 100, started);
+
+        let progress = receiver.try_recv().expect("latest progress snapshot");
+        assert_eq!(progress.current_file, "latest.txt");
+        assert_eq!(progress.bytes_done, 75);
+        assert_eq!(progress.total_bytes, 100);
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn copy_uses_numbered_name_when_destination_exists() {

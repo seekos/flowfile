@@ -1,4 +1,5 @@
 use super::FileEngine;
+use crate::distribution;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -19,7 +20,14 @@ impl SystemTerminal {
         }
     }
 
-    pub fn open(&self, path: PathBuf) {
+    pub fn is_available(&self) -> bool {
+        distribution::allows_external_terminal()
+    }
+
+    pub fn open(&self, path: PathBuf) -> bool {
+        if !self.is_available() {
+            return false;
+        }
         self.runtime.spawn_blocking(move || {
             let status = Command::new("/usr/bin/open")
                 .args(terminal_open_arguments(&path))
@@ -32,6 +40,7 @@ impl SystemTerminal {
                 Err(error) => eprintln!("FlowFile: 无法打开系统终端：{error}"),
             }
         });
+        true
     }
 }
 
@@ -57,6 +66,16 @@ mod tests {
                 OsString::from("Terminal"),
                 OsString::from("/tmp/Flow File"),
             ]
+        );
+    }
+
+    #[test]
+    fn terminal_availability_matches_distribution_policy() {
+        let engine = super::FileEngine::new().expect("engine");
+        let terminal = super::SystemTerminal::new(&engine);
+        assert_eq!(
+            terminal.is_available(),
+            crate::distribution::allows_external_terminal()
         );
     }
 }

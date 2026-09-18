@@ -194,15 +194,7 @@ impl Render for PaneView {
                         view_mode,
                         self.pane.clone(),
                         "大图标网格",
-                    ))
-                    .child(
-                        div()
-                            .ml_1()
-                            .mb_1()
-                            .text_size(theme::font(16.0))
-                            .text_color(theme::text_tertiary())
-                            .child("+"),
-                    ),
+                    )),
             )
             .child(
                 div()

@@ -5,9 +5,13 @@ use crate::services::{
 };
 use gpui::Context;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 const CLIPBOARD_SIGNATURE: &str = "com.flowfile.files.v1";
+const SUCCESS_NOTICE_DURATION: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ClipboardMode {
@@ -49,6 +53,7 @@ pub struct FileDragPayload {
 #[derive(Clone, Debug)]
 pub struct TransferActivity {
     pub running: bool,
+    pub completed_successfully: bool,
     pub current_file: String,
     pub bytes_done: u64,
     pub total_bytes: u64,
@@ -58,10 +63,16 @@ pub struct TransferActivity {
 
 impl TransferActivity {
     pub fn progress(&self) -> f32 {
-        if self.total_bytes == 0 {
-            return if self.running { 0.0 } else { 1.0 };
+        if self.completed_successfully {
+            return 1.0;
         }
-        (self.bytes_done as f32 / self.total_bytes as f32).clamp(0.0, 1.0)
+        if self.total_bytes == 0 {
+            return 0.0;
+        }
+        // Copying metadata and removing the source during a cross-volume move
+        // happen after the last file byte is written. Reserve the final 1% for
+        // actual task completion so a running transfer never appears finished.
+        (self.bytes_done as f32 / self.total_bytes as f32).clamp(0.0, 0.99)
     }
 }
 
@@ -73,6 +84,7 @@ pub struct FileOperationController {
     pub transfer: Option<TransferActivity>,
     pub notice: Option<String>,
     pub notice_is_error: bool,
+    notice_generation: u64,
     transfer_generation: u64,
 }
 
@@ -86,6 +98,7 @@ impl FileOperationController {
             transfer: None,
             notice: None,
             notice_is_error: false,
+            notice_generation: 0,
             transfer_generation: 0,
         }
     }
@@ -388,11 +401,14 @@ impl FileOperationController {
 
         self.transfer_generation += 1;
         let generation = self.transfer_generation;
-        let (progress_sender, progress_receiver) = async_channel::bounded(64);
+        // Progress values are snapshots. A single-slot channel lets the engine
+        // replace a stale pending value with the newest byte count.
+        let (progress_sender, progress_receiver) = async_channel::bounded(1);
         let engine = self.engine.clone();
         let sources_for_task = sources.clone();
         self.transfer = Some(TransferActivity {
             running: true,
+            completed_successfully: false,
             current_file: sources
                 .first()
                 .and_then(|path| path.file_name())
@@ -444,6 +460,7 @@ impl FileOperationController {
                     Ok(destinations) => {
                         if let Some(transfer) = &mut controller.transfer {
                             transfer.running = false;
+                            transfer.completed_successfully = true;
                             if transfer.total_bytes > 0 {
                                 transfer.bytes_done = transfer.total_bytes;
                             }
@@ -481,6 +498,9 @@ impl FileOperationController {
 
     fn apply_progress(&mut self, progress: TransferProgress) {
         if let Some(transfer) = &mut self.transfer {
+            if !transfer.running {
+                return;
+            }
             transfer.current_file = progress.current_file;
             transfer.bytes_done = progress.bytes_done;
             transfer.total_bytes = progress.total_bytes;
@@ -496,16 +516,82 @@ impl FileOperationController {
     }
 
     fn set_notice(&mut self, notice: impl Into<String>, is_error: bool, cx: &mut Context<Self>) {
+        self.notice_generation = self.notice_generation.wrapping_add(1);
+        let generation = self.notice_generation;
         self.notice = Some(notice.into());
         self.notice_is_error = is_error;
         cx.notify();
+
+        if !is_error {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(SUCCESS_NOTICE_DURATION)
+                    .await;
+                let _ = this.update(cx, |controller, cx| {
+                    if controller.notice_generation == generation {
+                        controller.notice = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CLIPBOARD_SIGNATURE, ClipboardMode, ClipboardPayload, native_clipboard_mode};
+    use super::{
+        CLIPBOARD_SIGNATURE, ClipboardMode, ClipboardPayload, TransferActivity,
+        native_clipboard_mode,
+    };
+    use crate::services::TransferMode;
     use std::path::PathBuf;
+
+    #[test]
+    fn running_transfer_reserves_completion_until_the_task_finishes() {
+        let transfer = TransferActivity {
+            running: true,
+            completed_successfully: false,
+            current_file: "example.bin".to_string(),
+            bytes_done: 100,
+            total_bytes: 100,
+            speed_bytes_per_second: 1.0,
+            mode: TransferMode::Copy,
+        };
+
+        assert_eq!(transfer.progress(), 0.99);
+    }
+
+    #[test]
+    fn completed_transfer_is_always_full_even_after_a_stale_snapshot() {
+        let transfer = TransferActivity {
+            running: false,
+            completed_successfully: true,
+            current_file: "example.bin".to_string(),
+            bytes_done: 25,
+            total_bytes: 100,
+            speed_bytes_per_second: 1.0,
+            mode: TransferMode::Move,
+        };
+
+        assert_eq!(transfer.progress(), 1.0);
+    }
+
+    #[test]
+    fn failed_transfer_keeps_its_last_real_progress() {
+        let transfer = TransferActivity {
+            running: false,
+            completed_successfully: false,
+            current_file: "example.bin".to_string(),
+            bytes_done: 25,
+            total_bytes: 100,
+            speed_bytes_per_second: 0.0,
+            mode: TransferMode::Copy,
+        };
+
+        assert_eq!(transfer.progress(), 0.25);
+    }
 
     fn payload(mode: ClipboardMode, paths: &[&str]) -> ClipboardPayload {
         ClipboardPayload {

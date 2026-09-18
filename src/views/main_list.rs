@@ -1191,8 +1191,8 @@ impl MainListView {
             .id(("file-row", index))
             .flex()
             .items_center()
-            .w_full()
-            .min_w(px(widths.total()))
+            .w(px(widths.total()))
+            .flex_shrink_0()
             .h(px(40.0))
             .border_b_1()
             .border_color(theme::surface_subtle())
@@ -1335,7 +1335,6 @@ impl MainListView {
                     .text_color(theme::text_secondary())
                     .child(item.modified),
             )
-            .child(div().min_w_0().flex_1())
             .into_any_element()
     }
 
@@ -2088,6 +2087,8 @@ impl Render for MainListView {
         }
         let background_context_menu = self.context_menu.clone();
         let background_focus_handle = self.focus_handle.clone();
+        let detail_blank_context_menu = self.context_menu.clone();
+        let detail_blank_focus_handle = self.focus_handle.clone();
         let viewport_bounds = self.viewport_bounds.clone();
         let pane_index = self.pane_index;
         if items.is_empty() {
@@ -2361,6 +2362,26 @@ impl Render for MainListView {
                         )
                     }),
             )
+            .when(view_mode == ViewMode::Details, |root| {
+                root.child(
+                    div()
+                        .id("detail-list-blank-area")
+                        .absolute()
+                        .top(px(32.0))
+                        .bottom_0()
+                        .left(px(details_width))
+                        .right_0()
+                        .cursor_default()
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_marquee))
+                        .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                            detail_blank_focus_handle.focus(window);
+                            detail_blank_context_menu.update(cx, |menu, cx| {
+                                menu.show_for_background(pane_index, event.position, cx);
+                            });
+                            cx.stop_propagation();
+                        }),
+                )
+            })
     }
 }
 

@@ -267,7 +267,15 @@ impl ContextMenuView {
             }
             MenuCommand::OpenTerminal => {
                 let path = state.pane.read(cx).current_path.clone();
-                self.terminal.open(path);
+                if !self.terminal.open(path) {
+                    self.operations.update(cx, |operations, cx| {
+                        operations.show_notice(
+                            "Mac App Store 版不直接启动系统终端".to_string(),
+                            true,
+                            cx,
+                        );
+                    });
+                }
             }
             MenuCommand::ToggleFavorite => {
                 let path = {
@@ -869,7 +877,7 @@ impl ContextMenuView {
         file_operations_enabled: bool,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        vec![
+        let mut items = vec![
             Self::item(
                 "context-new-folder",
                 "📁",
@@ -907,8 +915,10 @@ impl ContextMenuView {
                 MenuCommand::PasteMove,
                 cx,
             ),
-            Self::separator(),
-            Self::item(
+        ];
+        if self.terminal.is_available() {
+            items.push(Self::separator());
+            items.push(Self::item(
                 "context-open-terminal",
                 "⌘",
                 "在系统终端中打开",
@@ -916,8 +926,9 @@ impl ContextMenuView {
                 file_operations_enabled,
                 MenuCommand::OpenTerminal,
                 cx,
-            ),
-        ]
+            ));
+        }
+        items
     }
 }
 

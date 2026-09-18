@@ -11,7 +11,7 @@
     <key>CFBundleIconFile</key>
     <string>FlowFile</string>
     <key>CFBundleIdentifier</key>
-    <string>com.flowfile.app</string>
+    <string>cc.bso.flowfile</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -26,6 +26,8 @@
     <string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSDesktopFolderUsageDescription</key>

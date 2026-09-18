@@ -1,6 +1,6 @@
 use super::tooltip::delayed_tooltip;
 use crate::{
-    actions,
+    actions, distribution,
     models::{AppPreferences, LayoutMode, Model, MultiPaneModel},
     theme,
 };
@@ -420,12 +420,14 @@ impl Render for PreferencesModal {
                             .child("核心快捷键"),
                     )
                     .child(self.shortcut_row("搜索", ShortcutTarget::Search, search_shortcut, cx))
-                    .child(self.shortcut_row(
-                        "系统终端",
-                        ShortcutTarget::Terminal,
-                        terminal_shortcut,
-                        cx,
-                    ))
+                    .when(!distribution::is_app_store(), |settings| {
+                        settings.child(self.shortcut_row(
+                            "系统终端",
+                            ShortcutTarget::Terminal,
+                            terminal_shortcut,
+                            cx,
+                        ))
+                    })
                     .child(self.shortcut_row(
                         "Quick Look",
                         ShortcutTarget::QuickLook,

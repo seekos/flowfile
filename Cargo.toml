@@ -5,6 +5,13 @@ edition = "2024"
 description = "A multi-pane macOS file manager built with Rust and GPUI"
 license = "MulanPSL-2.0"
 
+[features]
+default = []
+# Builds submitted to the Mac App Store use App Sandbox and deliberately
+# disable direct-update, arbitrary executable, terminal, and scripted mount
+# paths that are only appropriate for the Developer ID distribution.
+app-store = []
+
 [dependencies]
 anyhow = "1"
 async-channel = "2"
@@ -28,18 +35,18 @@ walkdir = "2.5"
 accesskit = "0.24"
 accesskit_macos = "0.26"
 objc2 = "=0.5.2"
-objc2-app-kit = { version = "=0.2.2", features = ["NSApplication", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSImage", "NSPasteboard", "NSResponder", "NSView", "NSWorkspace"] }
-objc2-foundation = { version = "=0.2.2", features = ["NSArray", "NSGeometry", "NSObject", "NSString", "NSThread", "NSURL"] }
+objc2-app-kit = { version = "=0.2.2", features = ["NSApplication", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSImage", "NSOpenPanel", "NSPanel", "NSPasteboard", "NSResponder", "NSSavePanel", "NSView", "NSWindow", "NSWorkspace"] }
+objc2-foundation = { version = "=0.2.2", features = ["NSArray", "NSData", "NSError", "NSGeometry", "NSObject", "NSString", "NSThread", "NSURL"] }
 raw-window-handle = "0.6"
 
 [package.metadata.bundle]
 name = "FlowFile"
-identifier = "com.flowfile.app"
+identifier = "cc.bso.flowfile"
 icon = ["resources/FlowFile.icns"]
 version = "0.1.0"
 category = "Utility"
 short_description = "A high-performance multi-pane file manager for macOS"
-long_description = "FlowFile combines one to four file panes, Spotlight search, Quick Look, and an embedded terminal."
+long_description = "FlowFile combines one to four file panes, Spotlight search, Quick Look, and local file operations."
 copyright = "Copyright © 2026 FlowFile contributors"
 osx_minimum_system_version = "11.0"
 osx_info_plist_exts = ["resources/Info.plist.ext"]

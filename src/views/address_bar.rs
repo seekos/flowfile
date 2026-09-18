@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{
     actions::{CopyFiles, CutFiles, PasteFiles},
+    icons::{IconName, icon},
     models::Model,
     models::Pane,
     theme,
@@ -325,7 +326,7 @@ impl AddressBar {
     fn navigation_button(
         &self,
         id: &'static str,
-        glyph: &'static str,
+        symbol: IconName,
         action: NavigationAction,
         enabled: bool,
     ) -> impl IntoElement {
@@ -341,17 +342,12 @@ impl AddressBar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(29.0))
-            .rounded_sm()
-            .text_size(theme::font(15.0))
-            .text_color(if enabled {
-                theme::text_secondary()
-            } else {
-                theme::text_tertiary().opacity(0.45)
-            })
+            .size(px(28.0))
+            .rounded(px(6.0))
             .tooltip(delayed_tooltip(tooltip))
             .when(enabled, |button| {
                 button
+                    .cursor_pointer()
                     .hover(|style| style.bg(theme::accent_soft()))
                     .on_click(move |_, _, cx| {
                         pane.update(cx, |pane, cx| match action {
@@ -362,7 +358,15 @@ impl AddressBar {
                         });
                     })
             })
-            .child(glyph)
+            .child(icon(
+                symbol,
+                15.0,
+                if enabled {
+                    theme::text_secondary()
+                } else {
+                    theme::text_tertiary().opacity(0.4)
+                },
+            ))
     }
 
     fn edit_path_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -371,17 +375,15 @@ impl AddressBar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(29.0))
-            .rounded_sm()
+            .size(px(28.0))
+            .rounded(px(6.0))
             .cursor_pointer()
-            .text_size(theme::font(13.0))
-            .text_color(theme::text_secondary())
-            .hover(|style| style.bg(theme::accent_soft()).text_color(theme::accent()))
+            .hover(|style| style.bg(theme::accent_soft()))
             .tooltip(delayed_tooltip("编辑路径或连接 SMB 服务器"))
             .on_click(cx.listener(|this, _, window, cx| {
                 this.begin_edit(window, cx);
             }))
-            .child("✎")
+            .child(icon(IconName::Edit, 15.0, theme::text_secondary()))
     }
 
     fn breadcrumb(&self, path: &Path, cx: &mut Context<Self>) -> AnyElement {
@@ -450,7 +452,7 @@ impl AddressBar {
                             div()
                                 .text_size(theme::font(10.0))
                                 .text_color(theme::text_tertiary())
-                                .child("›")
+                                .child(icon(IconName::ChevronRight, 10.0, theme::text_tertiary()))
                                 .into_any_element()
                         });
 
@@ -864,19 +866,19 @@ impl Render for AddressBar {
                     .px_2()
                     .child(self.navigation_button(
                         "navigate-back",
-                        "‹",
+                        IconName::ChevronLeft,
                         NavigationAction::Back,
                         can_go_back,
                     ))
                     .child(self.navigation_button(
                         "navigate-forward",
-                        "›",
+                        IconName::ChevronRight,
                         NavigationAction::Forward,
                         can_go_forward,
                     ))
                     .child(self.navigation_button(
                         "navigate-up",
-                        "↑",
+                        IconName::ArrowUp,
                         NavigationAction::Up,
                         can_go_up,
                     ))
@@ -884,7 +886,7 @@ impl Render for AddressBar {
                     .child(self.edit_path_button(cx))
                     .child(self.navigation_button(
                         "refresh-directory",
-                        "↻",
+                        IconName::Refresh,
                         NavigationAction::Refresh,
                         true,
                     )),

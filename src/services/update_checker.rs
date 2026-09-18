@@ -1,4 +1,5 @@
 use super::FileEngine;
+use crate::distribution;
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 use std::process::Command;
@@ -34,6 +35,9 @@ impl UpdateChecker {
     }
 
     pub async fn check(&self) -> Result<Option<AvailableUpdate>> {
+        if !distribution::allows_direct_updates() {
+            return Ok(None);
+        }
         let current_version = self.current_version.clone();
         self.runtime
             .spawn_blocking(move || check_latest_release(&current_version))

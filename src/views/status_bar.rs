@@ -108,8 +108,10 @@ impl Render for StatusBar {
                             .w(relative(progress))
                             .bg(if transfer.running {
                                 theme::accent()
-                            } else {
+                            } else if transfer.completed_successfully {
                                 theme::file_green()
+                            } else {
+                                theme::danger()
                             }),
                     ),
                 )
@@ -122,14 +124,31 @@ impl Render for StatusBar {
                         .px_3()
                         .text_size(theme::font(9.0))
                         .text_color(theme::text_secondary())
-                        .child(if transfer.running { "●" } else { "✓" })
-                        .child(format!(
-                            "{} · {} · {:.0}% · {}/s",
-                            mode,
-                            transfer.current_file,
-                            progress * 100.0,
-                            format_size(transfer.speed_bytes_per_second)
-                        )),
+                        .child(if transfer.running {
+                            "●"
+                        } else if transfer.completed_successfully {
+                            "✓"
+                        } else {
+                            "!"
+                        })
+                        .child(if transfer.running {
+                            format!(
+                                "{} · {} · {:.0}% · {}/s",
+                                mode,
+                                transfer.current_file,
+                                progress * 100.0,
+                                format_size(transfer.speed_bytes_per_second)
+                            )
+                        } else if transfer.completed_successfully {
+                            format!("{} · {} · 100% · 已完成", mode, transfer.current_file)
+                        } else {
+                            format!(
+                                "{} · {} · {:.0}% · 失败",
+                                mode,
+                                transfer.current_file,
+                                progress * 100.0
+                            )
+                        }),
                 )
             })
             .when_some(inspector_metadata, |bar, metadata| {
@@ -216,23 +235,25 @@ impl Render for StatusBar {
                     )
                     .child(activity_label)
                     .child(layout_label)
-                    .child(
-                        div()
-                            .id("status-open-system-terminal")
-                            .flex()
-                            .items_center()
-                            .h(px(20.0))
-                            .px_2()
-                            .rounded_sm()
-                            .bg(theme::surface())
-                            .text_color(theme::text_secondary())
-                            .hover(|style| style.bg(theme::accent_soft()))
-                            .tooltip(delayed_tooltip("在系统终端中打开当前文件夹 (⌘`)"))
-                            .on_click(move |_, _, _| {
-                                terminal.open(terminal_path.clone());
-                            })
-                            .child(">_ 系统终端"),
-                    ),
+                    .when(self.terminal.is_available(), |status| {
+                        status.child(
+                            div()
+                                .id("status-open-system-terminal")
+                                .flex()
+                                .items_center()
+                                .h(px(20.0))
+                                .px_2()
+                                .rounded_sm()
+                                .bg(theme::surface())
+                                .text_color(theme::text_secondary())
+                                .hover(|style| style.bg(theme::accent_soft()))
+                                .tooltip(delayed_tooltip("在系统终端中打开当前文件夹 (⌘`)"))
+                                .on_click(move |_, _, _| {
+                                    terminal.open(terminal_path.clone());
+                                })
+                                .child(">_ 系统终端"),
+                        )
+                    }),
             )
     }
 }
