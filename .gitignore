@@ -2,3 +2,11 @@
 *.log
 .DS_Store
 dist/
+.env
+.env.*
+.idea/
+.vscode/
+*.swp
+*.p12
+*.mobileprovision
+*.xcuserstate
