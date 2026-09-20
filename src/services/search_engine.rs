@@ -136,10 +136,7 @@ fn spotlight_search(
 
 fn spotlight_name_pattern(query: &str) -> String {
     let mut pattern = String::from("*");
-    for (index, character) in query.trim().chars().enumerate() {
-        if index > 0 {
-            pattern.push('*');
-        }
+    for character in query.trim().chars() {
         if matches!(character, '\\' | '"' | '*' | '?') {
             pattern.push('\\');
         }
@@ -225,32 +222,8 @@ fn fuzzy_score(candidate: &str, query: &str) -> Option<i32> {
     if query.is_empty() {
         return Some(0);
     }
-    if let Some(index) = candidate.find(&query) {
-        return Some(10_000 - index as i32 * 8 - candidate.len() as i32);
-    }
-
-    let mut score = 0_i32;
-    let mut last_index = None;
-    let chars = candidate.chars().collect::<Vec<_>>();
-    let mut cursor = 0;
-    for needle in query.chars() {
-        let relative = chars[cursor..].iter().position(|value| *value == needle)?;
-        let index = cursor + relative;
-        score += 120;
-        if let Some(previous) = last_index {
-            score -= (index - previous - 1) as i32 * 7;
-        }
-        if index == 0
-            || chars
-                .get(index.wrapping_sub(1))
-                .is_some_and(|value| matches!(value, '-' | '_' | ' ' | '.'))
-        {
-            score += 40;
-        }
-        last_index = Some(index);
-        cursor = index + 1;
-    }
-    Some(score - candidate.len() as i32)
+    let index = candidate.find(&query)?;
+    Some(10_000 - index as i32 * 8 - candidate.len() as i32)
 }
 
 fn is_hidden_entry(entry: &DirEntry) -> bool {
@@ -263,10 +236,15 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     #[test]
-    fn contiguous_matches_rank_above_sparse_matches() {
-        let contiguous = fuzzy_score("flowfile-search.rs", "search").unwrap();
-        let sparse = fuzzy_score("some_rare_archive.rs", "search").unwrap();
-        assert!(contiguous > sparse);
+    fn contiguous_matches_rank_prefixes_above_later_occurrences() {
+        let prefix = fuzzy_score("search-results.rs", "search").unwrap();
+        let later = fuzzy_score("flowfile-search.rs", "search").unwrap();
+        assert!(prefix > later);
+    }
+
+    #[test]
+    fn rejects_sparse_character_matches() {
+        assert_eq!(fuzzy_score("some_rare_archive.rs", "search"), None);
     }
 
     #[test]
@@ -275,9 +253,9 @@ mod tests {
     }
 
     #[test]
-    fn spotlight_pattern_requests_ordered_character_matches() {
-        assert_eq!(spotlight_name_pattern(" lcapi "), "*l*c*a*p*i*");
-        assert_eq!(spotlight_name_pattern(r#"a*?\"b"#), r#"*a*\**\?*\\*\"*b*"#);
+    fn spotlight_pattern_requests_contiguous_name_matches() {
+        assert_eq!(spotlight_name_pattern(" lcapi "), "*lcapi*");
+        assert_eq!(spotlight_name_pattern(r#"a*?\"b"#), r#"*a\*\?\\\"b*"#);
     }
 
     #[test]

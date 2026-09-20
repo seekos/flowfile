@@ -499,6 +499,10 @@ impl Pane {
         let show_hidden = self.show_hidden;
         let cancellation = Arc::new(AtomicBool::new(false));
         self.search_cancellation = Some(cancellation.clone());
+        self.items.clear();
+        self.search_result_count = 0;
+        self.selected_index = None;
+        self.selected_indices.clear();
         self.is_loading = true;
         self.error_message = None;
         cx.notify();

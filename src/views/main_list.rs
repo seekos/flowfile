@@ -2080,7 +2080,7 @@ impl Render for MainListView {
                     }
                 }));
         }
-        let (items, rename_index, sort_mode, is_loading, view_mode, search_active) = {
+        let (items, rename_index, sort_mode, is_loading, view_mode, show_absolute_path) = {
             let pane = self.pane.read(cx);
             (
                 pane.items.clone(),
@@ -2088,7 +2088,7 @@ impl Render for MainListView {
                 pane.sort_mode,
                 pane.is_loading,
                 pane.view_mode,
-                pane.search_active,
+                pane.search_active && !pane.search_query.trim().is_empty(),
             )
         };
         let key_context = if rename_index.is_some() {
@@ -2175,7 +2175,7 @@ impl Render for MainListView {
                                     rename_buffer,
                                     selected_paths,
                                     thumbnail,
-                                    search_active,
+                                    show_absolute_path,
                                     cx.entity(),
                                 )
                             })
@@ -2251,7 +2251,7 @@ impl Render for MainListView {
             }
         };
 
-        let details_width = self.detail_column_widths.total(search_active);
+        let details_width = self.detail_column_widths.total(show_absolute_path);
         let details_header = if view_mode == ViewMode::Details {
             let name = self.detail_column_header(
                 "名称",
@@ -2281,7 +2281,7 @@ impl Render for MainListView {
                 sort_mode,
                 cx,
             );
-            let absolute_path = search_active.then(|| {
+            let absolute_path = show_absolute_path.then(|| {
                 self.detail_column_header(
                     "绝对路径",
                     DetailColumn::AbsolutePath,
