@@ -171,8 +171,18 @@ dmg_stage=$(mktemp -d "${TMPDIR:-/tmp}/flowfile-dmg.XXXXXX")
 cp -R "${app_path}" "${dmg_stage}/FlowFile.app"
 ln -s /Applications "${dmg_stage}/Applications"
 dmg_path=${dist_dir}/FlowFile-${version}.dmg
-/usr/bin/hdiutil create -volname "FlowFile" -srcfolder "${dmg_stage}" \
-    -ov -format UDZO "${dmg_path}"
+if [[ -e "${dmg_path}" ]]; then
+    /bin/rm -f "${dmg_path}"
+fi
+if /usr/sbin/diskutil image create from --help >/dev/null 2>&1; then
+    /usr/sbin/diskutil image create from \
+        --format UDZO \
+        --volumeName "FlowFile" \
+        "${dmg_stage}" "${dmg_path}"
+else
+    /usr/bin/hdiutil create -volname "FlowFile" -srcfolder "${dmg_stage}" \
+        -format UDZO "${dmg_path}"
+fi
 /bin/rm -R "${dmg_stage}"
 
 if [[ -n "${FLOWFILE_NOTARY_PROFILE:-}" ]]; then

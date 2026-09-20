@@ -449,8 +449,9 @@ async fn discover_volume_paths(root: PathBuf, volumes_directory: PathBuf) -> Res
         .unwrap_or_else(|_| root.clone());
     let mut seen = HashSet::from([root_identity]);
     let mut volumes = vec![root];
+    let recovery_volume = volumes_directory.join("Recovery");
 
-    if let Ok(mut entries) = tokio::fs::read_dir(volumes_directory).await {
+    if let Ok(mut entries) = tokio::fs::read_dir(&volumes_directory).await {
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();
             if name.to_string_lossy().starts_with('.') {
@@ -458,6 +459,9 @@ async fn discover_volume_paths(root: PathBuf, volumes_directory: PathBuf) -> Res
             }
 
             let path = entry.path();
+            if path == recovery_volume {
+                continue;
+            }
             let is_directory = tokio::fs::metadata(&path)
                 .await
                 .map(|metadata| metadata.is_dir())
@@ -573,6 +577,24 @@ mod tests {
         fs::create_dir(&external).expect("create external volume");
         std::os::unix::fs::symlink(&root, volumes_directory.join("Macintosh HD"))
             .expect("create system volume alias");
+
+        let volumes = discover_volume_paths(root.clone(), volumes_directory)
+            .await
+            .expect("discover volumes");
+
+        assert_eq!(volumes, vec![root, external]);
+    }
+
+    #[tokio::test]
+    async fn volume_discovery_hides_recovery_volume() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().join("system-root");
+        let volumes_directory = directory.path().join("Volumes");
+        let external = volumes_directory.join("External SSD");
+        fs::create_dir(&root).expect("create root");
+        fs::create_dir(&volumes_directory).expect("create volumes directory");
+        fs::create_dir(volumes_directory.join("Recovery")).expect("create recovery volume");
+        fs::create_dir(&external).expect("create external volume");
 
         let volumes = discover_volume_paths(root.clone(), volumes_directory)
             .await

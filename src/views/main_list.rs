@@ -41,6 +41,7 @@ enum DetailColumn {
     Kind,
     Size,
     Modified,
+    AbsolutePath,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +50,7 @@ struct DetailColumnWidths {
     kind: f32,
     size: f32,
     modified: f32,
+    absolute_path: f32,
 }
 
 impl Default for DetailColumnWidths {
@@ -58,6 +60,7 @@ impl Default for DetailColumnWidths {
             kind: 84.0,
             size: 90.0,
             modified: 128.0,
+            absolute_path: 320.0,
         }
     }
 }
@@ -69,6 +72,7 @@ impl DetailColumnWidths {
             DetailColumn::Kind => self.kind,
             DetailColumn::Size => self.size,
             DetailColumn::Modified => self.modified,
+            DetailColumn::AbsolutePath => self.absolute_path,
         }
     }
 
@@ -78,6 +82,7 @@ impl DetailColumnWidths {
             DetailColumn::Kind => 64.0,
             DetailColumn::Size => 68.0,
             DetailColumn::Modified => 104.0,
+            DetailColumn::AbsolutePath => 160.0,
         }
     }
 
@@ -88,11 +93,21 @@ impl DetailColumnWidths {
             DetailColumn::Kind => self.kind = width,
             DetailColumn::Size => self.size = width,
             DetailColumn::Modified => self.modified = width,
+            DetailColumn::AbsolutePath => self.absolute_path = width,
         }
     }
 
-    fn total(self) -> f32 {
-        DETAILS_ICON_WIDTH + self.name + self.kind + self.size + self.modified
+    fn total(self, show_absolute_path: bool) -> f32 {
+        DETAILS_ICON_WIDTH
+            + self.name
+            + self.kind
+            + self.size
+            + self.modified
+            + if show_absolute_path {
+                self.absolute_path
+            } else {
+                0.0
+            }
     }
 }
 
@@ -1156,9 +1171,11 @@ impl MainListView {
         rename_buffer: String,
         selected_paths: Vec<std::path::PathBuf>,
         thumbnail: Option<Arc<RenderImage>>,
+        show_absolute_path: bool,
         input_entity: Entity<Self>,
     ) -> AnyElement {
         let formatted_size = item.formatted_size();
+        let absolute_path = item.path.display().to_string();
         let is_folder = item.is_dir;
         let widths = self.detail_column_widths;
         let pane = self.pane.clone();
@@ -1191,7 +1208,7 @@ impl MainListView {
             .id(("file-row", index))
             .flex()
             .items_center()
-            .w(px(widths.total()))
+            .w(px(widths.total(show_absolute_path)))
             .flex_shrink_0()
             .h(px(40.0))
             .border_b_1()
@@ -1335,6 +1352,21 @@ impl MainListView {
                     .text_color(theme::text_secondary())
                     .child(item.modified),
             )
+            .when(show_absolute_path, |row| {
+                row.child(
+                    div()
+                        .id(("absolute-path", index))
+                        .flex_shrink_0()
+                        .w(px(widths.absolute_path))
+                        .px_2()
+                        .truncate()
+                        .text_left()
+                        .text_size(theme::font(10.0))
+                        .text_color(theme::text_secondary())
+                        .tooltip(delayed_tooltip(absolute_path.clone()))
+                        .child(absolute_path),
+                )
+            })
             .into_any_element()
     }
 
@@ -2048,7 +2080,7 @@ impl Render for MainListView {
                     }
                 }));
         }
-        let (items, rename_index, sort_mode, is_loading, view_mode) = {
+        let (items, rename_index, sort_mode, is_loading, view_mode, search_active) = {
             let pane = self.pane.read(cx);
             (
                 pane.items.clone(),
@@ -2056,6 +2088,7 @@ impl Render for MainListView {
                 pane.sort_mode,
                 pane.is_loading,
                 pane.view_mode,
+                pane.search_active,
             )
         };
         let key_context = if rename_index.is_some() {
@@ -2142,6 +2175,7 @@ impl Render for MainListView {
                                     rename_buffer,
                                     selected_paths,
                                     thumbnail,
+                                    search_active,
                                     cx.entity(),
                                 )
                             })
@@ -2217,7 +2251,7 @@ impl Render for MainListView {
             }
         };
 
-        let details_width = self.detail_column_widths.total();
+        let details_width = self.detail_column_widths.total(search_active);
         let details_header = if view_mode == ViewMode::Details {
             let name = self.detail_column_header(
                 "名称",
@@ -2247,6 +2281,15 @@ impl Render for MainListView {
                 sort_mode,
                 cx,
             );
+            let absolute_path = search_active.then(|| {
+                self.detail_column_header(
+                    "绝对路径",
+                    DetailColumn::AbsolutePath,
+                    None,
+                    sort_mode,
+                    cx,
+                )
+            });
             Some(
                 div()
                     .flex()
@@ -2263,6 +2306,9 @@ impl Render for MainListView {
                     .child(kind)
                     .child(size)
                     .child(modified)
+                    .when_some(absolute_path, |header, absolute_path| {
+                        header.child(absolute_path)
+                    })
                     .child(div().min_w_0().flex_1()),
             )
         } else {
@@ -2272,23 +2318,6 @@ impl Render for MainListView {
         let this = cx.weak_entity();
 
         div()
-            .on_children_prepainted(move |bounds, _, cx| {
-                if let Some(bounds) = bounds.last() {
-                    *viewport_bounds.borrow_mut() = Some(*bounds);
-                    if view_mode == ViewMode::Grid {
-                        let columns = grid_columns_for_width(bounds.size.width);
-                        let this = this.clone();
-                        cx.defer(move |cx| {
-                            let _ = this.update(cx, |this, cx| {
-                                if this.grid_columns != columns {
-                                    this.grid_columns = columns;
-                                    cx.notify();
-                                }
-                            });
-                        });
-                    }
-                }
-            })
             .id("main-file-list")
             .key_context(key_context)
             .relative()
@@ -2330,6 +2359,27 @@ impl Render for MainListView {
             .when_some(details_header, |root, header| root.child(header))
             .child(
                 div()
+                    .on_children_prepainted(move |bounds, _, cx| {
+                        // The first child is always the uniform-list body. Capture its
+                        // bounds instead of the root's last child: details mode also has
+                        // an absolute right-side hit layer, whose bounds are not the list
+                        // viewport and would offset/clamp the marquee overlay.
+                        if let Some(bounds) = bounds.first() {
+                            *viewport_bounds.borrow_mut() = Some(*bounds);
+                            if view_mode == ViewMode::Grid {
+                                let columns = grid_columns_for_width(bounds.size.width);
+                                let this = this.clone();
+                                cx.defer(move |cx| {
+                                    let _ = this.update(cx, |this, cx| {
+                                        if this.grid_columns != columns {
+                                            this.grid_columns = columns;
+                                            cx.notify();
+                                        }
+                                    });
+                                });
+                            }
+                        }
+                    })
                     .id("file-list-scroll")
                     .relative()
                     .flex()
@@ -2487,6 +2537,7 @@ mod grid_name_tests {
     fn detail_columns_resize_independently_and_keep_minimum_widths() {
         let mut widths = DetailColumnWidths::default();
         let original_kind = widths.kind;
+        let directory_width = widths.total(false);
 
         widths.resize(DetailColumn::Name, 24.0);
         assert_eq!(widths.name, 174.0);
@@ -2494,6 +2545,17 @@ mod grid_name_tests {
 
         widths.resize(DetailColumn::Size, -500.0);
         assert_eq!(widths.size, DetailColumnWidths::minimum(DetailColumn::Size));
+
+        widths.resize(DetailColumn::AbsolutePath, -500.0);
+        assert_eq!(
+            widths.absolute_path,
+            DetailColumnWidths::minimum(DetailColumn::AbsolutePath)
+        );
+        assert_eq!(
+            widths.total(true),
+            directory_width + 24.0 - (90.0 - DetailColumnWidths::minimum(DetailColumn::Size))
+                + widths.absolute_path
+        );
     }
 
     #[test]
