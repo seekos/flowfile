@@ -39,6 +39,7 @@ objc2 = "=0.5.2"
 objc2-app-kit = { version = "=0.2.2", features = ["NSApplication", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSImage", "NSOpenPanel", "NSPanel", "NSPasteboard", "NSResponder", "NSSavePanel", "NSView", "NSWindow", "NSWorkspace"] }
 objc2-foundation = { version = "=0.2.2", features = ["NSArray", "NSData", "NSError", "NSGeometry", "NSObject", "NSString", "NSThread", "NSURL"] }
 raw-window-handle = "0.6"
+security-framework = "3.7"
 
 [package.metadata.bundle]
 name = "FlowFile"

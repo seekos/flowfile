@@ -3,7 +3,7 @@ use crate::{
     models::{
         Favorites, FileDragPayload, FileOperationController, Model, MultiPaneModel, home_directory,
     },
-    services::{FileEngine, FileWatcher, TransferMode, VolumeInfo},
+    services::{FileEngine, FileWatcher, SmbMountInfo, TransferMode, VolumeInfo},
     theme,
 };
 use gpui::{
@@ -11,7 +11,7 @@ use gpui::{
     div, prelude::*, px,
 };
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -22,6 +22,8 @@ struct SidebarLocation {
     label: String,
     path: PathBuf,
     detail: Option<String>,
+    navigation_address: Option<String>,
+    eject_paths: Vec<PathBuf>,
 }
 
 pub struct SidebarView {
@@ -67,6 +69,8 @@ impl SidebarView {
             label: label.to_string(),
             path,
             detail: None,
+            navigation_address: None,
+            eject_paths: Vec::new(),
         })
         .collect();
 
@@ -135,15 +139,7 @@ impl SidebarView {
                         && !self.ntfs_mount_failures.contains(&volume.path)
                 })
                 .map(|volume| volume.path.clone());
-            let volumes = paths
-                .into_iter()
-                .map(|volume| SidebarLocation {
-                    icon: "◉",
-                    label: volume_label(&volume.path),
-                    detail: volume.status_label().map(str::to_string),
-                    path: volume.path,
-                })
-                .collect::<Vec<_>>();
+            let volumes = sidebar_locations_for_volumes(paths, FileEngine::mounted_smb_for_path);
             if self.volumes != volumes {
                 self.volumes = volumes;
                 cx.notify();
@@ -208,11 +204,14 @@ impl SidebarView {
             .child(title)
     }
 
-    fn eject_volume(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !self.ejecting_volumes.insert(path.clone()) {
+    fn eject_location(&mut self, location: SidebarLocation, cx: &mut Context<Self>) {
+        let identity = location.path.clone();
+        if !self.ejecting_volumes.insert(identity.clone()) {
             return;
         }
-        let label = volume_label(&path);
+        let label = location.label.clone();
+        let paths = location.eject_paths.clone();
+        let navigation_address = location.navigation_address.clone();
         self.operations.update(cx, |operations, cx| {
             operations.show_notice(format!("正在弹出 {label}…"), false, cx);
         });
@@ -221,31 +220,57 @@ impl SidebarView {
         let engine = self.engine.clone();
         let operations = self.operations.clone();
         cx.spawn(async move |this, cx| {
-            let result = engine.eject_volume(path.clone()).await;
+            let mut ejected_paths = Vec::new();
+            let mut first_error = None;
+            for path in paths {
+                match engine.eject_volume(path.clone()).await {
+                    Ok(()) => ejected_paths.push(path),
+                    Err(error) if first_error.is_none() => first_error = Some(error),
+                    Err(_) => {}
+                }
+            }
             let _ = this.update(cx, |sidebar, cx| {
-                sidebar.ejecting_volumes.remove(&path);
-                match result {
-                    Ok(()) => {
-                        let fallback = home_directory();
-                        let panes = sidebar.model.read(cx).panes.clone();
-                        for pane in panes {
-                            if pane.read(cx).current_path.starts_with(&path) {
-                                let server_address = pane.read(cx).smb_server_for_mount(&path);
-                                pane.update(cx, |pane, cx| {
-                                    if let Some(server_address) = server_address {
-                                        pane.navigate_to_address(server_address, cx);
-                                    } else {
-                                        pane.navigate_to(fallback.clone(), cx);
-                                    }
-                                });
-                            }
+                sidebar.ejecting_volumes.remove(&identity);
+                let disconnect_server = navigation_address.is_some() && first_error.is_none();
+                if !ejected_paths.is_empty() {
+                    let fallback = home_directory();
+                    let panes = sidebar.model.read(cx).panes.clone();
+                    for pane in panes {
+                        let pane_state = pane.read(cx);
+                        let active_ejected_mount = ejected_paths
+                            .iter()
+                            .find(|path| pane_state.current_path.starts_with(path));
+                        let pane_server = smb_server_address(&pane_state.display_path());
+                        let ejecting_server = disconnect_server
+                            && navigation_address
+                                .as_ref()
+                                .is_some_and(|address| pane_server.as_ref() == Some(address));
+                        let server_address = if navigation_address.is_none() {
+                            active_ejected_mount
+                                .and_then(|path| pane_state.smb_server_for_mount(path))
+                        } else {
+                            None
+                        };
+                        let should_leave_mount = active_ejected_mount.is_some() || ejecting_server;
+                        if should_leave_mount {
+                            pane.update(cx, |pane, cx| {
+                                if let Some(server_address) = server_address.clone() {
+                                    pane.navigate_to_address(server_address, cx);
+                                } else {
+                                    pane.navigate_to(fallback.clone(), cx);
+                                }
+                            });
                         }
+                    }
+                }
+                match first_error {
+                    None => {
                         operations.update(cx, |operations, cx| {
                             operations.show_notice(format!("已弹出 {label}"), false, cx);
                         });
-                        sidebar.volumes.retain(|volume| volume.path != path);
+                        sidebar.volumes.retain(|volume| volume.path != identity);
                     }
-                    Err(error) => operations.update(cx, |operations, cx| {
+                    Some(error) => operations.update(cx, |operations, cx| {
                         operations.show_notice(error.to_string(), true, cx);
                     }),
                 }
@@ -290,15 +315,23 @@ impl SidebarView {
         let model = self.model.clone();
         let operations = self.operations.clone();
         let path = location.path.clone();
+        let navigation_address = location.navigation_address.clone();
+        let accepts_drop = navigation_address.is_none();
         let drop_path = path.clone();
         let external_drop_path = path.clone();
         let external_operations = self.operations.clone();
-        let tooltip = format!("在当前面板中打开 {}", path.display());
-        let label: SharedString = location.label.into();
-        let detail = location.detail.map(SharedString::from);
+        let tooltip = if let Some(address) = &navigation_address {
+            format!("在当前面板中打开 {address}")
+        } else {
+            format!("在当前面板中打开 {}", path.display())
+        };
+        let label_text = location.label.clone();
+        let label: SharedString = label_text.clone().into();
+        let detail = location.detail.clone().map(SharedString::from);
         let favorite_path = location.path.clone();
-        let eject_path = location.path.clone();
-        let is_ejecting = self.ejecting_volumes.contains(&eject_path);
+        let eject_identity = location.path.clone();
+        let eject_location = location.clone();
+        let is_ejecting = self.ejecting_volumes.contains(&eject_identity);
         let hover_group: SharedString = format!("sidebar-location-{id}").into();
 
         div()
@@ -324,45 +357,58 @@ impl SidebarView {
             })
             .hover(|style| style.bg(theme::surface().opacity(0.8)))
             .tooltip(delayed_tooltip(tooltip))
-            .drag_over::<FileDragPayload>(|style, _, _, _| {
-                style.bg(theme::accent_soft()).text_color(theme::accent())
-            })
-            .on_drop(move |payload: &FileDragPayload, window, cx| {
-                let mode = if window.modifiers().alt {
-                    TransferMode::Copy
-                } else {
-                    TransferMode::Move
-                };
-                operations.update(cx, |operations, cx| {
-                    operations.transfer_to_path(payload.paths.clone(), drop_path.clone(), mode, cx);
-                });
-            })
-            .drag_over::<ExternalPaths>(|style, _, _, _| {
-                style.bg(theme::accent_soft()).text_color(theme::accent())
-            })
-            .on_drop(move |payload: &ExternalPaths, window, cx| {
-                let paths = payload.paths().to_vec();
-                if paths.iter().all(|path| {
-                    path == &external_drop_path
-                        || path.parent() == Some(external_drop_path.as_path())
-                }) {
-                    return;
-                }
-                let mode = if window.modifiers().alt {
-                    TransferMode::Copy
-                } else {
-                    TransferMode::Move
-                };
-                external_operations.update(cx, |operations, cx| {
-                    operations.transfer_to_path(paths, external_drop_path.clone(), mode, cx);
-                });
+            .when(accepts_drop, |item| {
+                item.drag_over::<FileDragPayload>(|style, _, _, _| {
+                    style.bg(theme::accent_soft()).text_color(theme::accent())
+                })
+                .on_drop(move |payload: &FileDragPayload, window, cx| {
+                    let mode = if window.modifiers().alt {
+                        TransferMode::Copy
+                    } else {
+                        TransferMode::Move
+                    };
+                    operations.update(cx, |operations, cx| {
+                        operations.transfer_to_path(
+                            payload.paths.clone(),
+                            drop_path.clone(),
+                            mode,
+                            cx,
+                        );
+                    });
+                })
+                .drag_over::<ExternalPaths>(|style, _, _, _| {
+                    style.bg(theme::accent_soft()).text_color(theme::accent())
+                })
+                .on_drop(move |payload: &ExternalPaths, window, cx| {
+                    let paths = payload.paths().to_vec();
+                    if paths.iter().all(|path| {
+                        path == &external_drop_path
+                            || path.parent() == Some(external_drop_path.as_path())
+                    }) {
+                        return;
+                    }
+                    let mode = if window.modifiers().alt {
+                        TransferMode::Copy
+                    } else {
+                        TransferMode::Move
+                    };
+                    external_operations.update(cx, |operations, cx| {
+                        operations.transfer_to_path(paths, external_drop_path.clone(), mode, cx);
+                    });
+                })
             })
             .on_click(move |_, _, cx| {
                 let pane = {
                     let model = model.read(cx);
                     model.panes[model.active_pane_index].clone()
                 };
-                pane.update(cx, |pane, cx| pane.navigate_to(path.clone(), cx));
+                pane.update(cx, |pane, cx| {
+                    if let Some(address) = navigation_address.clone() {
+                        pane.navigate_to_address(address, cx);
+                    } else {
+                        pane.navigate_to(path.clone(), cx);
+                    }
+                });
             })
             .child(
                 div()
@@ -431,12 +477,12 @@ impl SidebarView {
                         .tooltip(delayed_tooltip(if is_ejecting {
                             "正在弹出…".to_string()
                         } else {
-                            format!("弹出 {}", volume_label(&eject_path))
+                            format!("弹出 {label_text}")
                         }))
                         .child(if is_ejecting { "…" } else { "⏏" })
                         .on_click(cx.listener(move |sidebar, _, _, cx| {
                             cx.stop_propagation();
-                            sidebar.eject_volume(eject_path.clone(), cx);
+                            sidebar.eject_location(eject_location.clone(), cx);
                         })),
                 )
             })
@@ -445,12 +491,19 @@ impl SidebarView {
 
 impl Render for SidebarView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let current_path = {
+        let (current_path, current_smb_server, connected_smb_servers) = {
             let model = self.model.read(cx);
-            model.panes[model.active_pane_index]
-                .read(cx)
-                .current_path
-                .clone()
+            let pane = model.panes[model.active_pane_index].read(cx);
+            let connected_smb_servers = model
+                .panes
+                .iter()
+                .filter_map(|pane| smb_server_address(&pane.read(cx).display_path()))
+                .collect::<BTreeSet<_>>();
+            (
+                pane.current_path.clone(),
+                smb_server_address(&pane.display_path()),
+                connected_smb_servers,
+            )
         };
         let quick_access = self.quick_access.clone();
         let favorites = self
@@ -468,9 +521,27 @@ impl Render for SidebarView {
                     .to_string(),
                 path: path.clone(),
                 detail: None,
+                navigation_address: None,
+                eject_paths: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let volumes = self.volumes.clone();
+        let mut volumes = self.volumes.clone();
+        for address in connected_smb_servers {
+            if volumes
+                .iter()
+                .any(|location| location.navigation_address.as_ref() == Some(&address))
+            {
+                continue;
+            }
+            volumes.push(SidebarLocation {
+                icon: "◉",
+                label: smb_server_label(&address),
+                path: PathBuf::from(&address),
+                detail: Some("SMB · 网络服务器".to_string()),
+                navigation_address: Some(address),
+                eject_paths: Vec::new(),
+            });
+        }
 
         div()
             .flex()
@@ -506,7 +577,7 @@ impl Render for SidebarView {
                 let is_active = current_path == location.path;
                 self.item(50 + index, location, is_active, true, false, cx)
             }))
-            .child(Self::section_title("卷"))
+            .child(Self::section_title("位置"))
             .when(self.volumes_loading, |sidebar| {
                 sidebar.child(
                     div()
@@ -517,8 +588,12 @@ impl Render for SidebarView {
                 )
             })
             .children(volumes.into_iter().enumerate().map(|(index, location)| {
-                let is_active = current_path == location.path;
-                let can_eject = location.path.starts_with(Path::new("/Volumes"));
+                let is_active = location
+                    .navigation_address
+                    .as_ref()
+                    .is_some_and(|address| current_smb_server.as_ref() == Some(address))
+                    || current_path == location.path;
+                let can_eject = !location.eject_paths.is_empty();
                 self.item(100 + index, location, is_active, false, can_eject, cx)
             }))
             .child(
@@ -536,6 +611,75 @@ impl Render for SidebarView {
     }
 }
 
+fn sidebar_locations_for_volumes(
+    volumes: Vec<VolumeInfo>,
+    mut mounted_smb_for_path: impl FnMut(&Path) -> Option<SmbMountInfo>,
+) -> Vec<SidebarLocation> {
+    let mut locations = Vec::new();
+    let mut smb_servers = BTreeMap::<String, Vec<PathBuf>>::new();
+
+    for volume in volumes {
+        if volume.is_smb()
+            && let Some(mount) = mounted_smb_for_path(&volume.path)
+        {
+            smb_servers
+                .entry(mount.server_address)
+                .or_default()
+                .push(volume.path);
+            continue;
+        }
+
+        let eject_paths = if volume.path.starts_with(Path::new("/Volumes")) {
+            vec![volume.path.clone()]
+        } else {
+            Vec::new()
+        };
+        locations.push(SidebarLocation {
+            icon: "◉",
+            label: volume_label(&volume.path),
+            detail: volume.status_label().map(str::to_string),
+            path: volume.path,
+            navigation_address: None,
+            eject_paths,
+        });
+    }
+
+    locations.extend(smb_servers.into_iter().map(|(address, mut mount_paths)| {
+        mount_paths.sort();
+        mount_paths.dedup();
+        SidebarLocation {
+            icon: "◉",
+            label: smb_server_label(&address),
+            path: PathBuf::from(&address),
+            detail: Some("SMB · 网络服务器".to_string()),
+            navigation_address: Some(address),
+            eject_paths: mount_paths,
+        }
+    }));
+    locations
+}
+
+fn smb_server_address(address: &str) -> Option<String> {
+    let remainder = address.strip_prefix("smb://")?;
+    let authority = remainder.split('/').next()?;
+    let server = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, server)| server);
+    (!server.is_empty()).then(|| format!("smb://{server}"))
+}
+
+fn smb_server_label(address: &str) -> String {
+    address
+        .strip_prefix("smb://")
+        .unwrap_or(address)
+        .rsplit_once('@')
+        .map_or_else(
+            || address.strip_prefix("smb://").unwrap_or(address),
+            |(_, server)| server,
+        )
+        .to_string()
+}
+
 fn volume_label(path: &std::path::Path) -> String {
     if path == std::path::Path::new("/") {
         return "Macintosh HD".to_string();
@@ -544,4 +688,61 @@ fn volume_label(path: &std::path::Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("Volume")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sidebar_locations_for_volumes, smb_server_address};
+    use crate::services::{SmbMountInfo, VolumeInfo};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn smb_shares_from_the_same_server_become_one_sidebar_location() {
+        let volumes = vec![
+            VolumeInfo {
+                path: PathBuf::from("/"),
+                filesystem: "apfs".to_string(),
+                read_only: false,
+            },
+            VolumeInfo {
+                path: PathBuf::from("/Volumes/Design"),
+                filesystem: "smbfs".to_string(),
+                read_only: false,
+            },
+            VolumeInfo {
+                path: PathBuf::from("/Volumes/Media"),
+                filesystem: "smbfs".to_string(),
+                read_only: false,
+            },
+        ];
+
+        let locations = sidebar_locations_for_volumes(volumes, |path| {
+            let share_name = path.file_name()?.to_str()?.to_string();
+            Some(SmbMountInfo {
+                server_address: "smb://nas.local".to_string(),
+                share_name,
+                mount_path: path.to_path_buf(),
+            })
+        });
+
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[1].label, "nas.local");
+        assert_eq!(
+            locations[1].navigation_address.as_deref(),
+            Some("smb://nas.local")
+        );
+        assert_eq!(
+            locations[1].eject_paths,
+            [Path::new("/Volumes/Design"), Path::new("/Volumes/Media")]
+        );
+    }
+
+    #[test]
+    fn active_smb_path_resolves_to_its_server_without_user_or_share() {
+        assert_eq!(
+            smb_server_address("smb://office;alice@nas.local/Media/Movies").as_deref(),
+            Some("smb://nas.local")
+        );
+        assert_eq!(smb_server_address("/Users/zy"), None);
+    }
 }

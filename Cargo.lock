@@ -1755,6 +1755,7 @@ dependencies = [
  "open",
  "raw-window-handle",
  "rayon",
+ "security-framework",
  "serde",
  "serde_json",
  "smallvec",

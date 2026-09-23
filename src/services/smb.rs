@@ -1,9 +1,13 @@
+use super::smb_credentials;
 use anyhow::{Context as _, Result};
 use std::{
-    io::Write as _,
+    io::{Read as _, Write as _},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
+use zeroize::Zeroize as _;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SmbLocation {
@@ -55,6 +59,49 @@ on run argv
 end run
 "#;
 
+const SMB_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+const SMB_MOUNT_TIMEOUT: Duration = Duration::from_secs(60);
+const EXPECT_SMB_PASSWORD_SCRIPT: &str = r#"
+set timeout 15
+match_max 1000000
+log_user 0
+if {[gets stdin password] < 0} {
+    exit 2
+}
+spawn -noecho $env(FLOWFILE_SMB_PROGRAM) view $env(FLOWFILE_SMB_TARGET)
+set submitted 0
+set captured ""
+while {1} {
+    expect {
+        -nocase -re {password[^:\r\n]*:} {
+            append captured $expect_out(buffer)
+            if {$submitted} {
+                catch {exec /bin/kill -KILL [exp_pid]}
+                catch {close}
+                catch {wait}
+                exit 77
+            }
+            send -- "$password\r"
+            set submitted 1
+        }
+        timeout {
+            catch {exec /bin/kill -KILL [exp_pid]}
+            catch {close}
+            catch {wait}
+            exit 124
+        }
+        eof {
+            append captured $expect_out(buffer)
+            break
+        }
+    }
+}
+set result [wait]
+set captured [string map [list $password ""] $captured]
+send_user -- $captured
+exit [lindex $result 3]
+"#;
+
 pub(crate) fn looks_like_address(input: &str) -> bool {
     let input = input.trim();
     let lower = input.to_ascii_lowercase();
@@ -63,23 +110,124 @@ pub(crate) fn looks_like_address(input: &str) -> bool {
 
 pub(crate) fn connect(input: &str) -> Result<SmbNavigation> {
     let location = parse_location(input)?;
-    if location.share.is_none() {
-        return list_server_shares(&location);
-    }
-    if let Some(mount_path) = find_existing_mount(&location) {
+    if location.share.is_some()
+        && let Some(mount_path) = find_existing_mount(&location)
+    {
         return directory_navigation(&location, mount_path);
     }
 
-    let mount_url = mount_url(&location)?;
-    let output = Command::new("/usr/bin/osascript")
-        .args(["-e", MOUNT_SMB_SCRIPT, "--"])
-        .arg(&mount_url)
-        .output()
-        .context("无法启动 macOS SMB 连接服务")?;
+    let cached_credential = match smb_credentials::load(&location.server) {
+        Ok(credential) => credential,
+        Err(error) => {
+            eprintln!(
+                "FlowFile: 无法读取 {} 的 SMB 钥匙串凭证：{error}",
+                location.server
+            );
+            None
+        }
+    };
+    if let Some(credential) = cached_credential {
+        let suggested_username = credential.username.clone();
+        match authenticated_navigation(&location, &credential.username, &credential.password)? {
+            Some(navigation) => return Ok(navigation),
+            None => {
+                if let Err(error) = smb_credentials::delete(&location.server) {
+                    eprintln!(
+                        "FlowFile: 无法删除 {} 的失效 SMB 凭证：{error}",
+                        location.server
+                    );
+                }
+                return Ok(authentication_required(&location, Some(suggested_username)));
+            }
+        }
+    }
+
+    unauthenticated_navigation(&location)
+}
+
+pub(crate) fn connect_with_credentials(
+    input: &str,
+    username: &str,
+    password: &str,
+) -> Result<SmbNavigation> {
+    let location = parse_location(input)?;
+    let Some(navigation) = authenticated_navigation(&location, username, password)? else {
+        anyhow::bail!("用户名或密码不正确，请重试");
+    };
+    smb_credentials::save(&location.server, username, password)?;
+    Ok(navigation)
+}
+
+fn unauthenticated_navigation(location: &SmbLocation) -> Result<SmbNavigation> {
+    let output = match run_smbutil_view(location, None)? {
+        ShareQuery::Output(output) => output,
+        ShareQuery::AuthenticationRequired => {
+            return Ok(authentication_required(
+                location,
+                username_from_authority(&location.authority),
+            ));
+        }
+    };
+    if location.share.is_none() {
+        server_navigation(location, output)
+    } else {
+        mount_share(location, None)
+    }
+}
+
+fn authenticated_navigation(
+    location: &SmbLocation,
+    username: &str,
+    password: &str,
+) -> Result<Option<SmbNavigation>> {
+    let credentials = SmbCredentials { username, password };
+    let output = match run_smbutil_view(location, Some(credentials))? {
+        ShareQuery::Output(output) => output,
+        ShareQuery::AuthenticationRequired => return Ok(None),
+    };
+    let authenticated_location = location_with_username(location, username);
+    if authenticated_location.share.is_none() {
+        server_navigation(&authenticated_location, output).map(Some)
+    } else {
+        mount_share(&authenticated_location, Some(credentials)).map(Some)
+    }
+}
+
+fn mount_share(
+    location: &SmbLocation,
+    credentials: Option<SmbCredentials<'_>>,
+) -> Result<SmbNavigation> {
+    if let Some(mount_path) = find_existing_mount(location) {
+        return directory_navigation(location, mount_path);
+    }
+    let mount_url = mount_url(location)?;
+    let mut command = Command::new("/usr/bin/osascript");
+    let output = if let Some(credentials) = credentials {
+        // Feed the authenticated mount script over stdin. This keeps the
+        // password out of argv, the environment, temporary files, and logs.
+        let mut script = authenticated_mount_script(&mount_url, credentials);
+        command.arg("-");
+        let output = run_command_with_timeout(
+            &mut command,
+            Some(script.as_bytes()),
+            SMB_MOUNT_TIMEOUT,
+            "连接 SMB 服务器超时，请检查 NAS 地址和网络后重试",
+        );
+        script.zeroize();
+        output?
+    } else {
+        command.args(["-e", MOUNT_SMB_SCRIPT, "--"]).arg(&mount_url);
+        run_command_with_timeout(
+            &mut command,
+            None,
+            SMB_MOUNT_TIMEOUT,
+            "连接 SMB 服务器超时，请检查 NAS 地址和网络后重试",
+        )?
+    };
 
     if !output.status.success() {
-        if let Some(mount_path) = find_existing_mount(&location) {
-            return directory_navigation(&location, mount_path);
+        if let Some(mount_path) = find_existing_mount(location) {
+            return directory_navigation(location, mount_path);
         }
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if message.contains("(-128)") {
@@ -95,22 +243,39 @@ pub(crate) fn connect(input: &str) -> Result<SmbNavigation> {
     let mount_path = returned_path
         .is_dir()
         .then_some(returned_path)
-        .or_else(|| find_existing_mount(&location))
+        .or_else(|| find_existing_mount(location))
         .ok_or_else(|| anyhow::anyhow!("SMB 共享目录已连接，但 macOS 未返回可访问的挂载位置"))?;
 
-    directory_navigation(&location, mount_path)
+    directory_navigation(location, mount_path)
 }
 
-pub(crate) fn connect_with_credentials(
-    input: &str,
-    username: &str,
-    password: &str,
-) -> Result<SmbNavigation> {
-    let location = parse_location(input)?;
-    if location.share.is_some() {
-        return connect(input);
+fn authenticated_mount_script(mount_url: &str, credentials: SmbCredentials<'_>) -> String {
+    format!(
+        "on run\nset networkAddress to {}\nset mountedVolume to mount volume networkAddress as user name {} with password {}\nif mountedVolume is not missing value then\nreturn POSIX path of mountedVolume\nend if\nreturn \"\"\nend run\n",
+        applescript_string_literal(mount_url),
+        applescript_string_literal(credentials.username),
+        applescript_string_literal(credentials.password),
+    )
+}
+
+fn applescript_string_literal(value: &str) -> String {
+    let mut literal = String::with_capacity(value.len() + 2);
+    literal.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            '\n' => literal.push_str("\" & linefeed & \""),
+            '\r' => literal.push_str("\" & return & \""),
+            '\t' => literal.push_str("\" & tab & \""),
+            character if character.is_control() => {
+                literal.push_str(&format!("\" & character id {} & \"", character as u32));
+            }
+            character => literal.push(character),
+        }
     }
-    list_server_shares_with_credentials(&location, username, password)
+    literal.push('"');
+    literal
 }
 
 fn directory_navigation(location: &SmbLocation, mount_path: PathBuf) -> Result<SmbNavigation> {
@@ -126,32 +291,33 @@ fn directory_navigation(location: &SmbLocation, mount_path: PathBuf) -> Result<S
     })
 }
 
-fn list_server_shares(location: &SmbLocation) -> Result<SmbNavigation> {
-    let output = match run_smbutil_view(location, None)? {
-        ShareQuery::Output(output) => output,
-        ShareQuery::AuthenticationRequired => {
-            return Ok(SmbNavigation::AuthenticationRequired {
-                address: format!("smb://{}", location.server),
-                suggested_username: username_from_authority(&location.authority),
-            });
-        }
-    };
-    server_navigation(location, output)
+fn authentication_required(
+    location: &SmbLocation,
+    suggested_username: Option<String>,
+) -> SmbNavigation {
+    SmbNavigation::AuthenticationRequired {
+        address: logical_address(location),
+        suggested_username,
+    }
 }
 
-fn list_server_shares_with_credentials(
-    location: &SmbLocation,
-    username: &str,
-    password: &str,
-) -> Result<SmbNavigation> {
-    let credentials = SmbCredentials { username, password };
-    let output = match run_smbutil_view(location, Some(credentials))? {
-        ShareQuery::Output(output) => output,
-        ShareQuery::AuthenticationRequired => {
-            anyhow::bail!("用户名或密码不正确，请重试");
-        }
-    };
-    server_navigation(location, output)
+fn location_with_username(location: &SmbLocation, username: &str) -> SmbLocation {
+    let mut location = location.clone();
+    location.authority = format!("{}@{}", encode_username(username), location.server);
+    location
+}
+
+fn logical_address(location: &SmbLocation) -> String {
+    let mut address = format!("smb://{}", location.authority);
+    if let Some(share) = &location.share {
+        address.push('/');
+        address.push_str(&percent_encode(share));
+    }
+    for component in location.path_within_share.components() {
+        address.push('/');
+        address.push_str(&percent_encode(&component.as_os_str().to_string_lossy()));
+    }
+    address
 }
 
 fn server_navigation(location: &SmbLocation, output: String) -> Result<SmbNavigation> {
@@ -199,12 +365,18 @@ fn run_smbutil_view(
     let output = if let Some(credentials) = credentials {
         run_smbutil_with_password(&target, credentials.password)?
     } else {
-        Command::new("/usr/bin/smbutil")
-            .args(["view", "-N", "-G"])
-            .arg(target)
-            .output()
-            .context("无法启动 macOS SMB 共享查询服务")?
+        let mut command = Command::new("/usr/bin/smbutil");
+        command.args(["view", "-N", "-G"]).arg(target);
+        run_command_with_timeout(
+            &mut command,
+            None,
+            SMB_QUERY_TIMEOUT,
+            "连接 SMB 服务器超时，请检查 NAS 地址和网络后重试",
+        )?
     };
+    if output.status.code() == Some(124) {
+        anyhow::bail!("连接 SMB 服务器超时，请检查 NAS 地址和网络后重试");
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -228,24 +400,100 @@ fn run_smbutil_view(
 }
 
 fn run_smbutil_with_password(target: &str, password: &str) -> Result<std::process::Output> {
-    // smbutil deliberately reads passwords from a terminal. `script` provides
-    // that terminal while letting FlowFile write the secret through stdin, so
-    // it never appears in argv, the environment, logs, or the session file.
-    let mut child = Command::new("/usr/bin/script")
-        .args(["-q", "/dev/null", "/usr/bin/smbutil", "view"])
-        .arg(target)
-        .stdin(Stdio::piped())
+    run_smbutil_with_password_command(
+        std::path::Path::new("/usr/bin/smbutil"),
+        target,
+        password,
+        SMB_QUERY_TIMEOUT + Duration::from_secs(2),
+    )
+}
+
+fn run_smbutil_with_password_command(
+    program: &std::path::Path,
+    target: &str,
+    password: &str,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    // smbutil requires a terminal for passwords. Expect supplies that terminal,
+    // submits the password once, and treats a second prompt as an authentication
+    // failure instead of waiting forever. The password only travels over stdin;
+    // it is never placed in argv, the environment, logs, or the session file.
+    let mut input = password.as_bytes().to_vec();
+    input.push(b'\n');
+    let mut command = Command::new("/usr/bin/expect");
+    command
+        .args(["-c", EXPECT_SMB_PASSWORD_SCRIPT])
+        .env("FLOWFILE_SMB_PROGRAM", program)
+        .env("FLOWFILE_SMB_TARGET", target);
+    let output = run_command_with_timeout(
+        &mut command,
+        Some(&input),
+        timeout,
+        "SMB 登录超时，请检查 NAS 地址和网络后重试",
+    );
+    input.zeroize();
+    output
+}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    timeout_message: &str,
+) -> Result<Output> {
+    command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("无法启动安全的 SMB 认证终端")?;
-    let mut stdin = child.stdin.take().context("无法打开 SMB 认证输入")?;
-    stdin
-        .write_all(password.as_bytes())
-        .and_then(|_| stdin.write_all(b"\n"))
-        .context("无法提交 SMB 凭据")?;
-    drop(stdin);
-    child.wait_with_output().context("无法等待 SMB 认证完成")
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("无法启动 SMB 系统命令")?;
+
+    let stdout = child.stdout.take().context("无法读取 SMB 命令输出")?;
+    let stderr = child.stderr.take().context("无法读取 SMB 命令错误")?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.take(usize::MAX as u64).read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.take(usize::MAX as u64).read_to_end(&mut bytes);
+        bytes
+    });
+
+    if let Some(input) = stdin {
+        let mut child_stdin = child.stdin.take().context("无法打开 SMB 命令输入")?;
+        child_stdin.write_all(input).context("无法提交 SMB 凭据")?;
+        drop(child_stdin);
+    }
+
+    let started_at = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(timeout_message.to_string());
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("SMB 命令输出读取任务异常终止"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("SMB 命令错误读取任务异常终止"))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn username_from_authority(authority: &str) -> Option<String> {
@@ -557,10 +805,80 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SmbLocation, encode_username, is_authentication_error, looks_like_address, parse_location,
-        parse_matching_mount,
+        SmbCredentials, SmbLocation, SmbNavigation, applescript_string_literal,
+        authenticated_mount_script, authentication_required, encode_username,
+        is_authentication_error, location_with_username, logical_address, looks_like_address,
+        parse_location, parse_matching_mount, run_command_with_timeout,
+        run_smbutil_with_password_command,
     };
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt as _,
+        path::PathBuf,
+        process::Command,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn system_command_timeout_returns_without_waiting_for_the_process() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("5");
+        let started_at = Instant::now();
+        let error =
+            run_command_with_timeout(&mut command, None, Duration::from_millis(50), "测试超时")
+                .expect_err("sleep should be terminated at the deadline");
+
+        assert_eq!(error.to_string(), "测试超时");
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn system_command_runner_captures_output_and_exit_status() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf output; printf error >&2; exit 7"]);
+        let output =
+            run_command_with_timeout(&mut command, None, Duration::from_secs(1), "不应超时")
+                .unwrap();
+
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"output");
+        assert_eq!(output.stderr, b"error");
+    }
+
+    #[test]
+    fn repeated_password_prompt_returns_authentication_failure_without_leaking_password() {
+        let directory = tempfile::tempdir().unwrap();
+        let mock_smbutil = directory.path().join("mock smbutil");
+        fs::write(
+            &mock_smbutil,
+            r#"#!/bin/sh
+printf 'Password: '
+IFS= read -r password
+if [ "$password" = "correct-password" ]; then
+    printf '\nShare                                           Type    Comments\nMedia                                           Disk\n'
+    exit 0
+fi
+printf '\nPassword: '
+IFS= read -r password
+exit 1
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&mock_smbutil, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let started_at = Instant::now();
+        let output = run_smbutil_with_password_command(
+            &mock_smbutil,
+            "//tester@nas.local",
+            "wrong-secret",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert_eq!(output.status.code(), Some(77));
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("wrong-secret"));
+    }
 
     #[test]
     fn parses_smb_url_and_preserves_subdirectory() {
@@ -573,6 +891,80 @@ mod tests {
                 path_within_share: PathBuf::from("Movies/2026"),
             }
         );
+    }
+
+    #[test]
+    fn authentication_prompt_preserves_direct_share_destination() {
+        let location = parse_location("smb://nas.local/My%20Files/photos").expect("valid location");
+
+        assert_eq!(
+            logical_address(&location),
+            "smb://nas.local/My%20Files/photos"
+        );
+        assert_eq!(
+            authentication_required(&location, Some("alice".to_string())),
+            SmbNavigation::AuthenticationRequired {
+                address: "smb://nas.local/My%20Files/photos".to_string(),
+                suggested_username: Some("alice".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn authenticated_location_includes_encoded_username_without_a_password() {
+        let location = parse_location("smb://nas.local/Media").expect("valid location");
+        let authenticated = location_with_username(&location, r"OFFICE\张三");
+
+        assert_eq!(
+            authenticated.authority,
+            "OFFICE;%E5%BC%A0%E4%B8%89@nas.local"
+        );
+        let address = logical_address(&authenticated);
+        assert_eq!(address, "smb://OFFICE;%E5%BC%A0%E4%B8%89@nas.local/Media");
+        let user_info = address
+            .strip_prefix("smb://")
+            .unwrap()
+            .split('@')
+            .next()
+            .unwrap();
+        assert!(!user_info.contains(':'));
+    }
+
+    #[test]
+    fn applescript_mount_values_escape_quotes_slashes_and_line_breaks() {
+        assert_eq!(
+            applescript_string_literal("a\\\"b\nc"),
+            "\"a\\\\\\\"b\" & linefeed & \"c\""
+        );
+    }
+
+    #[test]
+    fn authenticated_mount_script_compiles_without_exposing_credentials_in_argv() {
+        let directory = tempfile::tempdir().unwrap();
+        let compiled_script = directory.path().join("mount.scpt");
+        let script = authenticated_mount_script(
+            "smb://nas.local/My%20Files",
+            SmbCredentials {
+                username: "测试用户",
+                password: "quote-\"-slash-\\-line-\n",
+            },
+        );
+        let mut command = Command::new("/usr/bin/osacompile");
+        command.args(["-o"]).arg(&compiled_script).arg("-");
+        let output = run_command_with_timeout(
+            &mut command,
+            Some(script.as_bytes()),
+            Duration::from_secs(2),
+            "AppleScript 编译超时",
+        )
+        .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(compiled_script.is_file());
     }
 
     #[test]

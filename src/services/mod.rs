@@ -9,6 +9,7 @@ mod quick_look;
 mod sandbox_access;
 mod search_engine;
 mod smb;
+mod smb_credentials;
 mod terminal_session;
 mod thumbnail_engine;
 mod update_checker;

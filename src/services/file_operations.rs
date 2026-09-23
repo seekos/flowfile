@@ -537,8 +537,26 @@ async fn copy_file_streamed(
         send_progress(progress, current_file, *bytes_done, total_bytes, started);
     }
     output.flush().await?;
-    output.sync_all().await?;
+    match output.sync_all().await {
+        Ok(()) => {}
+        Err(error) if is_unsupported_file_sync(&error) => {
+            // macOS SMB mounts can persist writes correctly while returning
+            // ENOTSUP for fsync. Closing the flushed file is the strongest
+            // durability boundary that filesystem provides.
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("无法同步已写入文件 {}", destination.display()));
+        }
+    }
     Ok(())
+}
+
+fn is_unsupported_file_sync(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        // ENOTSUP/EOPNOTSUPP on macOS. Rust versions before every platform
+        // mapping was stabilized can still surface it as Uncategorized.
+        || error.raw_os_error() == Some(45)
 }
 
 async fn unique_transfer_path(destination: &Path) -> Result<PathBuf> {
@@ -725,11 +743,13 @@ fn validate_file_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConflictPolicy, TransferMode, available_path, execute_transfer, rename_path, send_progress,
+        ConflictPolicy, TransferMode, available_path, execute_transfer, is_unsupported_file_sync,
+        rename_path, send_progress,
     };
     use std::{
         fs,
         os::unix::fs::{PermissionsExt as _, symlink},
+        path::PathBuf,
         process::Command,
         time::Instant,
     };
@@ -747,6 +767,15 @@ mod tests {
         assert_eq!(progress.bytes_done, 75);
         assert_eq!(progress.total_bytes, 100);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn unsupported_macos_file_sync_is_non_fatal() {
+        let error = std::io::Error::from_raw_os_error(45);
+        assert!(is_unsupported_file_sync(&error));
+        assert!(!is_unsupported_file_sync(
+            &std::io::Error::from_raw_os_error(5)
+        ));
     }
 
     #[tokio::test]
@@ -1040,5 +1069,38 @@ mod tests {
             fs::read(destination.join("inside.txt")).unwrap(),
             b"flowfile"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FLOWFILE_TEST_NAS_PATH to name a mounted writable NAS folder"]
+    async fn live_nas_copy_probe() {
+        let destination = std::env::var_os("FLOWFILE_TEST_NAS_PATH")
+            .map(PathBuf::from)
+            .expect("FLOWFILE_TEST_NAS_PATH");
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let source = source_directory.path().join(format!(
+            "flowfile-live-nas-probe-{}.txt",
+            std::process::id()
+        ));
+        fs::write(&source, b"FlowFile live NAS transfer probe\n").expect("write source");
+        let (progress, _receiver) = async_channel::bounded(1);
+
+        let result = execute_transfer(
+            vec![source],
+            destination,
+            TransferMode::Copy,
+            ConflictPolicy::AutoRename,
+            progress,
+        )
+        .await;
+
+        match result {
+            Ok(paths) => {
+                for path in paths {
+                    fs::remove_file(path).expect("remove live NAS probe");
+                }
+            }
+            Err(error) => panic!("live NAS transfer failed: {error:#}"),
+        }
     }
 }
