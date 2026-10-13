@@ -24,4 +24,7 @@ cp "${project_dir}/resources/Info.plist" "${app_path}/Contents/Info.plist"
 chmod 755 "${app_path}/Contents/MacOS/flowfile"
 /usr/bin/codesign --force --deep --sign - "${app_path}" >/dev/null 2>&1
 
-exec /usr/bin/open -W "${app_path}"
+# Always launch this freshly built bundle. Without `-n`, Launch Services can
+# activate another running FlowFile instance with the same bundle identifier,
+# which makes development appear to be running stale code.
+exec /usr/bin/open -n -W "${app_path}"

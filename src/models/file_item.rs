@@ -93,8 +93,7 @@ impl FileItem {
         }
 
         match extension.unwrap_or_default() {
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "avif" | "svg" | "tif" | "tiff"
-            | "bmp" => FileKind::Image,
+            extension if is_image_extension(extension) => FileKind::Image,
             "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "dmg" => FileKind::Archive,
             "mp3" | "wav" | "aac" | "m4a" | "flac" => FileKind::Audio,
             "mp4" | "mov" | "mkv" | "avi" | "webm" => FileKind::Video,
@@ -152,6 +151,71 @@ impl FileItem {
             }
         });
     }
+}
+
+/// Image extensions understood either by the built-in decoder or by the
+/// native macOS image fallback. Keep this list as the single source of truth
+/// for file classification, thumbnails, and Quick Look navigation.
+pub(crate) fn is_image_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        // Formats decoded directly by `image`/GPUI.
+        "png"
+            | "apng"
+            | "jpg"
+            | "jpeg"
+            | "jpe"
+            | "jfif"
+            | "gif"
+            | "webp"
+            | "bmp"
+            | "dib"
+            | "tif"
+            | "tiff"
+            | "avif"
+            | "ico"
+            | "cur"
+            | "pnm"
+            | "pbm"
+            | "pgm"
+            | "ppm"
+            | "pam"
+            | "qoi"
+            | "tga"
+            | "hdr"
+            | "dds"
+            | "exr"
+            | "ff"
+            | "svg"
+            // Formats delegated to the native macOS image stack when the
+            // Rust decoder cannot read them.
+            | "heic"
+            | "heif"
+            | "hif"
+            | "jp2"
+            | "j2k"
+            | "jpf"
+            | "jpx"
+            | "jxl"
+            | "psd"
+            | "psb"
+            | "icns"
+            | "pict"
+            | "pct"
+            | "dng"
+            | "raw"
+            | "arw"
+            | "cr2"
+            | "cr3"
+            | "nef"
+            | "nrw"
+            | "orf"
+            | "rw2"
+            | "raf"
+            | "pef"
+            | "sr2"
+            | "x3f"
+    )
 }
 
 #[cfg(unix)]
@@ -218,7 +282,7 @@ fn format_modified_time(time: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileItem, FileKind, SortMode};
+    use super::{FileItem, FileKind, SortMode, is_image_extension};
     use std::{fs, path::PathBuf};
     use tempfile::tempdir;
 
@@ -316,6 +380,21 @@ mod tests {
             assert_eq!(
                 FileItem::kind_for(false, Some(extension)),
                 FileKind::Model,
+                "wrong kind for .{extension}"
+            );
+        }
+    }
+
+    #[test]
+    fn modern_and_native_image_formats_are_classified_as_images() {
+        for extension in [
+            "avif", "bmp", "dds", "exr", "heic", "heif", "jxl", "qoi", "tga", "tiff", "webp",
+            "dng", "cr3", "nef", "psd", "svg",
+        ] {
+            assert!(is_image_extension(extension), "missing .{extension}");
+            assert_eq!(
+                FileItem::kind_for(false, Some(extension)),
+                FileKind::Image,
                 "wrong kind for .{extension}"
             );
         }

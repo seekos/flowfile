@@ -1,5 +1,6 @@
 mod address_bar;
 mod context_menu;
+mod image_viewer;
 mod main_list;
 mod multi_pane_container;
 mod pane;

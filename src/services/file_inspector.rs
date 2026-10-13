@@ -1,4 +1,9 @@
-use super::{FileEngine, quick_look::is_text_extension};
+use super::{
+    FileEngine,
+    quick_look::{is_text_extension, native_image_dimensions},
+};
+use crate::models::is_image_extension;
+use chrono::{DateTime, Local};
 use exif::{In, Reader, Tag};
 use gpui::Context;
 use std::{
@@ -13,6 +18,9 @@ const INSPECTION_READ_LIMIT: usize = 100 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct FileInspectorMetadata {
+    pub file_size: u64,
+    pub modified: String,
+    pub format: Option<String>,
     pub dimensions: Option<(u32, u32)>,
     pub line_count: Option<usize>,
     pub word_count: Option<usize>,
@@ -87,16 +95,18 @@ impl FileInspector {
 fn inspect_path(path: &Path) -> anyhow::Result<FileInspectorMetadata> {
     let metadata = fs::symlink_metadata(path)?;
     let permissions = format_permissions(metadata.permissions().mode());
-    let dimensions = if metadata.is_file() {
-        image::image_dimensions(path).ok()
-    } else {
-        None
-    };
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let dimensions = if metadata.is_file() && is_image_extension(&extension) {
+        image::image_dimensions(path)
+            .ok()
+            .or_else(|| native_image_dimensions(path))
+    } else {
+        None
+    };
     let (line_count, word_count) = if metadata.is_file() && is_text_extension(&extension) {
         let mut bytes = Vec::with_capacity(INSPECTION_READ_LIMIT);
         File::open(path)?
@@ -111,8 +121,19 @@ fn inspect_path(path: &Path) -> anyhow::Result<FileInspectorMetadata> {
         (None, None)
     };
     let exif = read_exif(path);
+    let modified = metadata
+        .modified()
+        .ok()
+        .map(|time| {
+            let local: DateTime<Local> = time.into();
+            local.format("%Y-%m-%d %H:%M:%S").to_string()
+        })
+        .unwrap_or_else(|| "未知".to_string());
 
     Ok(FileInspectorMetadata {
+        file_size: metadata.len(),
+        modified,
+        format: (!extension.is_empty()).then(|| extension.to_ascii_uppercase()),
         dimensions,
         line_count,
         word_count,
@@ -132,10 +153,14 @@ fn read_exif(path: &Path) -> Vec<(String, String)> {
     [
         (Tag::Make, "相机"),
         (Tag::Model, "型号"),
+        (Tag::LensModel, "镜头"),
         (Tag::DateTimeOriginal, "拍摄时间"),
         (Tag::ExposureTime, "曝光"),
         (Tag::FNumber, "光圈"),
         (Tag::PhotographicSensitivity, "ISO"),
+        (Tag::FocalLength, "焦距"),
+        (Tag::Orientation, "方向"),
+        (Tag::Software, "软件"),
     ]
     .into_iter()
     .filter_map(|(tag, label)| {

@@ -47,7 +47,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 - 与 macOS 访达共用原生文件剪贴板：双方复制的多文件/文件夹都可直接粘贴；`Option + Cmd + V` 按访达习惯移动到当前目录。FlowFile 内剪切项目以半透明状态显示。
 - 新建文件夹、新建空白文本文件、复制副本和原地重命名。
 - 移至 macOS 废纸篓，以及通过确认模态框执行永久删除。
-- 文件双击通常使用系统默认应用打开，`.app` 应用包会直接启动，带 Unix 执行位的普通文件会直接运行；安装 Notepad-- 后，已知文本文件优先由它打开；普通目录双击进入目录。
+- 图片双击直接进入 FlowFile 内置图片浏览器，不再调用系统图片应用；其他文件仍使用系统默认应用打开，`.app` 应用包会直接启动，带 Unix 执行位的普通文件会直接运行；安装 Notepad-- 后，已知文本文件优先由它打开；普通目录双击进入目录。
 - 右键“打开方式”首先提供显式的“以文本方式打开”，随后按文件类型排列 macOS 可用应用，并保留可自行选择 `.app` 的“自定义打开方式”；安装 Notepad-- 后由它执行文本打开，普通文本文件也默认由它打开；PLY 等模型文件普通打开时优先使用系统 Preview，再提供 CloudCompare 等专业工具。
 - 支持跨面板复制/移动，以及拖到其他面板或侧边栏目录。
 - 拖放默认移动，按住 `Option` 时复制。
@@ -67,10 +67,12 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 ### 缩略图、Quick Look 与文件信息
 
 - 100 MB 内存 LRU 缓存保存已解码图像。
-- 磁盘缓存位于 `~/Library/Caches/FlowFile/thumbnails/`，启动时按修改时间清理到 512 MB；缓存键包含文件路径、修改时间和文件大小。
+- 缩略图磁盘缓存位于 `~/Library/Caches/FlowFile/thumbnails/`；HEIC、相机 RAW 等原生图片预览缓存位于 `~/Library/Caches/FlowFile/image-previews/`。两者启动时都按修改时间清理到 512 MB，缓存键包含文件路径、修改时间和文件大小。
 - 仅为图片、音频、视频和三维模型生成缩略图；常见图片最多使用 4 个 `rayon` 工作线程，并在受限解码内存中生成 256×256 PNG，其他可预览格式使用 macOS `qlmanage`。
 - 按 `Space` 打开或关闭预览，`Esc` 关闭预览。
-- 图片预览支持缩放和平移；文本/代码预览最多读取前 100 KB；PLY、STL、OBJ 等三维文件按模型处理，不会误用文本加载器。
+- 图片使用可独立最小化、最大化和调整尺寸的浏览窗口；支持滚轮连续缩放（1%–10000 倍）、按住左键拖动、方向键或鼠标移至图片左右中部时显示的半透明按钮连续切图，以及可显隐的元信息面板；100% 对应图片原始像素尺寸，拖动只改变查看位置、不改变缩放比例；切图时同步当前文件选择，并显示格式、大小、分辨率、修改时间、权限和常见 EXIF。
+- 内置解码 PNG/APNG、JPEG、GIF、WebP、BMP、TIFF、AVIF、ICO、PNM、QOI、TGA、HDR、DDS、OpenEXR、Farbfeld 和 SVG；HEIC/HEIF、JPEG 2000、JPEG XL、PSD/PSB、ICNS、DNG 及常见相机 RAW 尝试通过 macOS 原生图像框架转换预览。
+- 文本/代码预览最多读取前 100 KB；PLY、STL、OBJ 等三维文件按模型处理，不会误用文本加载器。
 - PDF、视频、Office 文档等复杂格式交给 macOS 原生 Quick Look。
 - 状态栏文件检查器可显示图片分辨率、文本行数/字数、POSIX 权限和常见 EXIF 信息。
 
@@ -110,6 +112,9 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 | `Cmd + Option + 1` / `2` | 详细列表 / 大图标网格 |
 | `Tab` / `Shift + Tab` | 下一个 / 上一个面板 |
 | `Space` | Quick Look |
+| `←` / `→` | 图片预览中切换上一张 / 下一张 |
+| `I` | 图片预览中显示 / 隐藏元信息 |
+| `F` / `0` | 图片预览中恢复适合窗口 |
 | `Cmd + F` | 搜索 |
 | `Cmd + I` | 显示简介 |
 | `Cmd + Backtick` / `Cmd + Shift + T` | 在系统 Terminal 中打开当前目录 |
@@ -164,6 +169,7 @@ Intel Mac 请将变量名和 target 分别改为 `BINDGEN_EXTRA_CLANG_ARGS_x86_6
 | 偏好设置 | `~/Library/Application Support/FlowFile/preferences.json` |
 | 会话状态 | `~/Library/Application Support/FlowFile/session.json` |
 | 缩略图缓存 | `~/Library/Caches/FlowFile/thumbnails/` |
+| 原生图片预览缓存 | `~/Library/Caches/FlowFile/image-previews/` |
 
 ## macOS 文件夹权限与签名
 

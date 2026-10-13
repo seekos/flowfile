@@ -4,7 +4,7 @@ use super::{
     tooltip::delayed_tooltip,
 };
 use crate::{
-    actions::{CopyFiles, CutFiles, PasteFiles, RenameSelected, SelectAllFiles},
+    actions::{CopyFiles, CutFiles, PasteFiles, RenameSelected, SelectAllFiles, ToggleQuickLook},
     models::{FileItem, FileKind, FileOperationController, Model, Pane, SortMode, ViewMode},
     services::{ThumbnailEngine, TransferMode, begin_external_file_drag, end_external_file_drag},
     theme,
@@ -1177,6 +1177,7 @@ impl MainListView {
         let formatted_size = item.formatted_size();
         let absolute_path = item.path.display().to_string();
         let is_folder = item.is_dir;
+        let opens_in_internal_viewer = item.kind == FileKind::Image;
         let widths = self.detail_column_widths;
         let pane = self.pane.clone();
         let focus_handle = self.focus_handle.clone();
@@ -1292,17 +1293,22 @@ impl MainListView {
             .on_click(move |event: &ClickEvent, window, cx| {
                 focus_handle.focus(window);
                 let modifiers = event.modifiers();
+                let is_double_click = event.click_count() >= 2;
+                let open_internal_viewer = is_double_click && opens_in_internal_viewer;
                 pane.update(cx, |pane, cx| {
                     if pane.rename_index.is_some() {
                         pane.commit_rename(cx);
                     }
                     pane.select(index, modifiers.platform, modifiers.shift);
-                    if event.click_count() >= 2 {
+                    if is_double_click && !open_internal_viewer {
                         pane.activate_selected(cx);
                     } else {
                         cx.notify();
                     }
                 });
+                if open_internal_viewer {
+                    window.dispatch_action(Box::new(ToggleQuickLook), cx);
+                }
             })
             .child(
                 div()
@@ -1389,6 +1395,7 @@ impl MainListView {
         input_entity: Entity<Self>,
     ) -> AnyElement {
         let is_folder = item.is_dir;
+        let opens_in_internal_viewer = item.kind == FileKind::Image;
         let pane = self.pane.clone();
         let focus_handle = self.focus_handle.clone();
         let context_focus_handle = self.focus_handle.clone();
@@ -1601,17 +1608,22 @@ impl MainListView {
             .on_click(move |event: &ClickEvent, window, cx| {
                 focus_handle.focus(window);
                 let modifiers = event.modifiers();
+                let is_double_click = event.click_count() >= 2;
+                let open_internal_viewer = is_double_click && opens_in_internal_viewer;
                 pane.update(cx, |pane, cx| {
                     if pane.rename_index.is_some() {
                         pane.commit_rename(cx);
                     }
                     pane.select(index, modifiers.platform, modifiers.shift);
-                    if event.click_count() >= 2 {
+                    if is_double_click && !open_internal_viewer {
                         pane.activate_selected(cx);
                     } else {
                         cx.notify();
                     }
                 });
+                if open_internal_viewer {
+                    window.dispatch_action(Box::new(ToggleQuickLook), cx);
+                }
             })
             .child(file_visual)
             .child(name_element)

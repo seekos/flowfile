@@ -1,3 +1,4 @@
+use super::quick_look::QuickLookService;
 use crate::models::{FileItem, FileKind};
 use anyhow::{Context as _, Result, bail};
 use gpui::{Context, RenderImage};
@@ -223,10 +224,8 @@ fn generate_thumbnail(
             .and_then(|extension| extension.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let generated = if matches!(
-            extension.as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "avif"
-        ) {
+        let generated = if extension != "svg" && QuickLookService::can_render_image_directly(source)
+        {
             render_raster(source, cache_path).is_ok()
         } else {
             false

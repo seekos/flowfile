@@ -1,5 +1,6 @@
 use super::{
     context_menu::ContextMenuView,
+    image_viewer::ImageViewerWindow,
     multi_pane_container::MultiPaneContainerView,
     preferences::{PreferencesModal, application_version},
     search_bar::{
@@ -39,15 +40,18 @@ use gpui::{
     Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight, GlobalElementId, IntoElement,
     KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     PaintQuad, Pixels, Point, Render, ScrollWheelEvent, ShapedLine, SharedString, Style,
-    StyledImage, TextRun, Timer, UTF16Selection, UnderlineStyle, Window, black, div, fill, img,
-    point, prelude::*, px, relative, size, uniform_list,
+    StyledImage, TextRun, Timer, TouchPhase, UTF16Selection, UnderlineStyle, Window, WindowHandle,
+    black, div, fill, img, point, prelude::*, px, relative, size, uniform_list,
 };
 use std::{
     ops::Range,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+pub(super) const MIN_IMAGE_ZOOM: f32 = 0.01;
+pub(super) const MAX_IMAGE_ZOOM: f32 = 10_000.0;
 
 struct ModalNameTextElement {
     input: Entity<WorkspaceView>,
@@ -247,7 +251,7 @@ enum SmbAuthField {
 #[derive(Clone)]
 enum QuickLookContent {
     Loading,
-    Image,
+    Image { display_path: PathBuf },
     Text { lines: Vec<String>, truncated: bool },
     Native,
     Error(String),
@@ -257,18 +261,25 @@ enum QuickLookContent {
 struct QuickLookState {
     path: PathBuf,
     content: QuickLookContent,
+    image_paths: Vec<PathBuf>,
+    image_index: usize,
+    metadata_visible: bool,
     zoom: f32,
     pan_x: f32,
     pan_y: f32,
     last_pointer: Option<(f32, f32)>,
+    image_dimensions: Option<(u32, u32)>,
+    scroll_direction: f32,
+    last_scroll_at: Option<Instant>,
 }
 
 pub struct WorkspaceView {
     model: Model<MultiPaneModel>,
+    engine: FileEngine,
     operations: Entity<FileOperationController>,
     _thumbnails: Entity<ThumbnailEngine>,
     quick_look_service: QuickLookService,
-    _inspector: Entity<FileInspector>,
+    inspector: Entity<FileInspector>,
     sidebar: Entity<SidebarView>,
     multi_pane: Entity<MultiPaneContainerView>,
     status_bar: Entity<StatusBar>,
@@ -291,6 +302,7 @@ pub struct WorkspaceView {
     modal_name_bounds: Option<Bounds<Pixels>>,
     modal_error: Option<String>,
     quick_look: Option<QuickLookState>,
+    image_viewer_window: Option<WindowHandle<ImageViewerWindow>>,
     quick_look_generation: u64,
     quick_look_focus_handle: FocusHandle,
     session_save_generation: u64,
@@ -410,6 +422,21 @@ impl WorkspaceView {
         })
         .detach();
         cx.observe(&operations, |_, _, cx| cx.notify()).detach();
+        cx.observe(&inspector, |this, inspector, cx| {
+            let inspected = inspector.read(cx);
+            let current_path = inspected.current_path.clone();
+            let dimensions = inspected
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.dimensions);
+            if let Some(preview) = &mut this.quick_look
+                && current_path.as_ref() == Some(&preview.path)
+            {
+                preview.image_dimensions = dimensions;
+            }
+            cx.notify();
+        })
+        .detach();
         for pane in &panes {
             cx.observe(pane, |this, _, cx| {
                 this.schedule_session_save(cx);
@@ -481,10 +508,11 @@ impl WorkspaceView {
 
         let mut workspace = Self {
             model,
+            engine,
             operations,
             _thumbnails: thumbnails,
             quick_look_service,
-            _inspector: inspector,
+            inspector,
             sidebar,
             multi_pane,
             status_bar,
@@ -507,6 +535,7 @@ impl WorkspaceView {
             modal_name_bounds: None,
             modal_error: None,
             quick_look: None,
+            image_viewer_window: None,
             quick_look_generation: 0,
             quick_look_focus_handle: cx.focus_handle(),
             session_save_generation: 0,
@@ -852,7 +881,7 @@ impl WorkspaceView {
         let quick_look = self.quick_look.as_ref().map(|preview| {
             let state = match &preview.content {
                 QuickLookContent::Loading => "正在载入",
-                QuickLookContent::Image => "图像预览",
+                QuickLookContent::Image { .. } => "图像预览",
                 QuickLookContent::Text { truncated, .. } if *truncated => "文本预览，内容已截断",
                 QuickLookContent::Text { .. } => "文本预览",
                 QuickLookContent::Native => "系统预览",
@@ -1148,32 +1177,93 @@ impl WorkspaceView {
         if self.modal.is_some() {
             return;
         }
-        let path = {
+        let (path, image_paths, image_index) = {
             let pane = self.active_pane(cx);
             let pane = pane.read(cx);
-            pane.selected_index
+            let path = pane
+                .selected_index
                 .and_then(|index| pane.items.get(index))
                 .filter(|item| !item.is_dir)
+                .map(|item| item.path.clone());
+            let image_paths = pane
+                .items
+                .iter()
+                .filter(|item| !item.is_dir)
+                .filter(|item| QuickLookService::classify(&item.path) == PreviewKind::Image)
                 .map(|item| item.path.clone())
+                .collect::<Vec<_>>();
+            let image_index = path
+                .as_ref()
+                .and_then(|path| image_paths.iter().position(|candidate| candidate == path))
+                .unwrap_or(0);
+            (path, image_paths, image_index)
         };
         let Some(path) = path else {
             return;
         };
+        self.present_quick_look(path, image_paths, image_index, false, window, cx);
+    }
+
+    fn present_quick_look(
+        &mut self,
+        path: PathBuf,
+        mut image_paths: Vec<PathBuf>,
+        image_index: usize,
+        metadata_visible: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.quick_look_service.close_native();
         self.quick_look_generation += 1;
         let generation = self.quick_look_generation;
         let kind = QuickLookService::classify(&path);
+        if kind == PreviewKind::Image && image_paths.is_empty() {
+            image_paths.push(path.clone());
+        }
+        if kind == PreviewKind::Image {
+            self.open_image_viewer(path, image_paths, image_index, metadata_visible, cx);
+            return;
+        }
+        let content = match kind {
+            PreviewKind::Image if QuickLookService::can_render_image_directly(&path) => {
+                QuickLookContent::Image {
+                    display_path: path.clone(),
+                }
+            }
+            PreviewKind::Image | PreviewKind::Text => QuickLookContent::Loading,
+            PreviewKind::Native => QuickLookContent::Native,
+        };
+        let image_dimensions = if kind == PreviewKind::Image {
+            let inspector = self.inspector.read(cx);
+            (inspector.current_path.as_ref() == Some(&path))
+                .then(|| {
+                    inspector
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.dimensions)
+                })
+                .flatten()
+        } else {
+            None
+        };
         self.quick_look = Some(QuickLookState {
             path: path.clone(),
-            content: match kind {
-                PreviewKind::Image => QuickLookContent::Image,
-                PreviewKind::Text => QuickLookContent::Loading,
-                PreviewKind::Native => QuickLookContent::Native,
-            },
+            content,
+            image_paths,
+            image_index,
+            metadata_visible: metadata_visible && kind == PreviewKind::Image,
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
             last_pointer: None,
+            image_dimensions,
+            scroll_direction: 0.0,
+            last_scroll_at: None,
         });
+        if kind == PreviewKind::Image {
+            self.inspector
+                .update(cx, |inspector, cx| inspector.request(path.clone(), cx));
+        }
         self.quick_look_focus_handle.focus(window);
         cx.notify();
 
@@ -1203,8 +1293,146 @@ impl WorkspaceView {
                 .detach();
             }
             PreviewKind::Native => self.quick_look_service.open_native(path),
+            PreviewKind::Image if !QuickLookService::can_render_image_directly(&path) => {
+                let service = self.quick_look_service.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = service.prepare_image(path.clone()).await;
+                    let _ = this.update(cx, |workspace, cx| {
+                        if workspace.quick_look_generation != generation {
+                            return;
+                        }
+                        if let Some(preview) = &mut workspace.quick_look
+                            && preview.path == path
+                        {
+                            preview.content = match result {
+                                Ok(display_path) => QuickLookContent::Image { display_path },
+                                Err(error) => QuickLookContent::Error(error.to_string()),
+                            };
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
             PreviewKind::Image => {}
         }
+    }
+
+    fn open_image_viewer(
+        &mut self,
+        path: PathBuf,
+        image_paths: Vec<PathBuf>,
+        image_index: usize,
+        metadata_visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let source_pane = self.active_pane(cx);
+        if let Some(handle) = self.image_viewer_window
+            && handle
+                .update(cx, |viewer, window, cx| {
+                    viewer.show_image(
+                        path.clone(),
+                        image_paths.clone(),
+                        image_index,
+                        metadata_visible,
+                        source_pane.clone(),
+                        window,
+                        cx,
+                    );
+                    window.activate_window();
+                })
+                .is_ok()
+        {
+            return;
+        }
+
+        let options = ImageViewerWindow::window_options(&path, cx);
+        let service = self.quick_look_service.clone();
+        let engine = self.engine.clone();
+        match cx.open_window(options, move |window, cx| {
+            cx.new(|cx| {
+                ImageViewerWindow::new(
+                    path,
+                    image_paths,
+                    image_index,
+                    metadata_visible,
+                    source_pane,
+                    service,
+                    engine,
+                    window,
+                    cx,
+                )
+            })
+        }) {
+            Ok(handle) => self.image_viewer_window = Some(handle),
+            Err(error) => self.operations.update(cx, |operations, cx| {
+                operations.show_notice(format!("无法打开图片浏览窗口：{error}"), true, cx);
+            }),
+        }
+    }
+
+    fn switch_preview_image(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preview) = &self.quick_look else {
+            return;
+        };
+        if !matches!(
+            &preview.content,
+            QuickLookContent::Image { .. } | QuickLookContent::Loading
+        ) || preview.image_paths.is_empty()
+        {
+            return;
+        }
+        let Some(next_index) =
+            next_preview_index(preview.image_index, preview.image_paths.len(), delta)
+        else {
+            return;
+        };
+        let path = preview.image_paths[next_index].clone();
+        let image_paths = preview.image_paths.clone();
+        let metadata_visible = preview.metadata_visible;
+
+        self.active_pane(cx).update(cx, |pane, cx| {
+            if let Some(index) = pane.items.iter().position(|item| item.path == path) {
+                pane.select(index, false, false);
+                cx.notify();
+            }
+        });
+        self.present_quick_look(path, image_paths, next_index, metadata_visible, window, cx);
+    }
+
+    fn toggle_preview_metadata(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = &mut self.quick_look else {
+            return;
+        };
+        if !matches!(
+            &preview.content,
+            QuickLookContent::Image { .. } | QuickLookContent::Loading
+        ) {
+            return;
+        }
+        preview.metadata_visible = !preview.metadata_visible;
+        if preview.metadata_visible {
+            let path = preview.path.clone();
+            self.inspector
+                .update(cx, |inspector, cx| inspector.request(path, cx));
+        }
+        cx.notify();
+    }
+
+    fn reset_preview_transform(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = &mut self.quick_look else {
+            return;
+        };
+        let Some((image_width, image_height)) = preview.image_dimensions else {
+            return;
+        };
+        preview.zoom = fit_image_zoom(image_width, image_height, preview.metadata_visible);
+        preview.pan_x = 0.0;
+        preview.pan_y = 0.0;
+        preview.last_pointer = None;
+        preview.scroll_direction = 0.0;
+        preview.last_scroll_at = None;
+        cx.notify();
     }
 
     fn on_close_quick_look(
@@ -1249,23 +1477,70 @@ impl WorkspaceView {
         let Some(preview) = &mut self.quick_look else {
             return;
         };
-        if !matches!(preview.content, QuickLookContent::Image) {
+        if !matches!(&preview.content, QuickLookContent::Image { .. }) {
+            return;
+        }
+        if preview.image_dimensions.is_none() {
+            cx.stop_propagation();
             return;
         }
         let delta = event.delta.pixel_delta(px(18.0));
-        let factor = if f32::from(delta.y) < 0.0 { 1.12 } else { 0.89 };
-        preview.zoom = (preview.zoom * factor).clamp(0.25, 6.0);
+        let vertical_delta = f32::from(delta.y);
+        let now = Instant::now();
+        let elapsed = preview
+            .last_scroll_at
+            .and_then(|previous| now.checked_duration_since(previous));
+        if is_opposite_scroll_tail(
+            preview.scroll_direction,
+            elapsed,
+            vertical_delta,
+            event.delta.precise(),
+            event.touch_phase,
+        ) {
+            if matches!(event.touch_phase, TouchPhase::Ended) {
+                preview.scroll_direction = 0.0;
+                preview.last_scroll_at = None;
+            } else {
+                preview.last_scroll_at = Some(now);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if vertical_delta.abs() < f32::EPSILON {
+            if matches!(event.touch_phase, TouchPhase::Ended) {
+                preview.scroll_direction = 0.0;
+                preview.last_scroll_at = None;
+            }
+            cx.stop_propagation();
+            return;
+        }
+        preview.scroll_direction = vertical_delta.signum();
+        preview.last_scroll_at = if matches!(event.touch_phase, TouchPhase::Ended) {
+            None
+        } else {
+            Some(now)
+        };
+        let old_zoom = preview.zoom;
+        let new_zoom = zoom_from_scroll(old_zoom, vertical_delta);
+        let ratio = new_zoom / old_zoom;
+        preview.zoom = new_zoom;
+        preview.pan_x *= ratio;
+        preview.pan_y *= ratio;
         cx.notify();
+        cx.stop_propagation();
     }
 
     fn on_preview_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        if let Some(preview) = &mut self.quick_look {
+        if let Some(preview) = &mut self.quick_look
+            && matches!(&preview.content, QuickLookContent::Image { .. })
+        {
             preview.last_pointer = Some((f32::from(event.position.x), f32::from(event.position.y)));
+            cx.stop_propagation();
         }
     }
 
@@ -1278,6 +1553,9 @@ impl WorkspaceView {
         let Some(preview) = &mut self.quick_look else {
             return;
         };
+        if !matches!(&preview.content, QuickLookContent::Image { .. }) {
+            return;
+        }
         if !event.dragging() {
             preview.last_pointer = None;
             return;
@@ -1287,6 +1565,21 @@ impl WorkspaceView {
             preview.pan_y += f32::from(event.position.y) - last_y;
             preview.last_pointer = Some((f32::from(event.position.x), f32::from(event.position.y)));
             cx.notify();
+            cx.stop_propagation();
+        }
+    }
+
+    fn on_preview_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(preview) = &mut self.quick_look
+            && preview.last_pointer.take().is_some()
+        {
+            cx.notify();
+            cx.stop_propagation();
         }
     }
 
@@ -1640,6 +1933,22 @@ impl WorkspaceView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal.is_none()
+            && self
+                .quick_look
+                .as_ref()
+                .is_some_and(|preview| !preview.image_paths.is_empty())
+        {
+            match event.keystroke.key.as_str() {
+                "left" => self.switch_preview_image(-1, window, cx),
+                "right" => self.switch_preview_image(1, window, cx),
+                "i" => self.toggle_preview_metadata(cx),
+                "0" | "f" => self.reset_preview_transform(cx),
+                _ => return,
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.modal.is_none() {
             return;
         }
@@ -2462,56 +2771,143 @@ impl WorkspaceView {
 
     fn render_quick_look(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let preview = self.quick_look.clone()?;
+        let is_image = !preview.image_paths.is_empty();
+        let can_show_previous = is_image && preview.image_index > 0;
+        let can_show_next = is_image && preview.image_index + 1 < preview.image_paths.len();
         let file_name = preview
             .path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("预览")
             .to_string();
+        let (metadata_facts, metadata_status) = if preview.metadata_visible {
+            let inspector = self.inspector.read(cx);
+            if inspector.current_path.as_ref() != Some(&preview.path) || inspector.is_loading {
+                (Vec::new(), Some("正在读取图片元信息…".to_string()))
+            } else if let Some(error) = &inspector.error {
+                (Vec::new(), Some(format!("无法读取元信息：{error}")))
+            } else if let Some(metadata) = &inspector.metadata {
+                let mut facts = Vec::new();
+                if let Some(format) = &metadata.format {
+                    facts.push(("格式".to_string(), format.clone()));
+                }
+                facts.push(("文件大小".to_string(), format_file_size(metadata.file_size)));
+                if let Some((width, height)) = metadata.dimensions {
+                    facts.push(("分辨率".to_string(), format!("{width} × {height}")));
+                }
+                facts.push(("修改时间".to_string(), metadata.modified.clone()));
+                facts.push(("权限".to_string(), metadata.permissions.clone()));
+                facts.extend(metadata.exif.iter().cloned());
+                (facts, None)
+            } else {
+                (Vec::new(), Some("没有可显示的图片元信息".to_string()))
+            }
+        } else {
+            (Vec::new(), None)
+        };
 
-        let content = match preview.content {
+        let content = match preview.content.clone() {
             QuickLookContent::Loading => div()
                 .flex()
                 .items_center()
                 .justify_center()
-                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .flex_1()
                 .text_color(theme::text_tertiary())
-                .child("正在读取前 100 KB…")
+                .child(if is_image {
+                    "正在准备图片预览…"
+                } else {
+                    "正在读取前 100 KB…"
+                })
                 .into_any_element(),
-            QuickLookContent::Image => div()
-                .id("quick-look-image-stage")
-                .flex()
-                .items_center()
-                .justify_center()
-                .size_full()
-                .overflow_hidden()
-                .cursor_move()
-                .on_scroll_wheel(cx.listener(Self::on_preview_scroll))
-                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_preview_mouse_down))
-                .on_mouse_move(cx.listener(Self::on_preview_mouse_move))
-                .child(
-                    img(preview.path.clone())
-                        .w(px(760.0 * preview.zoom))
-                        .h(px(560.0 * preview.zoom))
-                        .ml(px(preview.pan_x))
-                        .mt(px(preview.pan_y))
-                        .object_fit(ObjectFit::Contain)
-                        .with_fallback(|| {
-                            div()
-                                .text_color(theme::danger())
-                                .child("无法解码此图像")
-                                .into_any_element()
-                        }),
-                )
-                .into_any_element(),
+            QuickLookContent::Image { display_path } => {
+                let rendered_image = img(display_path)
+                    .flex_none()
+                    .when_some(preview.image_dimensions, |image, (width, height)| {
+                        let (width, height) = scaled_image_size(width, height, preview.zoom);
+                        image.w(px(width)).h(px(height))
+                    })
+                    // Relative offsets move the painted image without taking
+                    // part in flex sizing. Dragging therefore cannot shrink or
+                    // stretch the image as margins did previously.
+                    .relative()
+                    .left(px(preview.pan_x))
+                    .top(px(preview.pan_y))
+                    .object_fit(ObjectFit::Contain)
+                    .with_fallback(|| {
+                        div()
+                            .text_color(theme::danger())
+                            .child("无法解码此图像")
+                            .into_any_element()
+                    });
+                div()
+                    .id("quick-look-image-stage")
+                    .relative()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .cursor_move()
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(rendered_image),
+                    )
+                    // Keep a dedicated hit surface above the image. Binding the
+                    // gestures to the stage itself lets a rendered image child
+                    // win hit testing on physical mouse input, so wheel and drag
+                    // events can skip the parent even though synthetic input
+                    // appears to work.
+                    .child(
+                        div()
+                            .id("quick-look-image-interaction")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .cursor_move()
+                            .on_scroll_wheel(cx.listener(Self::on_preview_scroll))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::on_preview_mouse_down),
+                            )
+                            .on_mouse_move(cx.listener(Self::on_preview_mouse_move))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_preview_mouse_up))
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(Self::on_preview_mouse_up),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom(px(12.0))
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(black().opacity(0.52))
+                            .text_size(theme::font(9.0))
+                            .text_color(gpui::rgba(0xffffffd1))
+                            .child("滚轮缩放 · 按住左键拖动 · F / 0 适合窗口"),
+                    )
+                    .into_any_element()
+            }
             QuickLookContent::Text { lines, truncated } => {
                 let line_count = lines.len();
                 let lines = std::sync::Arc::new(lines);
                 div()
                     .flex()
                     .flex_col()
-                    .size_full()
+                    .min_w_0()
                     .min_h_0()
+                    .flex_1()
                     .child(
                         uniform_list(
                             "quick-look-text",
@@ -2558,7 +2954,9 @@ impl WorkspaceView {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .flex_1()
                 .gap_3()
                 .text_color(theme::text_secondary())
                 .child(
@@ -2579,11 +2977,75 @@ impl WorkspaceView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .flex_1()
                 .text_color(theme::danger())
                 .child(error)
                 .into_any_element(),
         };
+
+        let metadata_panel = preview.metadata_visible.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .w(px(260.0))
+                .h_full()
+                .flex_shrink_0()
+                .border_l_1()
+                .border_color(theme::border())
+                .bg(theme::surface_subtle())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .h(px(38.0))
+                        .px_3()
+                        .border_b_1()
+                        .border_color(theme::border())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(theme::font(10.0))
+                        .child("图片元信息"),
+                )
+                .child(
+                    div()
+                        .id("quick-look-metadata-scroll")
+                        .flex()
+                        .flex_col()
+                        .min_h_0()
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .p_3()
+                        .gap_3()
+                        .when_some(metadata_status, |panel, status| {
+                            panel.child(
+                                div()
+                                    .text_size(theme::font(10.0))
+                                    .text_color(theme::text_tertiary())
+                                    .child(status),
+                            )
+                        })
+                        .children(metadata_facts.into_iter().map(|(label, value)| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(theme::font(9.0))
+                                        .text_color(theme::text_tertiary())
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(theme::font(10.0))
+                                        .text_color(theme::text_primary())
+                                        .child(value),
+                                )
+                        })),
+                )
+                .into_any_element()
+        });
 
         Some(
             div()
@@ -2627,21 +3089,138 @@ impl WorkspaceView {
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .child(file_name),
                                 )
-                                .when(
-                                    matches!(
-                                        self.quick_look.as_ref().map(|preview| &preview.content),
-                                        Some(QuickLookContent::Image)
-                                    ),
-                                    |header| {
-                                        header.child(
+                                .when(is_image, |header| {
+                                    header
+                                        .child(
                                             div()
-                                                .mr_3()
+                                                .mr_2()
+                                                .text_size(theme::font(9.0))
+                                                .text_color(theme::text_tertiary())
+                                                .child(format!(
+                                                    "{} / {}",
+                                                    preview.image_index + 1,
+                                                    preview.image_paths.len()
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("previous-preview-image")
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .size(px(26.0))
+                                                .rounded_md()
+                                                .text_color(if can_show_previous {
+                                                    theme::text_primary()
+                                                } else {
+                                                    theme::text_tertiary().opacity(0.4)
+                                                })
+                                                .when(can_show_previous, |button| {
+                                                    button
+                                                        .cursor_pointer()
+                                                        .hover(|style| {
+                                                            style.bg(theme::accent_soft())
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.switch_preview_image(
+                                                                    -1, window, cx,
+                                                                )
+                                                            },
+                                                        ))
+                                                })
+                                                .child("←"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("next-preview-image")
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .size(px(26.0))
+                                                .rounded_md()
+                                                .text_color(if can_show_next {
+                                                    theme::text_primary()
+                                                } else {
+                                                    theme::text_tertiary().opacity(0.4)
+                                                })
+                                                .when(can_show_next, |button| {
+                                                    button
+                                                        .cursor_pointer()
+                                                        .hover(|style| {
+                                                            style.bg(theme::accent_soft())
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.switch_preview_image(
+                                                                    1, window, cx,
+                                                                )
+                                                            },
+                                                        ))
+                                                })
+                                                .child("→"),
+                                        )
+                                        .child(
+                                            div()
+                                                .mx_2()
+                                                .min_w(px(42.0))
                                                 .text_size(theme::font(10.0))
                                                 .text_color(theme::text_tertiary())
                                                 .child(format!("{:.0}%", preview.zoom * 100.0)),
                                         )
-                                    },
-                                )
+                                        .child(
+                                            div()
+                                                .id("reset-preview-image")
+                                                .flex()
+                                                .items_center()
+                                                .h(px(26.0))
+                                                .px_2()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .text_size(theme::font(9.0))
+                                                .text_color(theme::text_secondary())
+                                                .hover(|style| style.bg(theme::accent_soft()))
+                                                .tooltip(delayed_tooltip("恢复适合窗口 (F / 0)"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.reset_preview_transform(cx)
+                                                }))
+                                                .child("适合窗口"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("toggle-preview-metadata")
+                                                .flex()
+                                                .items_center()
+                                                .h(px(26.0))
+                                                .px_2()
+                                                .ml_1()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .bg(if preview.metadata_visible {
+                                                    theme::accent_soft()
+                                                } else {
+                                                    gpui::transparent_black()
+                                                })
+                                                .text_size(theme::font(9.0))
+                                                .text_color(if preview.metadata_visible {
+                                                    theme::accent()
+                                                } else {
+                                                    theme::text_secondary()
+                                                })
+                                                .hover(|style| style.bg(theme::accent_soft()))
+                                                .tooltip(delayed_tooltip(
+                                                    "显示或隐藏图片元信息 (I)",
+                                                ))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.toggle_preview_metadata(cx)
+                                                }))
+                                                .child(if preview.metadata_visible {
+                                                    "隐藏信息"
+                                                } else {
+                                                    "显示信息"
+                                                }),
+                                        )
+                                })
                                 .child(
                                     div()
                                         .id("close-quick-look")
@@ -2658,7 +3237,15 @@ impl WorkspaceView {
                                         .child("×"),
                                 ),
                         )
-                        .child(div().flex().min_h_0().flex_1().child(content)),
+                        .child(
+                            div()
+                                .flex()
+                                .min_w_0()
+                                .min_h_0()
+                                .flex_1()
+                                .child(content)
+                                .when_some(metadata_panel, |body, panel| body.child(panel)),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -3008,6 +3595,81 @@ fn syntax_line_color(line: &str) -> gpui::Hsla {
     }
 }
 
+fn next_preview_index(current: usize, count: usize, delta: isize) -> Option<usize> {
+    if count == 0 || current >= count {
+        return None;
+    }
+    let next = current.checked_add_signed(delta)?;
+    (next < count && next != current).then_some(next)
+}
+
+pub(super) fn zoom_from_scroll(current: f32, vertical_delta: f32) -> f32 {
+    if vertical_delta.abs() < f32::EPSILON {
+        return current;
+    }
+    let factor = (vertical_delta / 180.0).exp().clamp(0.8, 1.25);
+    (current * factor).clamp(MIN_IMAGE_ZOOM, MAX_IMAGE_ZOOM)
+}
+
+pub(super) fn scaled_image_size(width: u32, height: u32, zoom: f32) -> (f32, f32) {
+    (width as f32 * zoom, height as f32 * zoom)
+}
+
+fn fit_image_zoom(width: u32, height: u32, metadata_visible: bool) -> f32 {
+    const CARD_WIDTH: f32 = 920.0;
+    const CARD_HEIGHT: f32 = 680.0;
+    const HEADER_HEIGHT: f32 = 42.0;
+    const METADATA_WIDTH: f32 = 260.0;
+    const VIEWPORT_PADDING: f32 = 24.0;
+
+    let viewport_width = CARD_WIDTH
+        - if metadata_visible {
+            METADATA_WIDTH
+        } else {
+            0.0
+        }
+        - VIEWPORT_PADDING;
+    let viewport_height = CARD_HEIGHT - HEADER_HEIGHT - VIEWPORT_PADDING;
+    let horizontal = viewport_width / width.max(1) as f32;
+    let vertical = viewport_height / height.max(1) as f32;
+    horizontal
+        .min(vertical)
+        .clamp(MIN_IMAGE_ZOOM, MAX_IMAGE_ZOOM)
+}
+
+pub(super) fn is_opposite_scroll_tail(
+    previous_direction: f32,
+    elapsed: Option<Duration>,
+    vertical_delta: f32,
+    precise: bool,
+    touch_phase: TouchPhase,
+) -> bool {
+    const REVERSAL_GUARD: Duration = Duration::from_millis(120);
+
+    precise
+        && !matches!(touch_phase, TouchPhase::Started)
+        && previous_direction.abs() >= f32::EPSILON
+        && vertical_delta.abs() >= f32::EPSILON
+        && previous_direction.signum() != vertical_delta.signum()
+        && elapsed.is_some_and(|elapsed| elapsed <= REVERSAL_GUARD)
+}
+
+pub(super) fn format_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes / GB)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes / KB)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
 fn backspace_at_cursor(value: &mut String, cursor: &mut usize) {
     let offset = (*cursor).min(value.len());
     let previous = previous_char_boundary(value, offset);
@@ -3028,7 +3690,13 @@ fn delete_at_cursor(value: &mut String, cursor: &mut usize) {
 
 #[cfg(test)]
 mod modal_name_input_tests {
-    use super::{backspace_at_cursor, delete_at_cursor};
+    use super::{
+        MAX_IMAGE_ZOOM, MIN_IMAGE_ZOOM, backspace_at_cursor, delete_at_cursor, fit_image_zoom,
+        format_file_size, is_opposite_scroll_tail, next_preview_index, scaled_image_size,
+        zoom_from_scroll,
+    };
+    use gpui::TouchPhase;
+    use std::time::Duration;
 
     #[test]
     fn cursor_edits_work_at_the_middle_of_file_names() {
@@ -3047,5 +3715,78 @@ mod modal_name_input_tests {
         delete_at_cursor(&mut value, &mut cursor);
         assert_eq!(value, "新建测件夹");
         assert_eq!(cursor, "新建测".len());
+    }
+
+    #[test]
+    fn image_navigation_stops_at_sequence_edges() {
+        assert_eq!(next_preview_index(1, 3, -1), Some(0));
+        assert_eq!(next_preview_index(1, 3, 1), Some(2));
+        assert_eq!(next_preview_index(0, 3, -1), None);
+        assert_eq!(next_preview_index(2, 3, 1), None);
+        assert_eq!(next_preview_index(0, 0, 1), None);
+    }
+
+    #[test]
+    fn wheel_zoom_is_smooth_and_bounded() {
+        assert!(zoom_from_scroll(1.0, 18.0) > 1.0);
+        assert!(zoom_from_scroll(1.0, -18.0) < 1.0);
+        assert_eq!(zoom_from_scroll(MAX_IMAGE_ZOOM, 10_000.0), MAX_IMAGE_ZOOM);
+        assert_eq!(zoom_from_scroll(MIN_IMAGE_ZOOM, -10_000.0), MIN_IMAGE_ZOOM);
+    }
+
+    #[test]
+    fn displayed_percentage_scales_the_real_pixel_dimensions() {
+        assert_eq!(scaled_image_size(512, 384, 1.0), (512.0, 384.0));
+        assert_eq!(scaled_image_size(512, 384, 1.25), (640.0, 480.0));
+        assert_eq!(
+            scaled_image_size(1, 1, MAX_IMAGE_ZOOM),
+            (10_000.0, 10_000.0)
+        );
+    }
+
+    #[test]
+    fn fit_zoom_uses_the_available_image_viewport() {
+        assert_eq!(fit_image_zoom(896, 614, false), 1.0);
+        assert!(fit_image_zoom(896, 614, true) < 1.0);
+        assert!(fit_image_zoom(10_000, 10_000, false) < 0.1);
+        assert_eq!(fit_image_zoom(100_000, 100_000, false), MIN_IMAGE_ZOOM);
+    }
+
+    #[test]
+    fn precise_scroll_ignores_an_immediate_opposite_tail() {
+        assert!(is_opposite_scroll_tail(
+            1.0,
+            Some(Duration::from_millis(20)),
+            -1.0,
+            true,
+            TouchPhase::Moved,
+        ));
+        assert!(!is_opposite_scroll_tail(
+            1.0,
+            Some(Duration::from_millis(200)),
+            -1.0,
+            true,
+            TouchPhase::Moved,
+        ));
+        assert!(!is_opposite_scroll_tail(
+            1.0,
+            Some(Duration::from_millis(20)),
+            -1.0,
+            false,
+            TouchPhase::Moved,
+        ));
+        assert!(!is_opposite_scroll_tail(
+            1.0,
+            Some(Duration::from_millis(20)),
+            -1.0,
+            true,
+            TouchPhase::Started,
+        ));
+    }
+
+    #[test]
+    fn image_metadata_uses_readable_file_sizes() {
+        assert_eq!(format_file_size(800), "800 B");
+        assert_eq!(format_file_size(1536), "1.5 KB");
     }
 }
