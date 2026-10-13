@@ -2,10 +2,11 @@ use gpui::{Pixels, Point, Window};
 use objc2::{ClassType, DeclaredClass, declare_class, msg_send_id, mutability};
 use objc2_app_kit::{
     NSApplication, NSDragOperation, NSDraggingContext, NSDraggingFormation, NSDraggingItem,
-    NSDraggingSession, NSDraggingSource, NSView, NSWorkspace,
+    NSDraggingSession, NSDraggingSource, NSEvent, NSEventType, NSView, NSWorkspace,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+    MainThreadMarker, NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    NSUInteger, NSURL,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
@@ -96,6 +97,15 @@ where
         let Some(event) = application.currentEvent() else {
             return false;
         };
+        // GPUI 0.2.2 can keep replaying a synthetic `MouseMoveEvent` with the
+        // left button marked as pressed after a native file drop. If the next
+        // click happens before that replay stops, trusting only GPUI's
+        // `event.dragging()` would turn the click into another file drag and
+        // swallow a folder double-click. AppKit's current event still tells us
+        // whether this callback came from a real, currently pressed drag.
+        if !native_event_can_begin_drag(event.r#type(), NSEvent::pressedMouseButtons()) {
+            return false;
+        }
 
         let workspace = NSWorkspace::sharedWorkspace();
         let location = view.convertPoint_fromView(event.locationInWindow(), None);
@@ -156,6 +166,10 @@ where
     }
 }
 
+fn native_event_can_begin_drag(event_type: NSEventType, pressed_mouse_buttons: NSUInteger) -> bool {
+    event_type == NSEventType::LeftMouseDragged && pressed_mouse_buttons & 1 != 0
+}
+
 fn finish_drag() {
     DRAG_ACTIVE.with(|active| active.set(false));
     DRAG_END_CALLBACK.with(|callback| {
@@ -192,8 +206,12 @@ pub fn end_external_file_drag() {
 
 #[cfg(test)]
 mod tests {
-    use super::{DRAG_END_CALLBACK, dragging_preview_center, end_external_file_drag};
+    use super::{
+        DRAG_END_CALLBACK, dragging_preview_center, end_external_file_drag,
+        native_event_can_begin_drag,
+    };
     use gpui::{point, px};
+    use objc2_app_kit::NSEventType;
     use objc2_foundation::NSPoint;
     use std::{cell::Cell, rc::Rc};
 
@@ -225,5 +243,19 @@ mod tests {
         end_external_file_drag();
 
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn native_drag_start_requires_a_live_left_mouse_drag_event() {
+        assert!(native_event_can_begin_drag(
+            NSEventType::LeftMouseDragged,
+            1
+        ));
+        assert!(!native_event_can_begin_drag(
+            NSEventType::LeftMouseDragged,
+            0
+        ));
+        assert!(!native_event_can_begin_drag(NSEventType::LeftMouseDown, 1));
+        assert!(!native_event_can_begin_drag(NSEventType::MouseMoved, 1));
     }
 }

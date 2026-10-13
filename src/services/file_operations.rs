@@ -1,4 +1,4 @@
-use super::{FileEngine, ensure_writable};
+use super::{FileEngine, ensure_writable, volume};
 use crate::distribution;
 use anyhow::{Context as _, Result, bail};
 use async_channel::Sender;
@@ -267,6 +267,8 @@ async fn execute_transfer(
     if !fs::metadata(&destination).await?.is_dir() {
         bail!("目标不是文件夹：{}", destination.display());
     }
+    let destination_is_smb =
+        volume::inspect_path(&destination).is_some_and(|volume| volume.is_smb());
 
     let mut plans = Vec::with_capacity(sources.len());
     let mut reserved_destinations = HashSet::new();
@@ -334,6 +336,7 @@ async fn execute_transfer(
             total_bytes,
             &mut bytes_done,
             started,
+            destination_is_smb,
         )
         .await
         {
@@ -447,6 +450,7 @@ async fn copy_plan(
     total_bytes: u64,
     bytes_done: &mut u64,
     started: Instant,
+    destination_is_smb: bool,
 ) -> Result<()> {
     for entry in &plan.entries {
         let destination = if entry.relative.as_os_str().is_empty() {
@@ -469,9 +473,10 @@ async fn copy_plan(
                     total_bytes,
                     bytes_done,
                     started,
+                    destination_is_smb,
                 )
                 .await?;
-                copy_metadata(entry.source.clone(), destination, false).await?;
+                copy_metadata(entry.source.clone(), destination, false, destination_is_smb).await?;
             }
             PlanEntryKind::Symlink => {
                 if let Some(parent) = destination.parent() {
@@ -487,7 +492,7 @@ async fn copy_plan(
                         destination.display()
                     )
                 })?;
-                copy_metadata(entry.source.clone(), destination, true).await?;
+                copy_metadata(entry.source.clone(), destination, true, destination_is_smb).await?;
             }
         }
     }
@@ -504,7 +509,7 @@ async fn copy_plan(
         } else {
             destination_root.join(&entry.relative)
         };
-        copy_metadata(entry.source.clone(), destination, false).await?;
+        copy_metadata(entry.source.clone(), destination, false, destination_is_smb).await?;
     }
     Ok(())
 }
@@ -516,6 +521,7 @@ async fn copy_file_streamed(
     total_bytes: u64,
     bytes_done: &mut u64,
     started: Instant,
+    destination_is_smb: bool,
 ) -> Result<()> {
     let mut source = fs::File::open(&entry.source).await?;
     let mut output = fs::File::create(destination).await?;
@@ -539,10 +545,13 @@ async fn copy_file_streamed(
     output.flush().await?;
     match output.sync_all().await {
         Ok(()) => {}
-        Err(error) if is_unsupported_file_sync(&error) => {
+        Err(error)
+            if is_unsupported_file_sync(&error)
+                || destination_is_smb && is_smb_metadata_capability_error(&error) =>
+        {
             // macOS SMB mounts can persist writes correctly while returning
-            // ENOTSUP for fsync. Closing the flushed file is the strongest
-            // durability boundary that filesystem provides.
+            // ENOTSUP, EINVAL, or a permission error for fsync. Closing the
+            // flushed file is the strongest durability boundary it provides.
         }
         Err(error) => {
             return Err(error)
@@ -557,6 +566,7 @@ fn is_unsupported_file_sync(error: &std::io::Error) -> bool {
         // ENOTSUP/EOPNOTSUPP on macOS. Rust versions before every platform
         // mapping was stabilized can still surface it as Uncategorized.
         || error.raw_os_error() == Some(45)
+        || error.raw_os_error() == Some(102)
 }
 
 async fn unique_transfer_path(destination: &Path) -> Result<PathBuf> {
@@ -609,13 +619,25 @@ async fn commit_staged_transfer(staging: &Path, destination: &Path, overwrite: b
     Ok(())
 }
 
-async fn copy_metadata(source: PathBuf, destination: PathBuf, no_follow: bool) -> Result<()> {
-    tokio::task::spawn_blocking(move || copy_macos_metadata(&source, &destination, no_follow))
-        .await
-        .context("文件元数据复制任务异常终止")?
+async fn copy_metadata(
+    source: PathBuf,
+    destination: PathBuf,
+    no_follow: bool,
+    destination_is_smb: bool,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        copy_macos_metadata(&source, &destination, no_follow, destination_is_smb)
+    })
+    .await
+    .context("文件元数据复制任务异常终止")?
 }
 
-fn copy_macos_metadata(source: &Path, destination: &Path, no_follow: bool) -> Result<()> {
+fn copy_macos_metadata(
+    source: &Path,
+    destination: &Path,
+    no_follow: bool,
+    destination_is_smb: bool,
+) -> Result<()> {
     const COPYFILE_ACL: u32 = 1 << 0;
     const COPYFILE_STAT: u32 = 1 << 1;
     const COPYFILE_XATTR: u32 = 1 << 2;
@@ -636,10 +658,18 @@ fn copy_macos_metadata(source: &Path, destination: &Path, no_follow: bool) -> Re
         .with_context(|| format!("源路径包含 NUL 字节：{}", source.display()))?;
     let destination_c = CString::new(destination.as_os_str().as_bytes())
         .with_context(|| format!("目标路径包含 NUL 字节：{}", destination.display()))?;
-    let flags = if no_follow {
-        COPYFILE_METADATA | COPYFILE_NOFOLLOW_SRC | COPYFILE_NOFOLLOW_DST
+    // SMB servers frequently reject macOS ACLs and extended attributes even
+    // though ordinary file writes are fully supported. Preserve basic stat
+    // data there and keep the complete macOS metadata path for local volumes.
+    let metadata_flags = if destination_is_smb {
+        COPYFILE_STAT
     } else {
         COPYFILE_METADATA
+    };
+    let flags = if no_follow {
+        metadata_flags | COPYFILE_NOFOLLOW_SRC | COPYFILE_NOFOLLOW_DST
+    } else {
+        metadata_flags
     };
     // SAFETY: Both paths are valid, NUL-terminated C strings for the duration
     // of the call. A null state is explicitly supported by macOS copyfile(3).
@@ -652,7 +682,11 @@ fn copy_macos_metadata(source: &Path, destination: &Path, no_follow: bool) -> Re
         )
     };
     if result != 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
+        let error = std::io::Error::last_os_error();
+        if destination_is_smb && is_smb_metadata_capability_error(&error) {
+            return Ok(());
+        }
+        return Err(error).with_context(|| {
             format!(
                 "无法复制 {} 的权限和 macOS 元数据到 {}",
                 source.display(),
@@ -661,6 +695,15 @@ fn copy_macos_metadata(source: &Path, destination: &Path, no_follow: bool) -> Re
         });
     }
     Ok(())
+}
+
+fn is_smb_metadata_capability_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::PermissionDenied
+    ) || matches!(error.raw_os_error(), Some(1 | 13 | 22 | 45 | 93 | 102))
 }
 
 fn send_progress(

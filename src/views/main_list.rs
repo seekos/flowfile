@@ -1251,7 +1251,11 @@ impl MainListView {
                 .on_drop(move |payload: &ExternalPaths, _, cx| {
                     let paths = payload.paths().to_vec();
                     folder_drop_finish_input.update(cx, |input, cx| {
-                        input.clear_folder_drop_hover(cx);
+                        // A drop listener consumes the synthetic mouse-up before it can
+                        // reach the list root. Finish the source interaction here so the
+                        // folder is clickable again without waiting for AppKit's
+                        // asynchronous dragging-session callback.
+                        input.finish_pointer_interaction(cx);
                     });
                     if !can_transfer_to_folder(&paths, &folder_drop_path_for_drop) {
                         return;
@@ -1554,7 +1558,11 @@ impl MainListView {
                 .on_drop(move |payload: &ExternalPaths, _, cx| {
                     let paths = payload.paths().to_vec();
                     folder_drop_finish_input.update(cx, |input, cx| {
-                        input.clear_folder_drop_hover(cx);
+                        // A drop listener consumes the synthetic mouse-up before it can
+                        // reach the list root. Finish the source interaction here so the
+                        // folder is clickable again without waiting for AppKit's
+                        // asynchronous dragging-session callback.
+                        input.finish_pointer_interaction(cx);
                     });
                     if !can_transfer_to_folder(&paths, &folder_drop_path_for_drop) {
                         return;

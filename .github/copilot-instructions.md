@@ -1,0 +1,1 @@
+- When generating git commit messages, always write them in Simplified Chinese.

@@ -65,3 +65,7 @@ block = { path = "vendor/block" }
 # GPUI 0.2.2 currently requires grid 0.18. This local source carries the
 # checked-arithmetic fix released upstream in grid 1.0.1 for GHSA-38c5-483c-4qqp.
 grid = { path = "vendor/grid" }
+# proc-macro-error2 2.0.1 privately imports proc_macro and then publicly
+# re-exports it. Rust 1.98 warns that this will become a hard error, so use
+# the API-identical local copy with the import made public.
+proc-macro-error2 = { path = "vendor/proc-macro-error2" }
