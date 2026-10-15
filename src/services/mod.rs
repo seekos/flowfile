@@ -23,13 +23,17 @@ pub use file_clipboard::{
 };
 pub use file_engine::{DirectorySnapshot, FileEngine, OpenWithApplication};
 pub use file_inspector::FileInspector;
-pub use file_operations::{ConflictPolicy, FileOperationEngine, TransferMode, TransferProgress};
+pub(crate) use file_operations::validate_file_name;
+pub use file_operations::{
+    ConflictPolicy, FileOperationEngine, TransferControl, TransferMode, TransferProgress,
+    is_transfer_cancelled,
+};
 pub use file_watcher::FileWatcher;
 pub use quick_look::{PreviewKind, QuickLookService};
 pub use sandbox_access::SandboxAccess;
 pub use search_engine::{SearchEngine, SearchScope};
 pub(crate) use smb::{SmbMountInfo, SmbNavigation, SmbShare};
 pub use terminal_session::SystemTerminal;
-pub use thumbnail_engine::ThumbnailEngine;
+pub use thumbnail_engine::{ThumbnailEngine, ThumbnailEvent};
 pub use update_checker::{AvailableUpdate, UpdateChecker};
 pub use volume::{VolumeInfo, ensure_writable};

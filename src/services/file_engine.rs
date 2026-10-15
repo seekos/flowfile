@@ -1,4 +1,7 @@
-use super::{SmbMountInfo, SmbNavigation, quick_look::is_text_extension, smb, volume};
+use super::{
+    SmbMountInfo, SmbNavigation, file_operations::TRANSFER_STAGING_PREFIX,
+    quick_look::is_text_extension, smb, volume,
+};
 use crate::distribution;
 use crate::models::{FileItem, FileKind, SortMode};
 use anyhow::{Context as _, Result};
@@ -512,6 +515,9 @@ pub async fn fetch_dir_entries_with_options(
         .with_context(|| format!("读取目录项失败：{}", path.display()))?
     {
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(TRANSFER_STAGING_PREFIX) {
+            continue;
+        }
         let is_hidden = name.starts_with('.');
         if is_hidden && !show_hidden {
             continue;
@@ -549,6 +555,11 @@ mod tests {
         fs::create_dir(directory.path().join("Alpha")).expect("create folder");
         fs::write(directory.path().join("notes.txt"), b"hello").expect("create file");
         fs::write(directory.path().join(".secret"), b"hidden").expect("create hidden file");
+        fs::write(
+            directory.path().join(".flowfile-transfer-42-0-notes.txt"),
+            b"partial",
+        )
+        .expect("create internal transfer staging file");
 
         let items = fetch_dir_entries(directory.path())
             .await
@@ -564,6 +575,11 @@ mod tests {
             .await
             .expect("read hidden entries");
         assert!(visible_hidden.iter().any(|item| item.name == ".secret"));
+        assert!(
+            visible_hidden
+                .iter()
+                .all(|item| !item.name.starts_with(".flowfile-transfer-"))
+        );
     }
 
     #[tokio::test]

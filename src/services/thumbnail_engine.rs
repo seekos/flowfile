@@ -1,7 +1,7 @@
 use super::quick_look::QuickLookService;
 use crate::models::{FileItem, FileKind};
 use anyhow::{Context as _, Result, bail};
-use gpui::{Context, RenderImage};
+use gpui::{Context, EventEmitter, RenderImage};
 use image::{
     DynamicImage, GenericImage, ImageBuffer, ImageReader, Limits, Rgba, imageops::FilterType,
 };
@@ -41,6 +41,19 @@ impl ThumbnailKey {
         Self(format!("{:x}", md5::compute(identity.as_bytes())))
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThumbnailEvent {
+    key: ThumbnailKey,
+}
+
+impl ThumbnailEvent {
+    pub fn key(&self) -> &ThumbnailKey {
+        &self.key
+    }
+}
+
+impl EventEmitter<ThumbnailEvent> for ThumbnailEngine {}
 
 struct CachedThumbnail {
     image: Arc<RenderImage>,
@@ -140,6 +153,18 @@ impl ThumbnailEngine {
         self.memory.get(&key).map(|entry| entry.image.clone())
     }
 
+    pub fn is_visible(&self, owner: usize, key: &ThumbnailKey) -> bool {
+        self.visible_by_owner
+            .get(&owner)
+            .is_some_and(|visible| visible.contains(key))
+    }
+
+    fn is_globally_visible(&self, key: &ThumbnailKey) -> bool {
+        self.visible_by_owner
+            .values()
+            .any(|visible| visible.contains(key))
+    }
+
     fn request(&mut self, item: &FileItem, cx: &mut Context<Self>) {
         let Some(key) = Self::key_for(item) else {
             return;
@@ -174,15 +199,21 @@ impl ThumbnailEngine {
             };
             let _ = this.update(cx, |engine, cx| {
                 engine.pending.remove(&key);
-                match result {
-                    Ok(Some(image)) => engine.insert(key, image),
-                    Ok(None) => {}
+                let ready_key = match result {
+                    Ok(Some(image)) => {
+                        engine.insert(key.clone(), image);
+                        engine.is_globally_visible(&key).then_some(key)
+                    }
+                    Ok(None) => None,
                     Err(error) => {
                         eprintln!("FlowFile: 缩略图生成失败：{error:#}");
                         engine.failed.insert(key);
+                        None
                     }
+                };
+                if let Some(key) = ready_key {
+                    cx.emit(ThumbnailEvent { key });
                 }
-                cx.notify();
             });
         })
         .detach();

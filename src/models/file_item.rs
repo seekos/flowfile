@@ -31,7 +31,7 @@ pub enum SortMode {
     Modified,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileItem {
     pub path: PathBuf,
     pub name: String,

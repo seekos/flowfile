@@ -9,6 +9,7 @@ mod search_bar;
 mod sidebar;
 mod status_bar;
 mod tooltip;
+mod transfer_progress;
 mod workspace;
 
 pub use workspace::WorkspaceView;

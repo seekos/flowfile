@@ -10,6 +10,7 @@ use super::{
     sidebar::SidebarView,
     status_bar::StatusBar,
     tooltip::delayed_tooltip,
+    transfer_progress::TransferProgressWindow,
 };
 #[cfg(target_os = "macos")]
 use crate::accessibility::{
@@ -25,8 +26,9 @@ use crate::{
     },
     icons::{IconName, icon},
     models::{
-        AppPreferences, CreateItemKind, Favorites, FileKind, FileOperationController, LayoutMode,
-        Model, MultiPaneModel, Pane, PaneEvent, SessionState, home_directory,
+        AppPreferences, CreateItemKind, Favorites, FileKind, FileOperationController,
+        FileOperationEvent, LayoutMode, Model, MultiPaneModel, Pane, PaneEvent, SessionState,
+        home_directory,
     },
     services::{
         AvailableUpdate, FileEngine, FileInspector, FileOperationEngine, PreviewKind,
@@ -303,6 +305,7 @@ pub struct WorkspaceView {
     modal_error: Option<String>,
     quick_look: Option<QuickLookState>,
     image_viewer_window: Option<WindowHandle<ImageViewerWindow>>,
+    transfer_window: Option<WindowHandle<TransferProgressWindow>>,
     quick_look_generation: u64,
     quick_look_focus_handle: FocusHandle,
     session_save_generation: u64,
@@ -421,7 +424,16 @@ impl WorkspaceView {
             cx.notify();
         })
         .detach();
-        cx.observe(&operations, |_, _, cx| cx.notify()).detach();
+        cx.subscribe_in(
+            &operations,
+            window,
+            |workspace, operations, event: &FileOperationEvent, _window, cx| {
+                if *event == FileOperationEvent::TransferStarted {
+                    workspace.open_transfer_progress(operations.clone(), cx);
+                }
+            },
+        )
+        .detach();
         cx.observe(&inspector, |this, inspector, cx| {
             let inspected = inspector.read(cx);
             let current_path = inspected.current_path.clone();
@@ -536,6 +548,7 @@ impl WorkspaceView {
             modal_error: None,
             quick_look: None,
             image_viewer_window: None,
+            transfer_window: None,
             quick_look_generation: 0,
             quick_look_focus_handle: cx.focus_handle(),
             session_save_generation: 0,
@@ -1367,6 +1380,30 @@ impl WorkspaceView {
             Ok(handle) => self.image_viewer_window = Some(handle),
             Err(error) => self.operations.update(cx, |operations, cx| {
                 operations.show_notice(format!("无法打开图片浏览窗口：{error}"), true, cx);
+            }),
+        }
+    }
+
+    fn open_transfer_progress(
+        &mut self,
+        operations: Entity<FileOperationController>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = self.transfer_window
+            && handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+        {
+            return;
+        }
+
+        let options = TransferProgressWindow::window_options(cx);
+        match cx.open_window(options, move |window, cx| {
+            cx.new(|cx| TransferProgressWindow::new(operations, window, cx))
+        }) {
+            Ok(handle) => self.transfer_window = Some(handle),
+            Err(error) => self.operations.update(cx, |operations, cx| {
+                operations.show_notice(format!("无法打开文件传输窗口：{error}"), true, cx);
             }),
         }
     }

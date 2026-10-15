@@ -6,7 +6,10 @@ use super::{
 use crate::{
     actions::{CopyFiles, CutFiles, PasteFiles, RenameSelected, SelectAllFiles, ToggleQuickLook},
     models::{FileItem, FileKind, FileOperationController, Model, Pane, SortMode, ViewMode},
-    services::{ThumbnailEngine, TransferMode, begin_external_file_drag, end_external_file_drag},
+    services::{
+        ThumbnailEngine, ThumbnailEvent, TransferMode, begin_external_file_drag,
+        end_external_file_drag,
+    },
     theme,
 };
 use gpui::{
@@ -20,7 +23,7 @@ use gpui::{
 };
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -337,7 +340,16 @@ impl MainListView {
     ) -> Self {
         cx.observe(&pane, |_, _, cx| cx.notify()).detach();
         cx.observe(&operations, |_, _, cx| cx.notify()).detach();
-        cx.observe(&thumbnails, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(
+            &thumbnails,
+            |this, thumbnails, event: &ThumbnailEvent, cx| {
+                let visible = thumbnails.read(cx).is_visible(this.pane_index, event.key());
+                if visible {
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         Self {
             pane_index,
             pane,
@@ -1700,10 +1712,12 @@ impl MainListView {
         self.rename_selected_range = cursor..cursor;
         self.rename_selection_reversed = false;
         self.rename_marked_range = None;
-        self.pane.update(cx, |pane, cx| {
-            pane.set_rename_buffer(replacement);
-            cx.notify();
-        });
+        self.pane
+            .update(cx, |pane, _| pane.set_rename_buffer(replacement));
+        // The rename buffer is rendered only by this list. Notifying the Pane
+        // would fan every keystroke out to the address bar, search bar,
+        // sidebar, status bar and workspace session persistence.
+        cx.notify();
     }
 
     fn rename_offset_from_utf16(&self, offset: usize, cx: &App) -> usize {
@@ -2051,10 +2065,12 @@ impl EntityInputHandler for MainListView {
             .unwrap_or(inserted.end..inserted.end);
         self.rename_selection_reversed = false;
 
-        self.pane.update(cx, |pane, cx| {
-            pane.set_rename_buffer(replacement);
-            cx.notify();
-        });
+        self.pane
+            .update(cx, |pane, _| pane.set_rename_buffer(replacement));
+        // IME composition updates are local to the rename editor too. Keep
+        // them off the pane-wide notification path so composition stays
+        // responsive while transfers are producing their own UI activity.
+        cx.notify();
     }
 
     fn bounds_for_range(
@@ -2100,10 +2116,10 @@ impl Render for MainListView {
                     }
                 }));
         }
-        let (items, rename_index, sort_mode, is_loading, view_mode, show_absolute_path) = {
+        let (item_count, rename_index, sort_mode, is_loading, view_mode, show_absolute_path) = {
             let pane = self.pane.read(cx);
             (
-                pane.items.clone(),
+                pane.items.len(),
                 pane.rename_index,
                 pane.sort_mode,
                 pane.is_loading,
@@ -2123,7 +2139,10 @@ impl Render for MainListView {
             self.rename_horizontal_offset = px(0.0);
             self.rename_is_selecting = false;
             if let Some(index) = rename_index {
-                self.rename_selected_range = items
+                self.rename_selected_range = self
+                    .pane
+                    .read(cx)
+                    .items
                     .get(index)
                     .map(initial_rename_selection)
                     .unwrap_or_else(|| {
@@ -2144,19 +2163,23 @@ impl Render for MainListView {
         let detail_blank_focus_handle = self.focus_handle.clone();
         let viewport_bounds = self.viewport_bounds.clone();
         let pane_index = self.pane_index;
-        if items.is_empty() {
+        // Query NSPasteboard once for this render. Calling changeCount for
+        // every visible item makes each rename keystroke cross into AppKit
+        // dozens of times in a dense directory.
+        let cut_paths = self.operations.read(cx).cut_paths();
+        if item_count == 0 {
             self.thumbnails.update(cx, |engine, cx| {
                 engine.set_visible(self.pane_index, &[], cx)
             });
         }
 
         let body = match view_mode {
-            ViewMode::Details => {
-                let item_count = items.len();
-                uniform_list(
-                    ("file-details", self.pane_index),
-                    item_count,
-                    cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+            ViewMode::Details => uniform_list(
+                ("file-details", self.pane_index),
+                item_count,
+                cx.processor({
+                    let cut_paths = cut_paths.clone();
+                    move |this, range: std::ops::Range<usize>, _window, cx| {
                         this.visible_indices.borrow_mut().clear();
                         this.visible_indices.borrow_mut().extend(range.clone());
                         let visible = {
@@ -2180,7 +2203,7 @@ impl Render for MainListView {
                                         pane.rename_buffer.clone(),
                                     )
                                 };
-                                let is_cut = this.operations.read(cx).is_cut_path(&item.path);
+                                let is_cut = cut_paths.contains(&item.path);
                                 let is_dragging = this.dragging_paths.contains(&item.path);
                                 let thumbnail = this
                                     .thumbnails
@@ -2200,14 +2223,15 @@ impl Render for MainListView {
                                 )
                             })
                             .collect::<Vec<_>>()
-                    }),
-                )
-                .size_full()
-                .into_any_element()
-            }
+                    }
+                }),
+            )
+            .size_full()
+            .into_any_element(),
             ViewMode::Grid => {
                 let columns = self.grid_columns;
-                let row_count = items.len().div_ceil(columns);
+                let row_count = item_count.div_ceil(columns);
+                let cut_paths: HashSet<PathBuf> = cut_paths.clone();
                 uniform_list(
                     ("file-grid", self.pane_index),
                     row_count,
@@ -2240,7 +2264,7 @@ impl Render for MainListView {
                                             pane.selected_paths(),
                                         )
                                     };
-                                    let is_cut = this.operations.read(cx).is_cut_path(&item.path);
+                                    let is_cut = cut_paths.contains(&item.path);
                                     let is_dragging = this.dragging_paths.contains(&item.path);
                                     let thumbnail = this
                                         .thumbnails

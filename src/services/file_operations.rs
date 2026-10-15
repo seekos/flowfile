@@ -5,28 +5,79 @@ use async_channel::Sender;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    error::Error,
     ffi::{CString, OsString},
+    fmt,
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     ptr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::Instant,
 };
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
     runtime::Handle,
+    sync::Notify,
 };
 
 const COPY_BUFFER_SIZE: usize = 256 * 1024;
+pub(super) const TRANSFER_STAGING_PREFIX: &str = ".flowfile-transfer-";
 static TRANSFER_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static FILE_MUTATION_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static FILE_MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static FILE_MUTATIONS: LazyLock<Mutex<Vec<ActiveFileMutation>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
-fn begin_file_mutation() -> Result<tokio::sync::MutexGuard<'static, ()>> {
-    FILE_MUTATION_GATE
-        .try_lock()
-        .map_err(|_| anyhow::anyhow!("另一个文件操作正在进行，请完成后重试"))
+struct ActiveFileMutation {
+    id: u64,
+    paths: Vec<PathBuf>,
+}
+
+struct FileMutationGuard {
+    id: u64,
+}
+
+impl Drop for FileMutationGuard {
+    fn drop(&mut self) {
+        let mut mutations = FILE_MUTATIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        mutations.retain(|mutation| mutation.id != self.id);
+    }
+}
+
+fn begin_file_mutation(mut paths: Vec<PathBuf>) -> Result<FileMutationGuard> {
+    paths.sort();
+    paths.dedup();
+
+    let mut mutations = FILE_MUTATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(conflicting_path) = paths.iter().find(|candidate| {
+        mutations.iter().any(|mutation| {
+            mutation
+                .paths
+                .iter()
+                .any(|active| mutation_paths_overlap(candidate, active))
+        })
+    }) {
+        bail!(
+            "{} 正在被另一个文件操作使用，请完成后重试",
+            conflicting_path.display()
+        );
+    }
+
+    let id = FILE_MUTATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    mutations.push(ActiveFileMutation { id, paths });
+    Ok(FileMutationGuard { id })
+}
+
+fn mutation_paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -60,6 +111,84 @@ pub struct TransferProgress {
     pub speed_bytes_per_second: f64,
 }
 
+#[derive(Clone, Debug)]
+pub struct TransferControl {
+    state: Arc<TransferControlState>,
+}
+
+#[derive(Debug)]
+struct TransferControlState {
+    paused: AtomicBool,
+    cancelled: AtomicBool,
+    wake: Notify,
+}
+
+impl Default for TransferControl {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(TransferControlState {
+                paused: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
+                wake: Notify::new(),
+            }),
+        }
+    }
+}
+
+impl TransferControl {
+    pub fn pause(&self) {
+        if !self.is_cancelled() {
+            self.state.paused.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn resume(&self) {
+        self.state.paused.store(false, Ordering::Release);
+        self.state.wake.notify_waiters();
+    }
+
+    pub fn cancel(&self) {
+        self.state.cancelled.store(true, Ordering::Release);
+        self.state.paused.store(false, Ordering::Release);
+        self.state.wake.notify_waiters();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.state.paused.load(Ordering::Acquire)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn checkpoint(&self) -> Result<()> {
+        loop {
+            if self.is_cancelled() {
+                return Err(TransferCancelled.into());
+            }
+            if !self.is_paused() {
+                return Ok(());
+            }
+            self.state.wake.notified().await;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TransferCancelled;
+
+impl fmt::Display for TransferCancelled {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("文件传输已停止")
+    }
+}
+
+impl Error for TransferCancelled {}
+
+pub fn is_transfer_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<TransferCancelled>().is_some()
+}
+
 #[derive(Clone)]
 pub struct FileOperationEngine {
     runtime: Handle,
@@ -79,11 +208,19 @@ impl FileOperationEngine {
         mode: TransferMode,
         conflict_policy: ConflictPolicy,
         progress: Sender<TransferProgress>,
+        control: TransferControl,
     ) -> Result<Vec<PathBuf>> {
         self.runtime
             .spawn(async move {
-                let _guard = begin_file_mutation()?;
-                execute_transfer(sources, destination, mode, conflict_policy, progress).await
+                execute_transfer_controlled(
+                    sources,
+                    destination,
+                    mode,
+                    conflict_policy,
+                    progress,
+                    control,
+                )
+                .await
             })
             .await
             .context("文件传输任务异常终止")?
@@ -92,10 +229,10 @@ impl FileOperationEngine {
     pub async fn create_directory(&self, parent: PathBuf, name: String) -> Result<PathBuf> {
         self.runtime
             .spawn(async move {
-                let _guard = begin_file_mutation()?;
                 ensure_writable(&parent)?;
                 validate_file_name(&name)?;
                 let path = available_path(&parent.join(name)).await?;
+                let _guard = begin_file_mutation(vec![path.clone()])?;
                 fs::create_dir(&path)
                     .await
                     .with_context(|| format!("无法创建文件夹 {}", path.display()))?;
@@ -108,10 +245,10 @@ impl FileOperationEngine {
     pub async fn create_text_file(&self, parent: PathBuf, name: String) -> Result<PathBuf> {
         self.runtime
             .spawn(async move {
-                let _guard = begin_file_mutation()?;
                 ensure_writable(&parent)?;
                 validate_file_name(&name)?;
                 let path = available_path(&parent.join(name)).await?;
+                let _guard = begin_file_mutation(vec![path.clone()])?;
                 fs::File::create(&path)
                     .await
                     .with_context(|| format!("无法创建文件 {}", path.display()))?;
@@ -123,10 +260,7 @@ impl FileOperationEngine {
 
     pub async fn rename(&self, source: PathBuf, new_name: String) -> Result<PathBuf> {
         self.runtime
-            .spawn(async move {
-                let _guard = begin_file_mutation()?;
-                rename_path(source, new_name).await
-            })
+            .spawn(async move { rename_path(source, new_name).await })
             .await
             .context("重命名任务异常终止")?
     }
@@ -134,7 +268,7 @@ impl FileOperationEngine {
     pub async fn move_to_trash(&self, paths: Vec<PathBuf>) -> Result<()> {
         self.runtime
             .spawn(async move {
-                let _guard = begin_file_mutation()?;
+                let _guard = begin_file_mutation(paths.clone())?;
                 tokio::task::spawn_blocking(move || {
                     for path in &paths {
                         ensure_writable(path)?;
@@ -151,7 +285,7 @@ impl FileOperationEngine {
     pub async fn delete_permanently(&self, paths: Vec<PathBuf>) -> Result<()> {
         self.runtime
             .spawn(async move {
-                let _guard = begin_file_mutation()?;
+                let _guard = begin_file_mutation(paths.clone())?;
                 for path in paths {
                     ensure_writable(&path)?;
                     let metadata = fs::symlink_metadata(&path)
@@ -211,6 +345,7 @@ async fn rename_path(source: PathBuf, new_name: String) -> Result<PathBuf> {
     if source == destination {
         return Ok(source);
     }
+    let _guard = begin_file_mutation(vec![source.clone(), destination.clone()])?;
     if fs::try_exists(&destination).await? {
         bail!("目标名称已存在：{}", destination.display());
     }
@@ -231,6 +366,15 @@ struct TransferPlan {
     total_bytes: u64,
 }
 
+struct CopyContext<'a> {
+    progress: &'a Sender<TransferProgress>,
+    total_bytes: u64,
+    bytes_done: &'a mut u64,
+    started: Instant,
+    destination_is_smb: bool,
+    control: &'a TransferControl,
+}
+
 struct PlanEntry {
     source: PathBuf,
     relative: PathBuf,
@@ -245,13 +389,15 @@ enum PlanEntryKind {
     Symlink,
 }
 
-async fn execute_transfer(
+async fn execute_transfer_controlled(
     sources: Vec<PathBuf>,
     destination: PathBuf,
     mode: TransferMode,
     conflict_policy: ConflictPolicy,
     progress: Sender<TransferProgress>,
+    control: TransferControl,
 ) -> Result<Vec<PathBuf>> {
+    control.checkpoint().await?;
     ensure_writable(&destination)?;
     if mode == TransferMode::Move {
         for source in &sources {
@@ -270,9 +416,10 @@ async fn execute_transfer(
     let destination_is_smb =
         volume::inspect_path(&destination).is_some_and(|volume| volume.is_smb());
 
-    let mut plans = Vec::with_capacity(sources.len());
+    let mut roots = Vec::with_capacity(sources.len());
     let mut reserved_destinations = HashSet::new();
     for source in sources {
+        control.checkpoint().await?;
         let source_metadata = fs::symlink_metadata(&source)
             .await
             .with_context(|| format!("无法读取 {}", source.display()))?;
@@ -290,15 +437,29 @@ async fn execute_transfer(
         {
             bail!("源文件已经位于目标文件夹中");
         }
-        let plan = build_plan(
-            source,
+        let destination_root = select_destination_root(
+            &source,
             &destination,
             conflict_policy,
             &reserved_destinations,
         )
         .await?;
-        reserved_destinations.insert(plan.destination_root.clone());
-        plans.push(plan);
+        reserved_destinations.insert(destination_root.clone());
+        roots.push((source, destination_root));
+    }
+
+    // Only paths touched by this transfer are reserved. Sibling files and
+    // unrelated folders remain available for rename, create, delete, and
+    // other background work while a long copy is running.
+    let mutation_paths = roots
+        .iter()
+        .flat_map(|(source, destination)| [source.clone(), destination.clone()])
+        .collect();
+    let _guard = begin_file_mutation(mutation_paths)?;
+
+    let mut plans = Vec::with_capacity(roots.len());
+    for (source_root, destination_root) in roots {
+        plans.push(build_plan(source_root, destination_root, &control).await?);
     }
 
     let total_bytes = plans.iter().map(|plan| plan.total_bytes).sum();
@@ -309,6 +470,7 @@ async fn execute_transfer(
     send_progress(&progress, "准备传输", bytes_done, total_bytes, started);
 
     for plan in plans {
+        control.checkpoint().await?;
         let current_file = plan
             .source_root
             .file_name()
@@ -329,17 +491,15 @@ async fn execute_transfer(
         }
 
         let staging_root = unique_transfer_path(&plan.destination_root).await?;
-        if let Err(error) = copy_plan(
-            &plan,
-            &staging_root,
-            &progress,
+        let mut copy_context = CopyContext {
+            progress: &progress,
             total_bytes,
-            &mut bytes_done,
+            bytes_done: &mut bytes_done,
             started,
             destination_is_smb,
-        )
-        .await
-        {
+            control: &control,
+        };
+        if let Err(error) = copy_plan(&plan, &staging_root, &mut copy_context).await {
             let _ = remove_existing(&staging_root).await;
             return Err(error).with_context(|| {
                 format!(
@@ -347,6 +507,10 @@ async fn execute_transfer(
                     plan.source_root.display()
                 )
             });
+        }
+        if let Err(error) = control.checkpoint().await {
+            let _ = remove_existing(&staging_root).await;
+            return Err(error);
         }
         if let Err(error) = commit_staged_transfer(
             &staging_root,
@@ -360,6 +524,7 @@ async fn execute_transfer(
         }
 
         if mode == TransferMode::Move {
+            control.checkpoint().await?;
             remove_existing(&plan.source_root).await.with_context(|| {
                 format!(
                     "目标已完整写入，但无法删除源项目 {}",
@@ -376,29 +541,55 @@ async fn execute_transfer(
     Ok(destinations)
 }
 
-async fn build_plan(
-    source_root: PathBuf,
+#[cfg(test)]
+async fn execute_transfer(
+    sources: Vec<PathBuf>,
+    destination: PathBuf,
+    mode: TransferMode,
+    conflict_policy: ConflictPolicy,
+    progress: Sender<TransferProgress>,
+) -> Result<Vec<PathBuf>> {
+    execute_transfer_controlled(
+        sources,
+        destination,
+        mode,
+        conflict_policy,
+        progress,
+        TransferControl::default(),
+    )
+    .await
+}
+
+async fn select_destination_root(
+    source_root: &Path,
     destination: &Path,
     conflict_policy: ConflictPolicy,
     reserved_destinations: &HashSet<PathBuf>,
-) -> Result<TransferPlan> {
+) -> Result<PathBuf> {
     let file_name = source_root
         .file_name()
         .context("无法确定源文件名称")?
         .to_owned();
     let desired_destination = destination.join(file_name);
-    let destination_root = match conflict_policy {
+    Ok(match conflict_policy {
         ConflictPolicy::AutoRename => {
             available_path_with_reserved(&desired_destination, reserved_destinations).await?
         }
         ConflictPolicy::Overwrite => desired_destination,
-    };
+    })
+}
 
+async fn build_plan(
+    source_root: PathBuf,
+    destination_root: PathBuf,
+    control: &TransferControl,
+) -> Result<TransferPlan> {
     let mut entries = Vec::new();
     let mut stack = vec![(source_root.clone(), PathBuf::new())];
     let mut total_bytes = 0_u64;
 
     while let Some((source, relative)) = stack.pop() {
+        control.checkpoint().await?;
         let metadata = fs::symlink_metadata(&source)
             .await
             .with_context(|| format!("无法读取 {}", source.display()))?;
@@ -446,13 +637,10 @@ async fn build_plan(
 async fn copy_plan(
     plan: &TransferPlan,
     destination_root: &Path,
-    progress: &Sender<TransferProgress>,
-    total_bytes: u64,
-    bytes_done: &mut u64,
-    started: Instant,
-    destination_is_smb: bool,
+    context: &mut CopyContext<'_>,
 ) -> Result<()> {
     for entry in &plan.entries {
+        context.control.checkpoint().await?;
         let destination = if entry.relative.as_os_str().is_empty() {
             destination_root.to_path_buf()
         } else {
@@ -466,17 +654,15 @@ async fn copy_plan(
                 if let Some(parent) = destination.parent() {
                     fs::create_dir_all(parent).await?;
                 }
-                copy_file_streamed(
-                    entry,
-                    &destination,
-                    progress,
-                    total_bytes,
-                    bytes_done,
-                    started,
-                    destination_is_smb,
+                copy_file_streamed(entry, &destination, context).await?;
+                context.control.checkpoint().await?;
+                copy_metadata(
+                    entry.source.clone(),
+                    destination,
+                    false,
+                    context.destination_is_smb,
                 )
                 .await?;
-                copy_metadata(entry.source.clone(), destination, false, destination_is_smb).await?;
             }
             PlanEntryKind::Symlink => {
                 if let Some(parent) = destination.parent() {
@@ -492,7 +678,14 @@ async fn copy_plan(
                         destination.display()
                     )
                 })?;
-                copy_metadata(entry.source.clone(), destination, true, destination_is_smb).await?;
+                context.control.checkpoint().await?;
+                copy_metadata(
+                    entry.source.clone(),
+                    destination,
+                    true,
+                    context.destination_is_smb,
+                )
+                .await?;
             }
         }
     }
@@ -504,12 +697,19 @@ async fn copy_plan(
         .collect::<Vec<_>>();
     directories.sort_by_key(|entry| std::cmp::Reverse(entry.relative.components().count()));
     for entry in directories {
+        context.control.checkpoint().await?;
         let destination = if entry.relative.as_os_str().is_empty() {
             destination_root.to_path_buf()
         } else {
             destination_root.join(&entry.relative)
         };
-        copy_metadata(entry.source.clone(), destination, false, destination_is_smb).await?;
+        copy_metadata(
+            entry.source.clone(),
+            destination,
+            false,
+            context.destination_is_smb,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -517,11 +717,7 @@ async fn copy_plan(
 async fn copy_file_streamed(
     entry: &PlanEntry,
     destination: &Path,
-    progress: &Sender<TransferProgress>,
-    total_bytes: u64,
-    bytes_done: &mut u64,
-    started: Instant,
-    destination_is_smb: bool,
+    context: &mut CopyContext<'_>,
 ) -> Result<()> {
     let mut source = fs::File::open(&entry.source).await?;
     let mut output = fs::File::create(destination).await?;
@@ -534,20 +730,28 @@ async fn copy_file_streamed(
         .unwrap_or("文件");
 
     loop {
+        context.control.checkpoint().await?;
         let read = source.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
         output.write_all(&buffer[..read]).await?;
-        *bytes_done += read as u64;
-        send_progress(progress, current_file, *bytes_done, total_bytes, started);
+        *context.bytes_done += read as u64;
+        send_progress(
+            context.progress,
+            current_file,
+            *context.bytes_done,
+            context.total_bytes,
+            context.started,
+        );
     }
+    context.control.checkpoint().await?;
     output.flush().await?;
     match output.sync_all().await {
         Ok(()) => {}
         Err(error)
             if is_unsupported_file_sync(&error)
-                || destination_is_smb && is_smb_metadata_capability_error(&error) =>
+                || context.destination_is_smb && is_smb_metadata_capability_error(&error) =>
         {
             // macOS SMB mounts can persist writes correctly while returning
             // ENOTSUP, EINVAL, or a permission error for fsync. Closing the
@@ -574,7 +778,7 @@ async fn unique_transfer_path(destination: &Path) -> Result<PathBuf> {
     let file_name = destination.file_name().unwrap_or_default();
     loop {
         let sequence = TRANSFER_PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let mut temporary_name = OsString::from(".flowfile-transfer-");
+        let mut temporary_name = OsString::from(TRANSFER_STAGING_PREFIX);
         temporary_name.push(format!("{}-{sequence}-", std::process::id()));
         temporary_name.push(file_name);
         let candidate = parent.join(temporary_name);
@@ -773,7 +977,7 @@ async fn remove_existing(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_file_name(name: &str) -> Result<()> {
+pub(crate) fn validate_file_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
         bail!("名称不能为空");
     }
@@ -786,15 +990,16 @@ fn validate_file_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConflictPolicy, TransferMode, available_path, execute_transfer, is_unsupported_file_sync,
-        rename_path, send_progress,
+        ConflictPolicy, TransferControl, TransferMode, available_path, begin_file_mutation,
+        execute_transfer, execute_transfer_controlled, is_transfer_cancelled,
+        is_unsupported_file_sync, rename_path, send_progress,
     };
     use std::{
         fs,
         os::unix::fs::{PermissionsExt as _, symlink},
         path::PathBuf,
         process::Command,
-        time::Instant,
+        time::{Duration, Instant},
     };
 
     #[test]
@@ -819,6 +1024,100 @@ mod tests {
         assert!(!is_unsupported_file_sync(
             &std::io::Error::from_raw_os_error(5)
         ));
+    }
+
+    #[tokio::test]
+    async fn paused_transfer_waits_until_it_is_resumed() {
+        let control = TransferControl::default();
+        control.pause();
+        let checkpoint_control = control.clone();
+        let checkpoint = tokio::spawn(async move { checkpoint_control.checkpoint().await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!checkpoint.is_finished());
+
+        control.resume();
+        tokio::time::timeout(Duration::from_secs(1), checkpoint)
+            .await
+            .expect("resume wakes paused transfer")
+            .expect("checkpoint task")
+            .expect("checkpoint succeeds");
+    }
+
+    #[tokio::test]
+    async fn stopped_transfer_keeps_source_and_does_not_create_destination() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let destination_directory = tempfile::tempdir().expect("destination directory");
+        let source = source_directory.path().join("large.bin");
+        fs::write(&source, b"source remains intact").expect("write source");
+        let control = TransferControl::default();
+        control.cancel();
+        let (progress, _receiver) = async_channel::bounded(1);
+
+        let error = execute_transfer_controlled(
+            vec![source.clone()],
+            destination_directory.path().to_path_buf(),
+            TransferMode::Copy,
+            ConflictPolicy::AutoRename,
+            progress,
+            control,
+        )
+        .await
+        .expect_err("cancelled transfer");
+
+        assert!(is_transfer_cancelled(&error));
+        assert!(source.exists());
+        assert!(!destination_directory.path().join("large.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn stopping_an_active_copy_removes_its_hidden_staging_file() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let destination_directory = tempfile::tempdir().expect("destination directory");
+        let source = source_directory.path().join("large.bin");
+        let source_file = fs::File::create(&source).expect("create source");
+        source_file.set_len(16 * 1024 * 1024).expect("size source");
+        let control = TransferControl::default();
+        let task_control = control.clone();
+        let (progress, receiver) = async_channel::bounded(1);
+        let destination = destination_directory.path().to_path_buf();
+        let transfer = tokio::spawn(async move {
+            execute_transfer_controlled(
+                vec![source],
+                destination,
+                TransferMode::Copy,
+                ConflictPolicy::AutoRename,
+                progress,
+                task_control,
+            )
+            .await
+        });
+
+        loop {
+            let snapshot = receiver.recv().await.expect("copy progress");
+            if snapshot.bytes_done > 0 {
+                break;
+            }
+        }
+        control.pause();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        control.cancel();
+
+        let error = transfer
+            .await
+            .expect("transfer task")
+            .expect_err("stopped active copy");
+        assert!(is_transfer_cancelled(&error));
+        assert!(!destination_directory.path().join("large.bin").exists());
+        assert!(
+            fs::read_dir(destination_directory.path())
+                .expect("read destination")
+                .all(|entry| !entry
+                    .expect("destination entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".flowfile-transfer-"))
+        );
     }
 
     #[tokio::test]
@@ -1112,6 +1411,39 @@ mod tests {
             fs::read(destination.join("inside.txt")).unwrap(),
             b"flowfile"
         );
+    }
+
+    #[tokio::test]
+    async fn unrelated_file_can_be_renamed_during_a_transfer() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let source = directory.path().join("large-source.bin");
+        let transfer_destination = directory.path().join("large-source (1).bin");
+        let unrelated = directory.path().join("notes.txt");
+        fs::write(&source, b"copying").expect("write transfer source");
+        fs::write(&unrelated, b"editable").expect("write unrelated file");
+        let _transfer_guard = begin_file_mutation(vec![source, transfer_destination])
+            .expect("reserve transfer paths");
+
+        let renamed = rename_path(unrelated, "renamed.txt".to_string())
+            .await
+            .expect("rename unrelated file during transfer");
+
+        assert_eq!(fs::read(renamed).unwrap(), b"editable");
+    }
+
+    #[tokio::test]
+    async fn file_used_by_a_transfer_remains_protected() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let source = directory.path().join("source.bin");
+        fs::write(&source, b"copying").expect("write transfer source");
+        let _transfer_guard =
+            begin_file_mutation(vec![source.clone()]).expect("reserve transfer source");
+
+        let error = rename_path(source, "renamed.bin".to_string())
+            .await
+            .expect_err("renaming the active source must be rejected");
+
+        assert!(error.to_string().contains("正在被另一个文件操作使用"));
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use super::{FileItem, FileKind, SortMode};
 use crate::services::{
     DirectorySnapshot, FileEngine, FileOperationEngine, FileWatcher, SearchEngine, SearchScope,
-    SmbNavigation, SmbShare,
+    SmbNavigation, SmbShare, validate_file_name,
 };
 use gpui::{Context, EventEmitter, Timer};
 use serde::{Deserialize, Serialize};
@@ -12,10 +12,12 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub(crate) const NAVIGATION_HISTORY_LIMIT: usize = 100;
+const WATCHER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(150);
+const WATCHER_MAX_LATENCY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ViewMode {
@@ -130,6 +132,7 @@ pub struct Pane {
     search_generation: u64,
     search_cancellation: Option<Arc<AtomicBool>>,
     load_generation: u64,
+    contents_generation: u64,
     watcher_generation: u64,
     watcher: Option<FileWatcher>,
     smb_server_root: bool,
@@ -172,6 +175,7 @@ impl Pane {
             search_generation: 0,
             search_cancellation: None,
             load_generation: 0,
+            contents_generation: 0,
             watcher_generation: 0,
             watcher: None,
             smb_server_root: false,
@@ -670,7 +674,7 @@ impl Pane {
     }
 
     pub fn begin_rename(&mut self) {
-        if self.smb_server_root {
+        if self.smb_server_root || self.rename_in_progress {
             return;
         }
         if self.selection_count() != 1 {
@@ -718,15 +722,35 @@ impl Pane {
             return;
         };
         let new_name = self.rename_buffer.trim().to_string();
+        if let Err(error) = validate_file_name(&new_name) {
+            self.error_message = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        let destination = source
+            .parent()
+            .map(|parent| parent.join(&new_name))
+            .unwrap_or_else(|| source.clone());
+        if source == destination {
+            self.cancel_rename();
+            cx.notify();
+            return;
+        }
         let engine = self.operation_engine.clone();
-        self.rename_in_progress = true;
+        // A rename on an SMB volume can take a noticeable round trip. Close
+        // the editor immediately so the foreground remains interactive while
+        // the filesystem operation completes on the background runtime.
+        self.mark_rename_pending();
+        self.error_message = None;
+        cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let result = engine.rename(source, new_name).await;
+            let result = engine.rename(source.clone(), new_name).await;
             let _ = this.update(cx, |pane, cx| match result {
-                Ok(_) => {
-                    pane.cancel_rename();
-                    pane.refresh(cx);
+                Ok(destination) => {
+                    pane.rename_in_progress = false;
+                    pane.apply_completed_rename(&source, &destination);
+                    cx.notify();
                 }
                 Err(error) => {
                     pane.rename_in_progress = false;
@@ -736,6 +760,50 @@ impl Pane {
             });
         })
         .detach();
+    }
+
+    fn mark_rename_pending(&mut self) {
+        self.rename_index = None;
+        self.rename_buffer.clear();
+        self.rename_in_progress = true;
+    }
+
+    fn apply_completed_rename(&mut self, source: &Path, destination: &Path) {
+        let mut selected_paths = self.selected_paths().into_iter().collect::<HashSet<_>>();
+        if selected_paths.remove(source) {
+            selected_paths.insert(destination.to_path_buf());
+        }
+        let renaming_path = self
+            .rename_index
+            .and_then(|index| self.items.get(index))
+            .map(|item| {
+                if item.path == source {
+                    destination.to_path_buf()
+                } else {
+                    item.path.clone()
+                }
+            });
+
+        update_renamed_item(&mut self.items, source, destination);
+        update_renamed_item(&mut self.search_original_items, source, destination);
+        self.contents_generation = self.contents_generation.wrapping_add(1);
+        if !self.search_active {
+            FileItem::sort_items(&mut self.items, self.sort_mode);
+        }
+
+        self.selected_indices = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| selected_paths.contains(&item.path))
+            .map(|(index, _)| index)
+            .collect();
+        self.selected_index = self.selected_indices.iter().next_back().copied();
+        self.rename_index = renaming_path.and_then(|renaming_path| {
+            self.items
+                .iter()
+                .position(|item| item.path == renaming_path)
+        });
     }
 
     fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -838,6 +906,7 @@ impl Pane {
                 kind: FileKind::Folder,
             })
             .collect();
+        self.contents_generation = self.contents_generation.wrapping_add(1);
         FileItem::sort_items(&mut self.items, self.sort_mode);
         self.selected_index = None;
         self.selected_indices.clear();
@@ -859,13 +928,22 @@ impl Pane {
     fn apply_snapshot(&mut self, snapshot: DirectorySnapshot, intent: NavigationIntent) {
         if self.search_active && matches!(&intent, NavigationIntent::Refresh) {
             self.search_original_items = snapshot.items;
+            self.contents_generation = self.contents_generation.wrapping_add(1);
             return;
         }
-        let selected_paths = if matches!(&intent, NavigationIntent::Refresh) {
+        let is_refresh = matches!(&intent, NavigationIntent::Refresh);
+        let selected_paths = if is_refresh {
             self.selected_paths().into_iter().collect::<HashSet<_>>()
         } else {
             HashSet::new()
         };
+        let renaming_path = is_refresh
+            .then(|| {
+                self.rename_index
+                    .and_then(|index| self.items.get(index))
+                    .map(|item| item.path.clone())
+            })
+            .flatten();
 
         match intent {
             NavigationIntent::Push => self.active_tab_mut().push_path(snapshot.path.clone()),
@@ -888,6 +966,7 @@ impl Pane {
             self.smb_mount = None;
         }
         self.items = snapshot.items;
+        self.contents_generation = self.contents_generation.wrapping_add(1);
         self.selected_indices = self
             .items
             .iter()
@@ -896,8 +975,15 @@ impl Pane {
             .map(|(index, _)| index)
             .collect();
         self.selected_index = self.selected_indices.iter().next_back().copied();
-        self.rename_index = None;
-        self.rename_in_progress = false;
+        self.rename_index = renaming_path.and_then(|renaming_path| {
+            self.items
+                .iter()
+                .position(|item| item.path == renaming_path)
+        });
+        if self.rename_index.is_none() {
+            self.rename_buffer.clear();
+            self.rename_in_progress = false;
+        }
     }
 
     pub fn is_smb_server_root(&self) -> bool {
@@ -954,24 +1040,123 @@ impl Pane {
             }
         };
         self.watcher = Some(watcher);
+        let engine = self.engine.clone();
 
         cx.spawn(async move |this, cx| {
             while receiver.recv().await.is_ok() {
-                Timer::after(Duration::from_millis(150)).await;
-                while receiver.try_recv().is_ok() {}
+                // Wait for a quiet window instead of rescanning every 150 ms
+                // while a copy is still producing filesystem events. The
+                // maximum latency keeps unrelated long-running writers live.
+                let debounce_started = Instant::now();
+                loop {
+                    Timer::after(WATCHER_DEBOUNCE_INTERVAL).await;
+                    let mut received_more = false;
+                    while receiver.try_recv().is_ok() {
+                        received_more = true;
+                    }
+                    if !received_more || debounce_started.elapsed() >= WATCHER_MAX_LATENCY {
+                        break;
+                    }
+                }
 
+                let request = this
+                    .update(cx, |pane, _| {
+                        if pane.watcher_generation != generation || pane.is_loading {
+                            return None;
+                        }
+                        Some((
+                            pane.current_path.clone(),
+                            pane.show_hidden,
+                            pane.sort_mode,
+                            pane.search_active,
+                            pane.load_generation,
+                            pane.contents_generation,
+                        ))
+                    })
+                    .ok()
+                    .flatten();
+                let Some((
+                    path,
+                    show_hidden,
+                    sort_mode,
+                    search_active,
+                    load_generation,
+                    contents_generation,
+                )) = request
+                else {
+                    let active = this
+                        .update(cx, |pane, _| pane.watcher_generation == generation)
+                        .unwrap_or(false);
+                    if !active {
+                        break;
+                    }
+                    continue;
+                };
+
+                // Await inside this one watcher task. This makes directory
+                // scans single-flight even on slow SMB volumes.
+                let result = engine
+                    .read_directory(path.clone(), show_hidden, sort_mode)
+                    .await;
                 let active = this
-                    .update(cx, |pane, _| pane.watcher_generation == generation)
+                    .update(cx, |pane, cx| {
+                        if pane.watcher_generation != generation {
+                            return false;
+                        }
+                        if pane.current_path != path
+                            || pane.show_hidden != show_hidden
+                            || pane.sort_mode != sort_mode
+                            || pane.search_active != search_active
+                            || pane.load_generation != load_generation
+                            || pane.contents_generation != contents_generation
+                        {
+                            return true;
+                        }
+                        let Ok(snapshot) = result else {
+                            return true;
+                        };
+                        if pane.watcher_snapshot_matches(&snapshot) {
+                            return true;
+                        }
+                        let visible_items_changed = !pane.search_active;
+                        pane.apply_snapshot(snapshot, NavigationIntent::Refresh);
+                        if visible_items_changed {
+                            cx.notify();
+                        }
+                        true
+                    })
                     .unwrap_or(false);
                 if !active {
                     break;
                 }
-
-                let _ = this.update(cx, |pane, cx| pane.refresh(cx));
             }
         })
         .detach();
     }
+
+    fn watcher_snapshot_matches(&self, snapshot: &DirectorySnapshot) -> bool {
+        if self.current_path != snapshot.path {
+            return false;
+        }
+        let current_items = if self.search_active {
+            &self.search_original_items
+        } else {
+            &self.items
+        };
+        current_items == &snapshot.items
+    }
+}
+
+fn update_renamed_item(items: &mut [FileItem], source: &Path, destination: &Path) {
+    let Some(item) = items.iter_mut().find(|item| item.path == source) else {
+        return;
+    };
+    item.path = destination.to_path_buf();
+    item.name = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
 }
 
 fn path_title(path: &Path) -> String {
@@ -1014,11 +1199,12 @@ pub fn home_directory() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExplorerTab, NAVIGATION_HISTORY_LIMIT, Pane, SmbMountContext, ViewMode, should_navigate_to,
+        ExplorerTab, NAVIGATION_HISTORY_LIMIT, NavigationIntent, Pane, SmbMountContext, ViewMode,
+        should_navigate_to,
     };
     use crate::{
         models::{FileItem, FileKind},
-        services::FileEngine,
+        services::{DirectorySnapshot, FileEngine},
     };
     use std::{collections::BTreeSet, path::PathBuf};
 
@@ -1176,6 +1362,134 @@ mod tests {
         pane.set_rename_buffer("中文文件夹".to_string());
 
         assert_eq!(pane.rename_buffer, "中文文件夹");
+    }
+
+    #[test]
+    fn completed_rename_updates_only_the_item_and_preserves_selection() {
+        let root = PathBuf::from("/tmp");
+        let source = root.join("bravo.txt");
+        let destination = root.join("aardvark.txt");
+        let item = |path: PathBuf, name: &str| FileItem {
+            path,
+            name: name.to_string(),
+            is_dir: false,
+            extension: Some("txt".to_string()),
+            size: 0,
+            modified_unix: 0,
+            modified: String::new(),
+            is_hidden: false,
+            kind: FileKind::Document,
+        };
+        let mut pane = Pane::new(root.clone(), FileEngine::new().expect("file engine"));
+        pane.items = vec![
+            item(root.join("alpha.txt"), "alpha.txt"),
+            item(source.clone(), "bravo.txt"),
+        ];
+        pane.search_original_items = vec![item(source.clone(), "bravo.txt")];
+        pane.select(1, false, false);
+        pane.rename_index = Some(0);
+        pane.rename_buffer = "alpha-edited.txt".to_string();
+
+        pane.apply_completed_rename(&source, &destination);
+
+        assert_eq!(pane.items[0].path, destination);
+        assert_eq!(pane.items[0].name, "aardvark.txt");
+        assert_eq!(pane.selected_indices, BTreeSet::from([0]));
+        assert_eq!(pane.selected_index, Some(0));
+        assert_eq!(pane.rename_index, Some(1));
+        assert_eq!(pane.rename_buffer, "alpha-edited.txt");
+        assert_eq!(pane.search_original_items[0].name, "aardvark.txt");
+    }
+
+    #[test]
+    fn pending_rename_closes_the_editor_before_filesystem_completion() {
+        let mut pane = Pane::new(
+            PathBuf::from("/tmp"),
+            FileEngine::new().expect("file engine"),
+        );
+        pane.rename_index = Some(0);
+        pane.rename_buffer = "after.txt".to_string();
+
+        pane.mark_rename_pending();
+
+        assert_eq!(pane.rename_index, None);
+        assert!(pane.rename_buffer.is_empty());
+        assert!(pane.rename_in_progress);
+    }
+
+    #[test]
+    fn directory_refresh_preserves_an_unrelated_rename_session() {
+        let root = PathBuf::from("/tmp");
+        let mut pane = Pane::new(root.clone(), FileEngine::new().expect("file engine"));
+        let editable = FileItem {
+            path: root.join("notes.txt"),
+            name: "notes.txt".to_string(),
+            is_dir: false,
+            extension: Some("txt".to_string()),
+            size: 0,
+            modified_unix: 0,
+            modified: String::new(),
+            is_hidden: false,
+            kind: FileKind::Document,
+        };
+        pane.items = vec![editable.clone()];
+        pane.select(0, false, false);
+        pane.begin_rename();
+        pane.set_rename_buffer("new-notes.txt".to_string());
+
+        pane.apply_snapshot(
+            DirectorySnapshot {
+                path: root.clone(),
+                items: vec![
+                    FileItem {
+                        path: root.join("copied.bin"),
+                        name: "copied.bin".to_string(),
+                        is_dir: false,
+                        extension: Some("bin".to_string()),
+                        size: 0,
+                        modified_unix: 0,
+                        modified: String::new(),
+                        is_hidden: false,
+                        kind: FileKind::Other,
+                    },
+                    editable,
+                ],
+            },
+            NavigationIntent::Refresh,
+        );
+
+        assert_eq!(pane.rename_index, Some(1));
+        assert_eq!(pane.rename_buffer, "new-notes.txt");
+    }
+
+    #[test]
+    fn watcher_refresh_skips_an_unchanged_directory_snapshot() {
+        let root = PathBuf::from("/tmp");
+        let item = FileItem {
+            path: root.join("notes.txt"),
+            name: "notes.txt".to_string(),
+            is_dir: false,
+            extension: Some("txt".to_string()),
+            size: 5,
+            modified_unix: 1,
+            modified: "now".to_string(),
+            is_hidden: false,
+            kind: FileKind::Document,
+        };
+        let mut pane = Pane::new(root.clone(), FileEngine::new().expect("file engine"));
+        pane.items = vec![item.clone()];
+
+        assert!(pane.watcher_snapshot_matches(&DirectorySnapshot {
+            path: root.clone(),
+            items: vec![item.clone()],
+        }));
+
+        let mut changed = item;
+        changed.size = 6;
+        assert!(!pane.watcher_snapshot_matches(&DirectorySnapshot {
+            path: root,
+            items: vec![changed],
+        }));
     }
 
     #[test]

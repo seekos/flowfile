@@ -1,17 +1,20 @@
 use super::{Model, MultiPaneModel};
 use crate::services::{
-    ConflictPolicy, FileOperationEngine, TransferMode, TransferProgress, clear_file_clipboard,
-    file_clipboard_change_count, read_file_clipboard, write_file_clipboard,
+    ConflictPolicy, FileOperationEngine, TransferControl, TransferMode, TransferProgress,
+    clear_file_clipboard, file_clipboard_change_count, is_transfer_cancelled, read_file_clipboard,
+    write_file_clipboard,
 };
-use gpui::Context;
+use gpui::{Context, EventEmitter};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 const CLIPBOARD_SIGNATURE: &str = "com.flowfile.files.v1";
 const SUCCESS_NOTICE_DURATION: Duration = Duration::from_secs(4);
+const TRANSFER_PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ClipboardMode {
@@ -38,6 +41,16 @@ fn native_clipboard_mode(
         .map_or(ClipboardMode::Copy, |clipboard| clipboard.mode)
 }
 
+fn take_latest_progress(
+    receiver: &async_channel::Receiver<TransferProgress>,
+    mut latest: TransferProgress,
+) -> TransferProgress {
+    while let Ok(progress) = receiver.try_recv() {
+        latest = progress;
+    }
+    latest
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CreateItemKind {
     Folder,
@@ -50,15 +63,26 @@ pub struct FileDragPayload {
     pub source_pane_index: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileOperationEvent {
+    TransferStarted,
+    TransferChanged,
+}
+
 #[derive(Clone, Debug)]
 pub struct TransferActivity {
     pub running: bool,
+    pub paused: bool,
+    pub cancelling: bool,
     pub completed_successfully: bool,
     pub current_file: String,
     pub bytes_done: u64,
     pub total_bytes: u64,
     pub speed_bytes_per_second: f64,
     pub mode: TransferMode,
+    pub item_count: usize,
+    pub source_location: PathBuf,
+    pub destination: PathBuf,
 }
 
 impl TransferActivity {
@@ -86,7 +110,10 @@ pub struct FileOperationController {
     pub notice_is_error: bool,
     notice_generation: u64,
     transfer_generation: u64,
+    transfer_control: Option<TransferControl>,
 }
+
+impl EventEmitter<FileOperationEvent> for FileOperationController {}
 
 impl FileOperationController {
     pub fn new(model: Model<MultiPaneModel>, engine: FileOperationEngine) -> Self {
@@ -100,17 +127,19 @@ impl FileOperationController {
             notice_is_error: false,
             notice_generation: 0,
             transfer_generation: 0,
+            transfer_control: None,
         }
     }
 
-    pub fn is_cut_path(&self, path: &Path) -> bool {
+    pub fn cut_paths(&self) -> HashSet<PathBuf> {
         if self.clipboard_change_count != file_clipboard_change_count() {
-            return false;
+            return HashSet::new();
         }
         self.clipboard
             .as_ref()
             .filter(|clipboard| clipboard.mode == ClipboardMode::Cut)
-            .is_some_and(|clipboard| clipboard.paths.iter().any(|cut_path| cut_path == path))
+            .map(|clipboard| clipboard.paths.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn copy_selected(&mut self, cx: &mut Context<Self>) {
@@ -231,6 +260,51 @@ impl FileOperationController {
         cx: &mut Context<Self>,
     ) {
         self.set_notice(notice, is_error, cx);
+    }
+
+    pub fn pause_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(transfer) = &mut self.transfer else {
+            return;
+        };
+        if !transfer.running || transfer.paused || transfer.cancelling {
+            return;
+        }
+        if let Some(control) = &self.transfer_control {
+            control.pause();
+            transfer.paused = true;
+            transfer.speed_bytes_per_second = 0.0;
+            cx.emit(FileOperationEvent::TransferChanged);
+        }
+    }
+
+    pub fn resume_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(transfer) = &mut self.transfer else {
+            return;
+        };
+        if !transfer.running || !transfer.paused || transfer.cancelling {
+            return;
+        }
+        if let Some(control) = &self.transfer_control {
+            control.resume();
+            transfer.paused = false;
+            cx.emit(FileOperationEvent::TransferChanged);
+        }
+    }
+
+    pub fn cancel_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(transfer) = &mut self.transfer else {
+            return;
+        };
+        if !transfer.running || transfer.cancelling {
+            return;
+        }
+        if let Some(control) = &self.transfer_control {
+            control.cancel();
+            transfer.paused = false;
+            transfer.cancelling = true;
+            transfer.speed_bytes_per_second = 0.0;
+            cx.emit(FileOperationEvent::TransferChanged);
+        }
     }
 
     pub fn move_selected_to_trash(&mut self, cx: &mut Context<Self>) {
@@ -406,8 +480,17 @@ impl FileOperationController {
         let (progress_sender, progress_receiver) = async_channel::bounded(1);
         let engine = self.engine.clone();
         let sources_for_task = sources.clone();
+        let source_location = sources
+            .first()
+            .and_then(|path| path.parent())
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        let control = TransferControl::default();
+        self.transfer_control = Some(control.clone());
         self.transfer = Some(TransferActivity {
             running: true,
+            paused: false,
+            cancelling: false,
             completed_successfully: false,
             current_file: sources
                 .first()
@@ -419,19 +502,32 @@ impl FileOperationController {
             total_bytes: 0,
             speed_bytes_per_second: 0.0,
             mode,
+            item_count: sources.len(),
+            source_location,
+            destination: destination.clone(),
         });
         self.notice = None;
+        cx.emit(FileOperationEvent::TransferStarted);
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             while let Ok(progress) = progress_receiver.recv().await {
+                // A fast local copy can produce thousands of 256 KiB updates
+                // per second. Keep the newest snapshot queued, but repaint the
+                // progress window at a modest cadence so typing, selection, and
+                // rename input keep priority on the GPUI foreground executor.
+                cx.background_executor()
+                    .timer(TRANSFER_PROGRESS_UPDATE_INTERVAL)
+                    .await;
+                let progress = take_latest_progress(&progress_receiver, progress);
                 let should_continue = this
                     .update(cx, |controller, cx| {
                         if controller.transfer_generation != generation {
                             return false;
                         }
-                        controller.apply_progress(progress);
-                        cx.notify();
+                        if controller.apply_progress(progress) {
+                            cx.emit(FileOperationEvent::TransferChanged);
+                        }
                         true
                     })
                     .unwrap_or(false);
@@ -450,12 +546,14 @@ impl FileOperationController {
                     mode,
                     ConflictPolicy::from_overwrite(false),
                     progress_sender,
+                    control,
                 )
                 .await;
             let _ = this.update(cx, |controller, cx| {
                 if controller.transfer_generation != generation {
                     return;
                 }
+                controller.transfer_control = None;
                 match result {
                     Ok(destinations) => {
                         if let Some(transfer) = &mut controller.transfer {
@@ -485,26 +583,38 @@ impl FileOperationController {
                         controller.refresh_all_panes(cx);
                     }
                     Err(error) => {
+                        let cancelled = is_transfer_cancelled(&error);
                         if let Some(transfer) = &mut controller.transfer {
                             transfer.running = false;
+                            transfer.paused = false;
+                            transfer.cancelling = false;
                         }
-                        controller.set_notice(error.to_string(), true, cx);
+                        if cancelled {
+                            controller.set_notice("已停止文件传输", false, cx);
+                            controller.refresh_all_panes(cx);
+                        } else {
+                            controller.set_notice(error.to_string(), true, cx);
+                        }
                     }
                 }
+                cx.emit(FileOperationEvent::TransferChanged);
             });
         })
         .detach();
     }
 
-    fn apply_progress(&mut self, progress: TransferProgress) {
+    fn apply_progress(&mut self, progress: TransferProgress) -> bool {
         if let Some(transfer) = &mut self.transfer {
             if !transfer.running {
-                return;
+                return false;
             }
             transfer.current_file = progress.current_file;
             transfer.bytes_done = progress.bytes_done;
             transfer.total_bytes = progress.total_bytes;
             transfer.speed_bytes_per_second = progress.speed_bytes_per_second;
+            true
+        } else {
+            false
         }
     }
 
@@ -543,21 +653,26 @@ impl FileOperationController {
 mod tests {
     use super::{
         CLIPBOARD_SIGNATURE, ClipboardMode, ClipboardPayload, TransferActivity,
-        native_clipboard_mode,
+        native_clipboard_mode, take_latest_progress,
     };
-    use crate::services::TransferMode;
+    use crate::services::{TransferMode, TransferProgress};
     use std::path::PathBuf;
 
     #[test]
     fn running_transfer_reserves_completion_until_the_task_finishes() {
         let transfer = TransferActivity {
             running: true,
+            paused: false,
+            cancelling: false,
             completed_successfully: false,
             current_file: "example.bin".to_string(),
             bytes_done: 100,
             total_bytes: 100,
             speed_bytes_per_second: 1.0,
             mode: TransferMode::Copy,
+            item_count: 1,
+            source_location: PathBuf::from("/source"),
+            destination: PathBuf::from("/destination"),
         };
 
         assert_eq!(transfer.progress(), 0.99);
@@ -567,12 +682,17 @@ mod tests {
     fn completed_transfer_is_always_full_even_after_a_stale_snapshot() {
         let transfer = TransferActivity {
             running: false,
+            paused: false,
+            cancelling: false,
             completed_successfully: true,
             current_file: "example.bin".to_string(),
             bytes_done: 25,
             total_bytes: 100,
             speed_bytes_per_second: 1.0,
             mode: TransferMode::Move,
+            item_count: 1,
+            source_location: PathBuf::from("/source"),
+            destination: PathBuf::from("/destination"),
         };
 
         assert_eq!(transfer.progress(), 1.0);
@@ -582,15 +702,52 @@ mod tests {
     fn failed_transfer_keeps_its_last_real_progress() {
         let transfer = TransferActivity {
             running: false,
+            paused: false,
+            cancelling: false,
             completed_successfully: false,
             current_file: "example.bin".to_string(),
             bytes_done: 25,
             total_bytes: 100,
             speed_bytes_per_second: 0.0,
             mode: TransferMode::Copy,
+            item_count: 1,
+            source_location: PathBuf::from("/source"),
+            destination: PathBuf::from("/destination"),
         };
 
         assert_eq!(transfer.progress(), 0.25);
+    }
+
+    #[test]
+    fn progress_repaint_uses_the_latest_snapshot_in_the_frame() {
+        let (sender, receiver) = async_channel::bounded(1);
+        let initial = TransferProgress {
+            current_file: "large.bin".to_string(),
+            bytes_done: 1,
+            total_bytes: 100,
+            speed_bytes_per_second: 1.0,
+        };
+        sender
+            .force_send(TransferProgress {
+                current_file: "large.bin".to_string(),
+                bytes_done: 50,
+                total_bytes: 100,
+                speed_bytes_per_second: 50.0,
+            })
+            .expect("queue progress");
+        sender
+            .force_send(TransferProgress {
+                current_file: "large.bin".to_string(),
+                bytes_done: 75,
+                total_bytes: 100,
+                speed_bytes_per_second: 75.0,
+            })
+            .expect("replace queued progress");
+
+        let progress = take_latest_progress(&receiver, initial);
+
+        assert_eq!(progress.bytes_done, 75);
+        assert_eq!(progress.speed_bytes_per_second, 75.0);
     }
 
     fn payload(mode: ClipboardMode, paths: &[&str]) -> ClipboardPayload {
