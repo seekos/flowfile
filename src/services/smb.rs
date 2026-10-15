@@ -126,6 +126,19 @@ pub(crate) fn connect(input: &str) -> Result<SmbNavigation> {
         return directory_navigation(&location, mount_path);
     }
 
+    // The system may already have an authenticated SMB session, including one
+    // established by Finder or an existing mount. Ask that session for the
+    // server root without prompting before consulting FlowFile's Keychain item.
+    // If it can list the shares, no password material is needed at all.
+    let root_authentication_required = if location.share.is_none() {
+        match unauthenticated_navigation(&location)? {
+            navigation @ SmbNavigation::AuthenticationRequired { .. } => Some(navigation),
+            navigation => return Ok(navigation),
+        }
+    } else {
+        None
+    };
+
     let cached_credential = match smb_credentials::load(&location.server) {
         Ok(credential) => credential,
         Err(error) => {
@@ -153,7 +166,10 @@ pub(crate) fn connect(input: &str) -> Result<SmbNavigation> {
         }
     }
 
-    unauthenticated_navigation(&location)
+    match root_authentication_required {
+        Some(navigation) => Ok(navigation),
+        None => unauthenticated_navigation(&location),
+    }
 }
 
 pub(crate) fn connect_with_credentials(
