@@ -71,7 +71,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 - 仅为图片、音频、视频和三维模型生成缩略图；常见图片最多使用 4 个 `rayon` 工作线程，并在受限解码内存中生成 256×256 PNG，其他可预览格式使用 macOS `qlmanage`。
 - 按 `Space` 打开或关闭预览，`Esc` 关闭预览。
 - 图片使用可独立最小化、最大化和调整尺寸的浏览窗口；支持滚轮连续缩放（1%–10000 倍）、按住左键拖动、方向键或鼠标移至图片左右中部时显示的半透明按钮连续切图，以及可显隐的元信息面板；100% 对应图片原始像素尺寸，拖动只改变查看位置、不改变缩放比例；切图时同步当前文件选择，并显示格式、大小、分辨率、修改时间、权限和常见 EXIF。
-- 内置解码 PNG/APNG、JPEG、GIF、WebP、BMP、TIFF、AVIF、ICO、PNM、QOI、TGA、HDR、DDS、OpenEXR、Farbfeld 和 SVG；HEIC/HEIF、JPEG 2000、JPEG XL、PSD/PSB、ICNS、DNG 及常见相机 RAW 尝试通过 macOS 原生图像框架转换预览。
+- 内置解码 PNG/APNG、JPEG、GIF（保留多帧动画）、WebP、BMP、TIFF、AVIF、ICO、PNM、QOI、TGA、HDR、DDS、OpenEXR 和 Farbfeld；SVG 使用 Safari 打开，以完整保留 CSS、SMIL 和脚本动画；HEIC/HEIF、JPEG 2000、JPEG XL、PSD/PSB、ICNS、DNG 及常见相机 RAW 尝试通过 macOS 原生图像框架转换预览。
 - 文本/代码预览最多读取前 100 KB；PLY、STL、OBJ 等三维文件按模型处理，不会误用文本加载器。
 - PDF、视频、Office 文档等复杂格式交给 macOS 原生 Quick Look。
 - 状态栏文件检查器可显示图片分辨率、文本行数/字数、POSIX 权限和常见 EXIF 信息。

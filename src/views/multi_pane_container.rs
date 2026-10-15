@@ -68,12 +68,12 @@ impl MultiPaneContainerView {
             )
     }
 
-    fn layout(&self, mode: LayoutMode) -> AnyElement {
+    fn layout(&self, mode: LayoutMode, active_pane_index: usize) -> AnyElement {
         match mode {
             LayoutMode::Single => div()
                 .flex()
                 .size_full()
-                .child(self.pane(0))
+                .child(self.pane(active_pane_index))
                 .into_any_element(),
             LayoutMode::DualVertical => self.pair(0, 1).into_any_element(),
             LayoutMode::DualHorizontal => div()
@@ -102,7 +102,9 @@ impl MultiPaneContainerView {
 
 impl Render for MultiPaneContainerView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mode = self.model.read(cx).layout_mode;
+        let model = self.model.read(cx);
+        let mode = model.layout_mode;
+        let active_pane_index = model.active_pane_index;
 
         div()
             .flex()
@@ -111,6 +113,6 @@ impl Render for MultiPaneContainerView {
             .size_full()
             .p(px(6.0))
             .bg(theme::canvas())
-            .child(self.layout(mode))
+            .child(self.layout(mode, active_pane_index))
     }
 }

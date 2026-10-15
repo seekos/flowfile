@@ -5,7 +5,9 @@ use super::{
 };
 use crate::{
     actions::{CopyFiles, CutFiles, PasteFiles, RenameSelected, SelectAllFiles, ToggleQuickLook},
-    models::{FileItem, FileKind, FileOperationController, Model, Pane, SortMode, ViewMode},
+    models::{
+        FileItem, FileKind, FileOperationController, Model, Pane, SortMode, ViewMode, is_svg_path,
+    },
     services::{
         ThumbnailEngine, ThumbnailEvent, TransferMode, begin_external_file_drag,
         end_external_file_drag,
@@ -1189,7 +1191,7 @@ impl MainListView {
         let formatted_size = item.formatted_size();
         let absolute_path = item.path.display().to_string();
         let is_folder = item.is_dir;
-        let opens_in_internal_viewer = item.kind == FileKind::Image;
+        let opens_in_internal_viewer = item.kind == FileKind::Image && !is_svg_path(&item.path);
         let widths = self.detail_column_widths;
         let pane = self.pane.clone();
         let focus_handle = self.focus_handle.clone();
@@ -1407,7 +1409,7 @@ impl MainListView {
         input_entity: Entity<Self>,
     ) -> AnyElement {
         let is_folder = item.is_dir;
-        let opens_in_internal_viewer = item.kind == FileKind::Image;
+        let opens_in_internal_viewer = item.kind == FileKind::Image && !is_svg_path(&item.path);
         let pane = self.pane.clone();
         let focus_handle = self.focus_handle.clone();
         let context_focus_handle = self.focus_handle.clone();

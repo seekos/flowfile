@@ -28,7 +28,7 @@ use crate::{
     models::{
         AppPreferences, CreateItemKind, Favorites, FileKind, FileOperationController,
         FileOperationEvent, LayoutMode, Model, MultiPaneModel, Pane, PaneEvent, SessionState,
-        home_directory,
+        home_directory, is_svg_path,
     },
     services::{
         AvailableUpdate, FileEngine, FileInspector, FileOperationEngine, PreviewKind,
@@ -389,17 +389,18 @@ impl WorkspaceView {
             .as_ref()
             .map(|session| session.layout_mode)
             .unwrap_or(app_preferences.default_layout);
-        let pane_count = layout_mode.pane_count().min(panes.len());
         let active_pane_index = restored_session
             .as_ref()
             .map(|session| session.active_pane_index)
-            .filter(|index| *index < pane_count)
+            .map(|index| {
+                MultiPaneModel::normalized_active_pane_index(layout_mode, index, panes.len())
+            })
             .unwrap_or(0);
         let last_active_pane_index = restored_session
             .as_ref()
             .and_then(|session| session.last_active_pane_index)
-            .filter(|index| *index < pane_count && *index != active_pane_index)
-            .or_else(|| (0..pane_count).find(|index| *index != active_pane_index));
+            .filter(|index| *index < panes.len() && *index != active_pane_index)
+            .or_else(|| (0..panes.len()).find(|index| *index != active_pane_index));
         let sidebar_visible = restored_session
             .as_ref()
             .map(|session| session.sidebar_visible)
@@ -612,7 +613,7 @@ impl WorkspaceView {
             } => (pane_index, item_index, true),
         };
         let pane = self.model.update(cx, |model, _| {
-            if pane_index >= model.layout_mode.pane_count() || pane_index >= model.panes.len() {
+            if !model.is_pane_visible(pane_index) {
                 return None;
             }
             model.set_active_pane(pane_index);
@@ -810,14 +811,11 @@ impl WorkspaceView {
     #[cfg(target_os = "macos")]
     fn accessibility_snapshot(&self, cx: &App) -> AccessibilitySnapshot {
         let model = self.model.read(cx);
-        let pane_count = model.layout_mode.pane_count().min(model.panes.len());
-        let panes = model
-            .panes
+        let visible_pane_indices = model.visible_pane_indices();
+        let panes = visible_pane_indices
             .iter()
-            .take(pane_count)
-            .enumerate()
-            .map(|(pane_index, pane)| {
-                let pane = pane.read(cx);
+            .map(|pane_index| {
+                let pane = model.panes[*pane_index].read(cx);
                 let total_count = pane.items.len();
                 let items = pane
                     .items
@@ -832,7 +830,7 @@ impl WorkspaceView {
                     .collect();
                 PaneSnapshot {
                     path: pane.display_path(),
-                    active: pane_index == model.active_pane_index,
+                    active: *pane_index == model.active_pane_index,
                     search: pane
                         .search_active
                         .then(|| pane.search_query.trim().to_string())
@@ -1203,6 +1201,7 @@ impl WorkspaceView {
                 .iter()
                 .filter(|item| !item.is_dir)
                 .filter(|item| QuickLookService::classify(&item.path) == PreviewKind::Image)
+                .filter(|item| !is_svg_path(&item.path))
                 .map(|item| item.path.clone())
                 .collect::<Vec<_>>();
             let image_index = path
@@ -1214,6 +1213,19 @@ impl WorkspaceView {
         let Some(path) = path else {
             return;
         };
+        if is_svg_path(&path) {
+            let engine = self.engine.clone();
+            let operations = self.operations.clone();
+            cx.spawn(async move |_this, cx| {
+                if let Err(error) = engine.open_path(path).await {
+                    let _ = operations.update(cx, |operations, cx| {
+                        operations.show_notice(error.to_string(), true, cx);
+                    });
+                }
+            })
+            .detach();
+            return;
+        }
         self.present_quick_look(path, image_paths, image_index, false, window, cx);
     }
 
@@ -2859,7 +2871,10 @@ impl WorkspaceView {
                 })
                 .into_any_element(),
             QuickLookContent::Image { display_path } => {
+                let image_element_id =
+                    SharedString::from(display_path.to_string_lossy().into_owned());
                 let rendered_image = img(display_path)
+                    .id(image_element_id)
                     .flex_none()
                     .when_some(preview.image_dimensions, |image, (width, height)| {
                         let (width, height) = scaled_image_size(width, height, preview.zoom);

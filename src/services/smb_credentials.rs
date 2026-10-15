@@ -3,20 +3,28 @@ use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
 };
 use serde::{Deserialize, Serialize};
-use std::{sync::mpsc, thread, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock, mpsc},
+    thread,
+    time::Duration,
+};
 use zeroize::Zeroize as _;
 
 const KEYCHAIN_SERVICE: &str = "cc.bso.flowfile.smb";
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 const KEYCHAIN_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SmbCredential {
     version: u8,
     pub username: String,
     pub password: String,
 }
+
+static SESSION_CREDENTIALS: OnceLock<Mutex<HashMap<String, Option<SmbCredential>>>> =
+    OnceLock::new();
 
 impl Drop for SmbCredential {
     fn drop(&mut self) {
@@ -33,11 +41,35 @@ struct SmbCredentialRef<'a> {
 }
 
 pub(crate) fn load(server: &str) -> Result<Option<SmbCredential>> {
+    let account = keychain_account(server);
+    let session_cache = session_credentials()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(credential) = session_cache.get(&account) {
+        return Ok(credential.clone());
+    }
+    drop(session_cache);
+
     let server = server.to_string();
+    let cached_account = account.clone();
     run_keychain_operation(
         "读取 macOS 钥匙串超时",
         KEYCHAIN_OPERATION_TIMEOUT,
-        move || load_from_keychain(&server),
+        move || {
+            let credential = load_from_keychain(&server);
+            if let Ok(credential) = &credential {
+                // This closure can finish after the foreground timeout while
+                // the user is responding to a macOS authorization dialog.
+                // Preserve that result so the next directory click does not
+                // start another Keychain request.
+                session_credentials()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(cached_account)
+                    .or_insert_with(|| credential.clone());
+            }
+            credential
+        },
     )
 }
 
@@ -66,6 +98,18 @@ fn load_from_keychain(server: &str) -> Result<Option<SmbCredential>> {
 }
 
 pub(crate) fn save(server: &str, username: &str, password: &str) -> Result<()> {
+    session_credentials()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            keychain_account(server),
+            Some(SmbCredential {
+                version: 1,
+                username: username.to_string(),
+                password: password.to_string(),
+            }),
+        );
+
     let server = server.to_string();
     let username = username.to_string();
     let mut password = password.to_string();
@@ -95,6 +139,11 @@ fn save_to_keychain(server: &str, username: &str, password: &str) -> Result<()> 
 }
 
 pub(crate) fn delete(server: &str) -> Result<()> {
+    session_credentials()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(keychain_account(server), None);
+
     let server = server.to_string();
     run_keychain_operation(
         "删除 macOS 钥匙串凭证超时",
@@ -139,6 +188,10 @@ fn decode(payload: &[u8]) -> Result<SmbCredential> {
 
 fn keychain_account(server: &str) -> String {
     server.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn session_credentials() -> &'static Mutex<HashMap<String, Option<SmbCredential>>> {
+    SESSION_CREDENTIALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[cfg(test)]

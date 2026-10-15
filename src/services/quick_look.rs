@@ -75,6 +75,9 @@ impl QuickLookService {
     /// Returns true when GPUI's in-process image loader can decode the source
     /// without a native conversion step. GPUI and this application share the
     /// same `image` feature set, so animated GIF/WebP files remain animated.
+    /// SVG is intentionally delegated to Quick Look because GPUI's static
+    /// renderer does not resolve browser CSS custom properties such as
+    /// `var(--color)`, which can otherwise turn a valid SVG into a black image.
     pub fn can_render_image_directly(path: &Path) -> bool {
         let extension = path
             .extension()
@@ -109,7 +112,6 @@ impl QuickLookService {
                 | "dds"
                 | "exr"
                 | "ff"
-                | "svg"
         )
     }
 
@@ -263,6 +265,14 @@ fn prune_image_cache(cache_dir: &Path, limit: u64) {
 
 #[cfg(target_os = "macos")]
 fn render_native_image_to_png(source: &Path, destination: &Path) -> Result<()> {
+    if source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+    {
+        return render_svg_with_quicklook(source, destination);
+    }
+
     use image::imageops::FilterType;
     use objc2::{ClassType, rc::autoreleasepool};
     use objc2_app_kit::NSImage;
@@ -298,6 +308,81 @@ fn render_native_image_to_png(source: &Path, destination: &Path) -> Result<()> {
     decoded
         .save_with_format(destination, image::ImageFormat::Png)
         .with_context(|| format!("无法写入图片预览 {}", destination.display()))
+}
+
+#[cfg(target_os = "macos")]
+fn render_svg_with_quicklook(source: &Path, destination: &Path) -> Result<()> {
+    let (source_width, source_height) = native_image_dimensions(source)
+        .with_context(|| format!("无法读取 SVG 尺寸 {}", source.display()))?;
+    let render_edge = source_width
+        .max(source_height)
+        .clamp(1, NATIVE_PREVIEW_MAX_DIMENSION);
+    let work_dir = destination.with_extension(format!(
+        "quicklook-{}-{}",
+        std::process::id(),
+        NATIVE_PREVIEW_TEMPORARY_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&work_dir)
+        .with_context(|| format!("无法创建 SVG 预览临时目录 {}", work_dir.display()))?;
+
+    let result = (|| -> Result<()> {
+        let status = std::process::Command::new("/usr/bin/qlmanage")
+            .args(["-t", "-s"])
+            .arg(render_edge.to_string())
+            .arg("-o")
+            .arg(&work_dir)
+            .arg(source)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("无法启动 SVG Quick Look 渲染：{}", source.display()))?;
+        if !status.success() {
+            bail!("Quick Look 未能渲染 SVG {}", source.display());
+        }
+
+        let generated = fs::read_dir(&work_dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+            })
+            .with_context(|| format!("Quick Look 未生成 SVG 预览 {}", source.display()))?;
+        let rendered = image::open(&generated)
+            .with_context(|| format!("无法读取 SVG Quick Look 预览 {}", generated.display()))?;
+        let (crop_width, crop_height) = aspect_fit_size(
+            source_width,
+            source_height,
+            rendered.width(),
+            rendered.height(),
+        );
+        rendered
+            .crop_imm(0, 0, crop_width, crop_height)
+            .save_with_format(destination, image::ImageFormat::Png)
+            .with_context(|| format!("无法写入 SVG 预览 {}", destination.display()))
+    })();
+
+    let _ = fs::remove_dir_all(&work_dir);
+    result
+}
+
+fn aspect_fit_size(
+    source_width: u32,
+    source_height: u32,
+    bounds_width: u32,
+    bounds_height: u32,
+) -> (u32, u32) {
+    let source_width = source_width.max(1) as u64;
+    let source_height = source_height.max(1) as u64;
+    let bounds_width = bounds_width.max(1) as u64;
+    let bounds_height = bounds_height.max(1) as u64;
+    if source_width * bounds_height >= source_height * bounds_width {
+        let height = (bounds_width * source_height / source_width).max(1);
+        (bounds_width as u32, height.min(bounds_height) as u32)
+    } else {
+        let width = (bounds_height * source_width / source_height).max(1);
+        (width.min(bounds_width) as u32, bounds_height as u32)
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -362,7 +447,7 @@ pub fn is_text_extension(extension: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreviewKind, QuickLookService};
+    use super::{PreviewKind, QuickLookService, aspect_fit_size};
     use std::path::Path;
 
     #[test]
@@ -391,11 +476,24 @@ mod tests {
         assert!(QuickLookService::can_render_image_directly(Path::new(
             "photo.tiff"
         )));
+        assert!(QuickLookService::can_render_image_directly(Path::new(
+            "animation.gif"
+        )));
+        assert!(!QuickLookService::can_render_image_directly(Path::new(
+            "diagram.svg"
+        )));
         assert!(!QuickLookService::can_render_image_directly(Path::new(
             "photo.heic"
         )));
         assert!(!QuickLookService::can_render_image_directly(Path::new(
             "photo.cr3"
         )));
+    }
+
+    #[test]
+    fn svg_quicklook_canvas_is_cropped_to_the_source_aspect_ratio() {
+        assert_eq!(aspect_fit_size(960, 640, 960, 960), (960, 640));
+        assert_eq!(aspect_fit_size(640, 960, 960, 960), (640, 960));
+        assert_eq!(aspect_fit_size(1920, 1080, 8192, 8192), (8192, 4608));
     }
 }

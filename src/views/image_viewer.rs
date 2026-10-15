@@ -14,8 +14,8 @@ use crate::{
 use gpui::{
     AnyElement, App, Bounds, Context, Entity, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Render, ScrollWheelEvent,
-    TitlebarOptions, TouchPhase, Window, WindowBounds, WindowOptions, black, div, img, prelude::*,
-    px, size,
+    SharedString, TitlebarOptions, TouchPhase, Window, WindowBounds, WindowOptions, black, div,
+    img, prelude::*, px, size,
 };
 use std::{path::PathBuf, time::Instant};
 
@@ -461,7 +461,13 @@ impl ImageViewerWindow {
                 .child(error)
                 .into_any_element(),
             ImageViewerContent::Image { display_path } => {
+                let image_element_id =
+                    SharedString::from(display_path.to_string_lossy().into_owned());
                 let rendered_image = img(display_path)
+                    // GPUI only preserves per-frame timing and requests animation
+                    // frames for stateful image elements. A path-specific id keeps
+                    // GIF/WebP animation running and resets it when images change.
+                    .id(image_element_id)
                     .flex_none()
                     .when_some(self.state.image_dimensions, |image, (width, height)| {
                         let (width, height) = scaled_image_size(width, height, self.state.zoom);

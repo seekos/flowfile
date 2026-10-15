@@ -3,7 +3,7 @@ use super::{
     quick_look::is_text_extension, smb, volume,
 };
 use crate::distribution;
-use crate::models::{FileItem, FileKind, SortMode};
+use crate::models::{FileItem, FileKind, SortMode, is_svg_path};
 use anyhow::{Context as _, Result};
 use std::{
     collections::HashSet,
@@ -146,6 +146,8 @@ impl FileEngine {
                     )
                 } else if is_unix_executable(&path) {
                     run_unix_executable(&path)
+                } else if is_svg_path(&path) {
+                    open_svg_in_browser(&path)
                 } else if let Some(application) = preferred_text_application(&path) {
                     open_path_with_application(&path, &application)
                 } else if file_kind_for_path(&path) == FileKind::Model
@@ -325,6 +327,24 @@ fn open_path_with_application(path: &Path, application: &Path) -> Result<()> {
         anyhow::bail!("无法使用 {} 打开 {}", application.display(), path.display());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_svg_in_browser(path: &Path) -> Result<()> {
+    let status = Command::new("/usr/bin/open")
+        .args(["-b", "com.apple.Safari"])
+        .arg(path)
+        .status()
+        .with_context(|| format!("无法启动 Safari 打开 SVG {}", path.display()))?;
+    if !status.success() {
+        anyhow::bail!("Safari 无法打开 SVG {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_svg_in_browser(path: &Path) -> Result<()> {
+    open::that(path).with_context(|| format!("无法在浏览器中打开 SVG {}", path.display()))
 }
 
 fn is_unix_executable(path: &Path) -> bool {

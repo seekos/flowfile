@@ -1,9 +1,13 @@
 use super::smb_credentials;
 use anyhow::{Context as _, Result};
 use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
     io::{Read as _, Write as _},
     path::PathBuf,
     process::{Command, Output, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -101,6 +105,7 @@ set captured [string map [list $password ""] $captured]
 send_user -- $captured
 exit [lindex $result 3]
 "#;
+static SERVER_SHARE_CACHE: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
 
 pub(crate) fn looks_like_address(input: &str) -> bool {
     let input = input.trim();
@@ -110,6 +115,11 @@ pub(crate) fn looks_like_address(input: &str) -> bool {
 
 pub(crate) fn connect(input: &str) -> Result<SmbNavigation> {
     let location = parse_location(input)?;
+    if location.share.is_none()
+        && let Some(shares) = cached_server_shares(&location.server)
+    {
+        return server_navigation(&location, shares);
+    }
     if location.share.is_some()
         && let Some(mount_path) = find_existing_mount(&location)
     {
@@ -131,6 +141,7 @@ pub(crate) fn connect(input: &str) -> Result<SmbNavigation> {
         match authenticated_navigation(&location, &credential.username, &credential.password)? {
             Some(navigation) => return Ok(navigation),
             None => {
+                forget_server_shares(&location.server);
                 if let Err(error) = smb_credentials::delete(&location.server) {
                     eprintln!(
                         "FlowFile: 无法删除 {} 的失效 SMB 凭证：{error}",
@@ -154,7 +165,14 @@ pub(crate) fn connect_with_credentials(
     let Some(navigation) = authenticated_navigation(&location, username, password)? else {
         anyhow::bail!("用户名或密码不正确，请重试");
     };
-    smb_credentials::save(&location.server, username, password)?;
+    if let Err(error) = smb_credentials::save(&location.server, username, password) {
+        // Authentication has already succeeded. Keep the session credential
+        // usable even when macOS declines persistent Keychain storage.
+        eprintln!(
+            "FlowFile: 无法持久保存 {} 的 SMB 凭证，本次运行仍会复用：{error}",
+            location.server
+        );
+    }
     Ok(navigation)
 }
 
@@ -168,8 +186,9 @@ fn unauthenticated_navigation(location: &SmbLocation) -> Result<SmbNavigation> {
             ));
         }
     };
+    let shares = remember_server_shares(location, &output);
     if location.share.is_none() {
-        server_navigation(location, output)
+        server_navigation(location, shares)
     } else {
         mount_share(location, None)
     }
@@ -181,16 +200,25 @@ fn authenticated_navigation(
     password: &str,
 ) -> Result<Option<SmbNavigation>> {
     let credentials = SmbCredentials { username, password };
+    let authenticated_location = location_with_username(location, username);
+
+    // A share path can be mounted directly with the server credential. Running
+    // `smbutil view` first is redundant and may make macOS consult Keychain for
+    // every share or nested SMB address.
+    if authenticated_location.share.is_some() {
+        return match mount_share(&authenticated_location, Some(credentials)) {
+            Ok(navigation) => Ok(Some(navigation)),
+            Err(error) if error.downcast_ref::<SmbAuthenticationFailed>().is_some() => Ok(None),
+            Err(error) => Err(error),
+        };
+    }
+
     let output = match run_smbutil_view(location, Some(credentials))? {
         ShareQuery::Output(output) => output,
         ShareQuery::AuthenticationRequired => return Ok(None),
     };
-    let authenticated_location = location_with_username(location, username);
-    if authenticated_location.share.is_none() {
-        server_navigation(&authenticated_location, output).map(Some)
-    } else {
-        mount_share(&authenticated_location, Some(credentials)).map(Some)
-    }
+    let shares = remember_server_shares(&authenticated_location, &output);
+    server_navigation(&authenticated_location, shares).map(Some)
 }
 
 fn mount_share(
@@ -232,6 +260,17 @@ fn mount_share(
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if message.contains("(-128)") {
             anyhow::bail!("已取消连接 SMB 服务器");
+        }
+        if is_authentication_error(output.status.code(), &message) {
+            return Err(SmbAuthenticationFailed.into());
+        }
+        if let Some(credentials) = credentials
+            && matches!(
+                run_smbutil_view(location, Some(credentials)),
+                Ok(ShareQuery::AuthenticationRequired)
+            )
+        {
+            return Err(SmbAuthenticationFailed.into());
         }
         if message.is_empty() {
             anyhow::bail!("无法连接 SMB 服务器，请检查 NAS 地址、网络和访问权限");
@@ -320,8 +359,8 @@ fn logical_address(location: &SmbLocation) -> String {
     address
 }
 
-fn server_navigation(location: &SmbLocation, output: String) -> Result<SmbNavigation> {
-    let shares = parse_smbutil_shares(&output)
+fn server_navigation(location: &SmbLocation, share_names: Vec<String>) -> Result<SmbNavigation> {
+    let shares = share_names
         .into_iter()
         .map(|name| SmbShare {
             address: format!("smb://{}/{}", location.authority, percent_encode(&name)),
@@ -337,11 +376,56 @@ fn server_navigation(location: &SmbLocation, output: String) -> Result<SmbNaviga
     })
 }
 
+fn remember_server_shares(location: &SmbLocation, output: &str) -> Vec<String> {
+    let shares = parse_smbutil_shares(output);
+    if !shares.is_empty() {
+        server_share_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(server_cache_key(&location.server), shares.clone());
+    }
+    shares
+}
+
+fn cached_server_shares(server: &str) -> Option<Vec<String>> {
+    server_share_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&server_cache_key(server))
+        .cloned()
+}
+
+fn forget_server_shares(server: &str) {
+    server_share_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&server_cache_key(server));
+}
+
+fn server_share_cache() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    SERVER_SHARE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn server_cache_key(server: &str) -> String {
+    server.trim_end_matches('.').to_ascii_lowercase()
+}
+
 #[derive(Clone, Copy)]
 struct SmbCredentials<'a> {
     username: &'a str,
     password: &'a str,
 }
+
+#[derive(Debug)]
+struct SmbAuthenticationFailed;
+
+impl fmt::Display for SmbAuthenticationFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("用户名或密码不正确，请重试")
+    }
+}
+
+impl Error for SmbAuthenticationFailed {}
 
 enum ShareQuery {
     Output(String),
@@ -513,13 +597,19 @@ fn encode_username(username: &str) -> String {
 }
 
 fn is_authentication_error(status_code: Option<i32>, message: &str) -> bool {
+    let lowercase = message.to_ascii_lowercase();
     status_code == Some(77)
-        || message
-            .to_ascii_lowercase()
-            .contains("authentication error")
-        || message
-            .to_ascii_lowercase()
-            .contains("server rejected the authentication")
+        || lowercase.contains("authentication error")
+        || lowercase.contains("authentication failed")
+        || lowercase.contains("server rejected the authentication")
+        || lowercase.contains("user name or password")
+        || lowercase.contains("username or password")
+        || lowercase.contains("incorrect password")
+        || lowercase.contains("invalid password")
+        || message.contains("用户名或密码")
+        || message.contains("密码不正确")
+        || message.contains("认证失败")
+        || message.contains("鉴权失败")
 }
 
 fn parse_smbutil_shares(output: &str) -> Vec<String> {

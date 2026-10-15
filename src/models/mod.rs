@@ -8,8 +8,8 @@ mod preferences;
 mod session;
 
 pub use favorites::Favorites;
-pub(crate) use file_item::is_image_extension;
 pub use file_item::{FileItem, FileKind, SortMode};
+pub(crate) use file_item::{is_image_extension, is_svg_path};
 pub use multi_pane::{LayoutMode, MultiPaneModel};
 pub use operations::{
     CreateItemKind, FileDragPayload, FileOperationController, FileOperationEvent,

@@ -218,6 +218,15 @@ pub(crate) fn is_image_extension(extension: &str) -> bool {
     )
 }
 
+/// SVG is still classified as an image for thumbnails and metadata, but its
+/// browser-only animation/CSS features must not be flattened by the raster
+/// image viewer.
+pub(crate) fn is_svg_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+}
+
 #[cfg(unix)]
 fn has_unix_execute_bit(metadata: &Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -282,8 +291,11 @@ fn format_modified_time(time: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileItem, FileKind, SortMode, is_image_extension};
-    use std::{fs, path::PathBuf};
+    use super::{FileItem, FileKind, SortMode, is_image_extension, is_svg_path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -398,6 +410,14 @@ mod tests {
                 "wrong kind for .{extension}"
             );
         }
+    }
+
+    #[test]
+    fn svg_paths_are_reserved_for_browser_rendering() {
+        assert!(is_svg_path(Path::new("animated.svg")));
+        assert!(is_svg_path(Path::new("ANIMATED.SVG")));
+        assert!(!is_svg_path(Path::new("animation.gif")));
+        assert!(!is_svg_path(Path::new("svg")));
     }
 
     #[test]
