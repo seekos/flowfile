@@ -2493,7 +2493,6 @@ impl WorkspaceView {
             div()
                 .min_w_0()
                 .flex_1()
-                .h(px(16.0))
                 .overflow_hidden()
                 .child(ModalNameTextElement {
                     input: input_entity,
@@ -2503,7 +2502,6 @@ impl WorkspaceView {
             div()
                 .min_w_0()
                 .flex_1()
-                .h(px(16.0))
                 .overflow_hidden()
                 .child(display_value)
                 .into_any_element()
@@ -2664,16 +2662,11 @@ impl WorkspaceView {
                                     });
                                 },
                             )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .h(px(16.0))
-                                    .overflow_hidden()
-                                    .child(ModalNameTextElement {
-                                        input: input_entity.clone(),
-                                    }),
-                            ),
+                            .child(div().min_w_0().flex_1().overflow_hidden().child(
+                                ModalNameTextElement {
+                                    input: input_entity.clone(),
+                                },
+                            )),
                     )
                     .when_some(modal_error, |card, error| {
                         card.child(
