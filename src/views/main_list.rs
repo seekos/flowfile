@@ -1142,9 +1142,15 @@ impl MainListView {
                 });
             })
             .on_click(|_, _, cx| cx.stop_propagation())
-            .child(RenameTextElement {
-                input: input_entity,
-            })
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(RenameTextElement {
+                        input: input_entity,
+                    }),
+            )
             .into_any_element()
     }
 

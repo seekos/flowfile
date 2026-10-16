@@ -366,6 +366,11 @@ struct TransferPlan {
     total_bytes: u64,
 }
 
+enum PreparedTransfer {
+    Renamed(PathBuf),
+    Planned(TransferPlan),
+}
+
 struct CopyContext<'a> {
     progress: &'a Sender<TransferProgress>,
     total_bytes: u64,
@@ -457,38 +462,51 @@ async fn execute_transfer_controlled(
         .collect();
     let _guard = begin_file_mutation(mutation_paths)?;
 
-    let mut plans = Vec::with_capacity(roots.len());
+    let mut prepared_transfers = Vec::with_capacity(roots.len());
     for (source_root, destination_root) in roots {
-        plans.push(build_plan(source_root, destination_root, &control).await?);
+        control.checkpoint().await?;
+        // A same-volume move is a single filesystem rename and does not need
+        // to inspect the directory contents. Besides being much faster for
+        // large trees, trying it first matches Finder and allows repositories
+        // containing live Unix sockets such as .git/fsmonitor--daemon.ipc to
+        // move normally. If rename is unavailable (for example, across
+        // volumes), fall back to the recursive copy-and-remove path below.
+        if mode == TransferMode::Move
+            && conflict_policy == ConflictPolicy::AutoRename
+            && fs::rename(&source_root, &destination_root).await.is_ok()
+        {
+            prepared_transfers.push(PreparedTransfer::Renamed(destination_root));
+        } else {
+            prepared_transfers.push(PreparedTransfer::Planned(
+                build_plan(source_root, destination_root, &control).await?,
+            ));
+        }
     }
 
-    let total_bytes = plans.iter().map(|plan| plan.total_bytes).sum();
+    let total_bytes = prepared_transfers
+        .iter()
+        .filter_map(|transfer| match transfer {
+            PreparedTransfer::Renamed(_) => None,
+            PreparedTransfer::Planned(plan) => Some(plan.total_bytes),
+        })
+        .sum();
     let started = Instant::now();
     let mut bytes_done = 0_u64;
-    let mut destinations = Vec::with_capacity(plans.len());
+    let mut destinations = Vec::with_capacity(prepared_transfers.len());
 
     send_progress(&progress, "准备传输", bytes_done, total_bytes, started);
 
-    for plan in plans {
-        control.checkpoint().await?;
-        let current_file = plan
-            .source_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("项目")
-            .to_string();
-
-        if mode == TransferMode::Move
-            && conflict_policy == ConflictPolicy::AutoRename
-            && fs::rename(&plan.source_root, &plan.destination_root)
-                .await
-                .is_ok()
-        {
-            bytes_done += plan.total_bytes;
-            send_progress(&progress, &current_file, bytes_done, total_bytes, started);
-            destinations.push(plan.destination_root);
-            continue;
-        }
+    for prepared_transfer in prepared_transfers {
+        let plan = match prepared_transfer {
+            PreparedTransfer::Renamed(destination) => {
+                destinations.push(destination);
+                continue;
+            }
+            PreparedTransfer::Planned(plan) => {
+                control.checkpoint().await?;
+                plan
+            }
+        };
 
         let staging_root = unique_transfer_path(&plan.destination_root).await?;
         let mut copy_context = CopyContext {
@@ -996,7 +1014,10 @@ mod tests {
     };
     use std::{
         fs,
-        os::unix::fs::{PermissionsExt as _, symlink},
+        os::unix::{
+            fs::{FileTypeExt as _, PermissionsExt as _, symlink},
+            net::UnixListener,
+        },
         path::PathBuf,
         process::Command,
         time::{Duration, Instant},
@@ -1167,6 +1188,41 @@ mod tests {
         assert_eq!(
             fs::read(destinations[0].join("README.md")).unwrap(),
             b"hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_volume_move_does_not_scan_live_unix_sockets() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("project");
+        let destination_directory = directory.path().join("destination");
+        fs::create_dir(&source).expect("create source folder");
+        fs::create_dir(&destination_directory).expect("create destination folder");
+        fs::write(source.join("README.md"), b"hello").expect("write source file");
+        let socket = source.join("fsmonitor--daemon.ipc");
+        let _listener = UnixListener::bind(&socket).expect("create live unix socket");
+        let (progress, _receiver) = async_channel::bounded(8);
+
+        let destinations = execute_transfer(
+            vec![source.clone()],
+            destination_directory,
+            TransferMode::Move,
+            ConflictPolicy::AutoRename,
+            progress,
+        )
+        .await
+        .expect("move folder containing unix socket");
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(destinations[0].join("README.md")).unwrap(),
+            b"hello"
+        );
+        assert!(
+            fs::symlink_metadata(destinations[0].join("fsmonitor--daemon.ipc"))
+                .expect("read moved socket")
+                .file_type()
+                .is_socket()
         );
     }
 
