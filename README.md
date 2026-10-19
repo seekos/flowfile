@@ -205,6 +205,7 @@ FLOWFILE_REQUIRE_STABLE_SIGNING=1 ./scripts/build.sh
 ```
 
 指定的版本会写入应用的 `CFBundleShortVersionString`，并用于 DMG 文件名，但不会修改 `Cargo.toml`。
+构建成功后，脚本会把该版本保存在本地；下次不传 `-v` 时默认继续使用。首次构建仍使用 `Cargo.toml` 中的版本。
 
 输出：
 

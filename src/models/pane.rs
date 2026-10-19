@@ -6,7 +6,7 @@ use crate::services::{
 use gpui::{Context, EventEmitter, Timer};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -133,6 +133,7 @@ pub struct Pane {
     search_cancellation: Option<Arc<AtomicBool>>,
     load_generation: u64,
     contents_generation: u64,
+    git_status_generation: u64,
     watcher_generation: u64,
     watcher: Option<FileWatcher>,
     smb_server_root: bool,
@@ -176,6 +177,7 @@ impl Pane {
             search_cancellation: None,
             load_generation: 0,
             contents_generation: 0,
+            git_status_generation: 0,
             watcher_generation: 0,
             watcher: None,
             smb_server_root: false,
@@ -848,6 +850,7 @@ impl Pane {
                         if path_changed || pane.watcher.is_none() {
                             pane.start_watching(cx);
                         }
+                        pane.refresh_git_statuses(cx);
                     }
                     Err(error) => {
                         pane.error_message = Some(error.to_string());
@@ -904,6 +907,7 @@ impl Pane {
                 modified: "SMB 共享".to_string(),
                 is_hidden: false,
                 kind: FileKind::Folder,
+                git_status: None,
             })
             .collect();
         self.contents_generation = self.contents_generation.wrapping_add(1);
@@ -1116,10 +1120,12 @@ impl Pane {
                             return true;
                         };
                         if pane.watcher_snapshot_matches(&snapshot) {
+                            pane.refresh_git_statuses(cx);
                             return true;
                         }
                         let visible_items_changed = !pane.search_active;
                         pane.apply_snapshot(snapshot, NavigationIntent::Refresh);
+                        pane.refresh_git_statuses(cx);
                         if visible_items_changed {
                             cx.notify();
                         }
@@ -1143,8 +1149,100 @@ impl Pane {
         } else {
             &self.items
         };
-        current_items == &snapshot.items
+        file_items_match_without_git_status(current_items, &snapshot.items)
     }
+
+    fn refresh_git_statuses(&mut self, cx: &mut Context<Self>) {
+        if self.smb_server_root {
+            return;
+        }
+
+        self.git_status_generation = self.git_status_generation.wrapping_add(1);
+        let generation = self.git_status_generation;
+        let load_generation = self.load_generation;
+        let contents_generation = self.contents_generation;
+        let search_active = self.search_active;
+        let path = self.current_path.clone();
+        let items = if search_active {
+            self.search_original_items.clone()
+        } else {
+            self.items.clone()
+        };
+        let engine = self.engine.clone();
+
+        cx.spawn(async move |this, cx| {
+            // Avoid starting Git processes for folders the user only passes
+            // through during fast navigation.
+            Timer::after(Duration::from_millis(60)).await;
+            let still_current = this
+                .update(cx, |pane, _| {
+                    pane.git_status_generation == generation
+                        && pane.load_generation == load_generation
+                        && pane.contents_generation == contents_generation
+                        && pane.current_path == path
+                        && pane.search_active == search_active
+                })
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+
+            let Ok(items) = engine.annotate_git_statuses(path.clone(), items).await else {
+                return;
+            };
+            let statuses = items
+                .into_iter()
+                .map(|item| (item.path, item.git_status))
+                .collect::<HashMap<_, _>>();
+            let _ = this.update(cx, |pane, cx| {
+                if pane.git_status_generation != generation
+                    || pane.load_generation != load_generation
+                    || pane.contents_generation != contents_generation
+                    || pane.current_path != path
+                    || pane.search_active != search_active
+                {
+                    return;
+                }
+
+                let mut visible_changed = false;
+                for item in &mut pane.items {
+                    let Some(status) = statuses.get(&item.path).copied() else {
+                        continue;
+                    };
+                    if item.git_status != status {
+                        item.git_status = status;
+                        visible_changed = true;
+                    }
+                }
+                if search_active {
+                    for item in &mut pane.search_original_items {
+                        if let Some(status) = statuses.get(&item.path).copied() {
+                            item.git_status = status;
+                        }
+                    }
+                }
+                if visible_changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+fn file_items_match_without_git_status(left: &[FileItem], right: &[FileItem]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.path == right.path
+                && left.name == right.name
+                && left.is_dir == right.is_dir
+                && left.extension == right.extension
+                && left.size == right.size
+                && left.modified_unix == right.modified_unix
+                && left.modified == right.modified
+                && left.is_hidden == right.is_hidden
+                && left.kind == right.kind
+        })
 }
 
 fn update_renamed_item(items: &mut [FileItem], source: &Path, destination: &Path) {
@@ -1203,7 +1301,7 @@ mod tests {
         should_navigate_to,
     };
     use crate::{
-        models::{FileItem, FileKind},
+        models::{FileItem, FileKind, GitStatus},
         services::{DirectorySnapshot, FileEngine},
     };
     use std::{collections::BTreeSet, path::PathBuf};
@@ -1266,6 +1364,7 @@ mod tests {
                 modified: String::new(),
                 is_hidden: false,
                 kind: FileKind::Document,
+                git_status: None,
             })
             .collect();
         pane.select(0, false, false);
@@ -1303,6 +1402,7 @@ mod tests {
                 modified: String::new(),
                 is_hidden: false,
                 kind: FileKind::Document,
+                git_status: None,
             })
             .collect();
 
@@ -1329,6 +1429,7 @@ mod tests {
                 modified: String::new(),
                 is_hidden: false,
                 kind: FileKind::Document,
+                git_status: None,
             })
             .collect();
         pane.select(1, false, false);
@@ -1355,6 +1456,7 @@ mod tests {
             modified: String::new(),
             is_hidden: false,
             kind: FileKind::Folder,
+            git_status: None,
         }];
         pane.select(0, false, false);
         pane.begin_rename();
@@ -1379,6 +1481,7 @@ mod tests {
             modified: String::new(),
             is_hidden: false,
             kind: FileKind::Document,
+            git_status: None,
         };
         let mut pane = Pane::new(root.clone(), FileEngine::new().expect("file engine"));
         pane.items = vec![
@@ -1431,6 +1534,7 @@ mod tests {
             modified: String::new(),
             is_hidden: false,
             kind: FileKind::Document,
+            git_status: None,
         };
         pane.items = vec![editable.clone()];
         pane.select(0, false, false);
@@ -1451,6 +1555,7 @@ mod tests {
                         modified: String::new(),
                         is_hidden: false,
                         kind: FileKind::Other,
+                        git_status: None,
                     },
                     editable,
                 ],
@@ -1475,9 +1580,12 @@ mod tests {
             modified: "now".to_string(),
             is_hidden: false,
             kind: FileKind::Document,
+            git_status: None,
         };
         let mut pane = Pane::new(root.clone(), FileEngine::new().expect("file engine"));
-        pane.items = vec![item.clone()];
+        let mut annotated = item.clone();
+        annotated.git_status = Some(GitStatus::Clean);
+        pane.items = vec![annotated];
 
         assert!(pane.watcher_snapshot_matches(&DirectorySnapshot {
             path: root.clone(),
@@ -1504,6 +1612,7 @@ mod tests {
             modified: String::new(),
             is_hidden: false,
             kind: FileKind::Folder,
+            git_status: None,
         };
         let mut folder = application.clone();
         folder.path = PathBuf::from("/Applications/Utilities");

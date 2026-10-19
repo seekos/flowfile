@@ -22,6 +22,12 @@ pub enum FileKind {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum GitStatus {
+    Clean,
+    Modified,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SortMode {
     Name,
@@ -42,6 +48,8 @@ pub struct FileItem {
     pub modified: String,
     pub is_hidden: bool,
     pub kind: FileKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_status: Option<GitStatus>,
 }
 
 impl FileItem {
@@ -80,6 +88,7 @@ impl FileItem {
             modified_unix,
             modified: format_modified_time(modified_time),
             is_hidden,
+            git_status: None,
         }
     }
 

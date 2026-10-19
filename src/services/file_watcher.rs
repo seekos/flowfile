@@ -1,4 +1,4 @@
-use super::file_operations::TRANSFER_STAGING_PREFIX;
+use super::{file_operations::TRANSFER_STAGING_PREFIX, git_status};
 use anyhow::{Context as _, Result};
 use async_channel::{Receiver, bounded};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -29,6 +29,9 @@ impl FileWatcher {
         watcher
             .watch(path, RecursiveMode::NonRecursive)
             .with_context(|| format!("无法监听目录 {}", path.display()))?;
+        for metadata_directory in git_status::metadata_directories(path) {
+            let _ = watcher.watch(&metadata_directory, RecursiveMode::NonRecursive);
+        }
 
         Ok((Self { _watcher: watcher }, receiver))
     }

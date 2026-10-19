@@ -7,6 +7,7 @@ use super::{
 };
 use crate::{
     actions::{CloseQuickLook, ToggleQuickLook},
+    icons::{IconName, icon},
     models::{Model, Pane},
     services::{FileEngine, FileInspector, QuickLookService},
     theme,
@@ -29,6 +30,7 @@ const VIEWPORT_PADDING: f32 = 32.0;
 const NAVIGATION_HOVER_WIDTH: f32 = 112.0;
 const NAVIGATION_HOVER_HEIGHT: f32 = 180.0;
 const NAVIGATION_BUTTON_SIZE: f32 = 64.0;
+const NAVIGATION_ICON_SIZE: f32 = 36.0;
 
 #[derive(Clone)]
 enum ImageViewerContent {
@@ -543,21 +545,16 @@ impl ImageViewerWindow {
                                             .rounded_full()
                                             .border_1()
                                             .border_color(gpui::rgba(if can_show_previous {
-                                                0xffffff33
+                                                0xffffff70
                                             } else {
-                                                0xffffff14
+                                                0xffffff28
                                             }))
                                             .bg(black().opacity(if can_show_previous {
-                                                0.22
+                                                0.52
                                             } else {
-                                                0.08
+                                                0.18
                                             }))
-                                            .text_size(theme::font(30.0))
-                                            .text_color(gpui::rgba(if can_show_previous {
-                                                0xffffffb8
-                                            } else {
-                                                0xffffff38
-                                            }))
+                                            .shadow_lg()
                                             .invisible()
                                             .group_hover("previous-image-hover-zone", |style| {
                                                 style.visible()
@@ -565,13 +562,22 @@ impl ImageViewerWindow {
                                             .when(can_show_previous, |button| {
                                                 button
                                                     .cursor_pointer()
-                                                    .hover(|style| style.bg(black().opacity(0.3)))
+                                                    .hover(|style| style.bg(black().opacity(0.68)))
                                                     .tooltip(delayed_tooltip("上一张（左方向键）"))
                                                     .on_click(cx.listener(|this, _, window, cx| {
                                                         this.switch_image(-1, window, cx)
                                                     }))
                                             })
-                                            .child("‹"),
+                                            .child(icon(
+                                                IconName::ChevronLeft,
+                                                NAVIGATION_ICON_SIZE,
+                                                gpui::rgba(if can_show_previous {
+                                                    0xffffffff
+                                                } else {
+                                                    0xffffff52
+                                                })
+                                                .into(),
+                                            )),
                                     ),
                             ),
                     )
@@ -602,21 +608,16 @@ impl ImageViewerWindow {
                                             .rounded_full()
                                             .border_1()
                                             .border_color(gpui::rgba(if can_show_next {
-                                                0xffffff33
+                                                0xffffff70
                                             } else {
-                                                0xffffff14
+                                                0xffffff28
                                             }))
                                             .bg(black().opacity(if can_show_next {
-                                                0.22
+                                                0.52
                                             } else {
-                                                0.08
+                                                0.18
                                             }))
-                                            .text_size(theme::font(30.0))
-                                            .text_color(gpui::rgba(if can_show_next {
-                                                0xffffffb8
-                                            } else {
-                                                0xffffff38
-                                            }))
+                                            .shadow_lg()
                                             .invisible()
                                             .group_hover("next-image-hover-zone", |style| {
                                                 style.visible()
@@ -624,13 +625,22 @@ impl ImageViewerWindow {
                                             .when(can_show_next, |button| {
                                                 button
                                                     .cursor_pointer()
-                                                    .hover(|style| style.bg(black().opacity(0.3)))
+                                                    .hover(|style| style.bg(black().opacity(0.68)))
                                                     .tooltip(delayed_tooltip("下一张（右方向键）"))
                                                     .on_click(cx.listener(|this, _, window, cx| {
                                                         this.switch_image(1, window, cx)
                                                     }))
                                             })
-                                            .child("›"),
+                                            .child(icon(
+                                                IconName::ChevronRight,
+                                                NAVIGATION_ICON_SIZE,
+                                                gpui::rgba(if can_show_next {
+                                                    0xffffffff
+                                                } else {
+                                                    0xffffff52
+                                                })
+                                                .into(),
+                                            )),
                                     ),
                             ),
                     )

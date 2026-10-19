@@ -1,5 +1,5 @@
 use super::{
-    SmbMountInfo, SmbNavigation, file_operations::TRANSFER_STAGING_PREFIX,
+    SmbMountInfo, SmbNavigation, file_operations::TRANSFER_STAGING_PREFIX, git_status,
     quick_look::is_text_extension, smb, volume,
 };
 use crate::distribution;
@@ -62,6 +62,20 @@ impl FileEngine {
             })
             .await
             .context("目录读取任务异常终止")?
+    }
+
+    pub(crate) async fn annotate_git_statuses(
+        &self,
+        path: PathBuf,
+        mut items: Vec<FileItem>,
+    ) -> Result<Vec<FileItem>> {
+        self.runtime
+            .spawn_blocking(move || {
+                git_status::annotate_directory(&path, &mut items);
+                items
+            })
+            .await
+            .context("Git 状态读取任务异常终止")
     }
 
     pub async fn list_volumes(&self) -> Result<Vec<volume::VolumeInfo>> {

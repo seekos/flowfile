@@ -417,6 +417,7 @@ mod tests {
             modified: String::new(),
             is_hidden: false,
             kind: FileKind::Image,
+            git_status: None,
         }
     }
 

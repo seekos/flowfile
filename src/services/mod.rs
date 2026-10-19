@@ -5,6 +5,7 @@ pub mod file_engine;
 mod file_inspector;
 mod file_operations;
 mod file_watcher;
+mod git_status;
 mod quick_look;
 mod sandbox_access;
 mod search_engine;

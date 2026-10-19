@@ -2,6 +2,7 @@
 *.log
 .DS_Store
 dist/
+.flowfile-build-version
 .env
 .env.*
 .idea/

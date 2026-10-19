@@ -27,6 +27,8 @@ pub enum IconName {
     Refresh,
     Search,
     Close,
+    GitClean,
+    GitModified,
 }
 
 impl IconName {
@@ -51,6 +53,8 @@ impl IconName {
             Self::Refresh => "icons/refresh.svg",
             Self::Search => "icons/search.svg",
             Self::Close => "icons/close.svg",
+            Self::GitClean => "icons/git-clean.svg",
+            Self::GitModified => "icons/git-modified.svg",
         }
     }
 }
@@ -83,6 +87,8 @@ impl AssetSource for IconAssets {
             "icons/refresh.svg" => Some(REFRESH),
             "icons/search.svg" => Some(SEARCH),
             "icons/close.svg" => Some(CLOSE),
+            "icons/git-clean.svg" => Some(GIT_CLEAN),
+            "icons/git-modified.svg" => Some(GIT_MODIFIED),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
@@ -110,6 +116,8 @@ impl AssetSource for IconAssets {
                 "refresh.svg".into(),
                 "search.svg".into(),
                 "close.svg".into(),
+                "git-clean.svg".into(),
+                "git-modified.svg".into(),
             ])
         } else {
             Ok(Vec::new())
@@ -136,3 +144,5 @@ const EDIT: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/
 const REFRESH: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="M16.4 7.5A6.7 6.7 0 1 0 16 13M16.4 3.7v3.8h-3.8" fill="none" stroke="#000" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 const SEARCH: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><circle cx="8.7" cy="8.7" r="5.7" fill="none" stroke="#000" stroke-width="1.7"/><path d="m13 13 4 4" fill="none" stroke="#000" stroke-width="1.9" stroke-linecap="round"/></svg>"##;
 const CLOSE: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="#000" stroke-width="1.8" stroke-linecap="round"/></svg>"##;
+const GIT_CLEAN: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="m4.2 10.4 3.5 3.5 8.1-8.1" fill="none" stroke="#000" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+const GIT_MODIFIED: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="M10 4.1v7.7" fill="none" stroke="#000" stroke-width="2.8" stroke-linecap="round"/><circle cx="10" cy="15.3" r="1.45" fill="#000"/></svg>"##;

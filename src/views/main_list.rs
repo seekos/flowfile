@@ -5,8 +5,10 @@ use super::{
 };
 use crate::{
     actions::{CopyFiles, CutFiles, PasteFiles, RenameSelected, SelectAllFiles, ToggleQuickLook},
+    icons::{self, IconName},
     models::{
-        FileItem, FileKind, FileOperationController, Model, Pane, SortMode, ViewMode, is_svg_path,
+        FileItem, FileKind, FileOperationController, GitStatus, Model, Pane, SortMode, ViewMode,
+        is_svg_path,
     },
     services::{
         ThumbnailEngine, ThumbnailEvent, TransferMode, begin_external_file_drag,
@@ -61,7 +63,7 @@ struct DetailColumnWidths {
 impl Default for DetailColumnWidths {
     fn default() -> Self {
         Self {
-            name: 150.0,
+            name: 260.0,
             kind: 84.0,
             size: 90.0,
             modified: 128.0,
@@ -581,11 +583,9 @@ impl MainListView {
     }
 
     fn file_visual(item: &FileItem, thumbnail: Option<Arc<RenderImage>>, edge: f32) -> AnyElement {
-        if matches!(item.kind, FileKind::Application | FileKind::Script) {
-            return Self::program_icon(item.kind, edge);
-        }
-
-        if let Some(thumbnail) = thumbnail {
+        let visual = if matches!(item.kind, FileKind::Application | FileKind::Script) {
+            Self::program_icon(item.kind, edge)
+        } else if let Some(thumbnail) = thumbnail {
             let visual_edge = if edge < 64.0 { 30.0 } else { edge };
             div()
                 .flex()
@@ -623,7 +623,47 @@ impl MainListView {
                     Self::file_icon(item)
                 })
                 .into_any_element()
-        }
+        };
+
+        div()
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(edge))
+            .child(visual)
+            .when_some(item.git_status, |visual, status| {
+                let badge_id: SharedString = format!("git-status:{}", item.path.display()).into();
+                visual.child(Self::git_status_badge(status, edge, badge_id))
+            })
+            .into_any_element()
+    }
+
+    fn git_status_badge(status: GitStatus, edge: f32, id: SharedString) -> AnyElement {
+        let is_large = edge >= 64.0;
+        let badge_edge = if is_large { 22.0 } else { 13.0 };
+        let icon_edge = if is_large { 15.0 } else { 9.0 };
+        let (icon, color, label) = match status {
+            GitStatus::Clean => (IconName::GitClean, theme::file_green(), "Git：未修改"),
+            GitStatus::Modified => (IconName::GitModified, theme::danger(), "Git：已修改"),
+        };
+
+        div()
+            .id(id)
+            .absolute()
+            .right(if is_large { px(1.0) } else { px(0.0) })
+            .bottom(if is_large { px(1.0) } else { px(0.0) })
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(badge_edge))
+            .rounded_full()
+            .border_1()
+            .border_color(theme::surface())
+            .bg(color)
+            .tooltip(delayed_tooltip(label))
+            .child(icons::icon(icon, icon_edge, theme::surface()))
+            .into_any_element()
     }
 
     fn program_icon(kind: FileKind, edge: f32) -> AnyElement {
@@ -2592,7 +2632,7 @@ mod grid_name_tests {
         let directory_width = widths.total(false);
 
         widths.resize(DetailColumn::Name, 24.0);
-        assert_eq!(widths.name, 174.0);
+        assert_eq!(widths.name, 284.0);
         assert_eq!(widths.kind, original_kind);
 
         widths.resize(DetailColumn::Size, -500.0);
@@ -2709,6 +2749,7 @@ mod grid_name_tests {
             modified: String::new(),
             is_hidden: false,
             kind: FileKind::Archive,
+            git_status: None,
         };
         let hidden_file = FileItem {
             name: ".env".to_string(),

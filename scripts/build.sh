@@ -9,12 +9,14 @@ resources_dir=${project_dir}/resources
 dist_dir=${project_dir}/dist
 icon_source=${resources_dir}/FlowFile.svg
 icon_output=${resources_dir}/FlowFile.icns
+version_file=${project_dir}/.flowfile-build-version
 icon_only=false
 version_override=""
 
 usage() {
     print "Usage: ${script_name} [-v <version>] [--icon-only]"
     print "  -v, --version <version>  Override the package version (for example: v0.1.2)"
+    print "                          Defaults to the last successful build version"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -115,7 +117,13 @@ sign_app() {
 }
 
 cd "${project_dir}"
-version=${version_override:-$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)}
+if [[ -n "${version_override}" ]]; then
+    version=${version_override}
+elif [[ -s "${version_file}" ]]; then
+    version=$(<"${version_file}")
+else
+    version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+fi
 version=${version#v}
 if [[ ! "${version}" =~ '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$' ]]; then
     print -u2 "Invalid version: ${version_override:-${version}}"
@@ -196,5 +204,6 @@ if [[ -n "${FLOWFILE_NOTARY_PROFILE:-}" ]]; then
     xcrun stapler staple "${dmg_path}"
 fi
 
+print -r -- "${version}" > "${version_file}"
 print "Application: ${app_path}"
 print "Disk image:  ${dmg_path}"
