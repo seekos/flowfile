@@ -241,7 +241,7 @@ function run(argv) {
 
 const CHOOSE_OPEN_WITH_APPLICATION_SCRIPT: &str = r#"
 try
-    set selectedApplication to choose file with prompt "选择用于打开该文件的应用程序" of type {"com.apple.application-bundle"} default location (path to applications folder)
+    set selectedApplication to choose file with prompt "选择用于打开该项目的应用程序" of type {"com.apple.application-bundle"} default location (path to applications folder)
     return POSIX path of selectedApplication
 on error number -128
     return ""
@@ -287,7 +287,7 @@ fn query_applications_for_path(path: &Path) -> Result<Vec<OpenWithApplication>> 
     }
     let mut applications = parse_open_with_applications(&String::from_utf8_lossy(&output.stdout))?;
     rank_applications_for_path(path, &mut applications);
-    if is_text_or_unknown_path(path) {
+    if !path.is_dir() && is_text_or_unknown_path(path) {
         ensure_text_editor(&mut applications);
         if let Some(notepad_path) = installed_notepad_application() {
             promote_notepad_application(&mut applications, notepad_path);
@@ -575,9 +575,10 @@ pub async fn fetch_dir_entries_with_options(
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenWithApplication, discover_volume_paths, ensure_text_editor, fetch_dir_entries,
-        fetch_dir_entries_with_options, is_text_or_unknown_path, is_text_path, is_unix_executable,
-        parse_open_with_applications, promote_notepad_application, rank_applications_for_path,
+        FileEngine, OpenWithApplication, discover_volume_paths, ensure_text_editor,
+        fetch_dir_entries, fetch_dir_entries_with_options, is_text_or_unknown_path, is_text_path,
+        is_unix_executable, parse_open_with_applications, promote_notepad_application,
+        rank_applications_for_path,
     };
     use crate::models::SortMode;
     use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf};
@@ -690,6 +691,13 @@ mod tests {
             applications[0].path,
             PathBuf::from("/System/Applications/TextEdit.app")
         );
+    }
+
+    #[test]
+    fn folders_do_not_offer_text_opening() {
+        let directory = tempfile::tempdir().expect("temp directory");
+
+        assert!(!FileEngine::supports_text_opening(directory.path()));
     }
 
     #[test]

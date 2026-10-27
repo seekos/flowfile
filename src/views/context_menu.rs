@@ -118,11 +118,10 @@ impl ContextMenuView {
         });
         let open_with_path = self.state.as_ref().and_then(|state| {
             let pane = state.pane.read(cx);
-            (pane.selection_count() == 1)
-                .then(|| pane.selected_index.and_then(|index| pane.items.get(index)))
-                .flatten()
-                .filter(|item| !item.is_dir)
-                .map(|item| item.path.clone())
+            open_with_path_for_selection(
+                pane.selection_count(),
+                pane.selected_index.and_then(|index| pane.items.get(index)),
+            )
         });
         if let Some(path) = open_with_path {
             self.load_open_with_applications(path, cx);
@@ -932,6 +931,16 @@ impl ContextMenuView {
     }
 }
 
+fn open_with_path_for_selection(
+    selection_count: usize,
+    selected_item: Option<&crate::models::FileItem>,
+) -> Option<std::path::PathBuf> {
+    (selection_count == 1)
+        .then_some(selected_item)
+        .flatten()
+        .map(|item| item.path.clone())
+}
+
 impl Render for ContextMenuView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(state) = self.state.clone() else {
@@ -1014,7 +1023,34 @@ impl Render for ContextMenuView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{FileItem, FileKind};
     use gpui::size;
+
+    fn folder_item(path: &str) -> FileItem {
+        FileItem {
+            path: path.into(),
+            name: "project".to_string(),
+            is_dir: true,
+            extension: None,
+            size: 0,
+            modified_unix: 0,
+            modified: String::new(),
+            is_hidden: false,
+            kind: FileKind::Folder,
+            git_status: None,
+        }
+    }
+
+    #[test]
+    fn open_with_is_available_for_one_selected_folder() {
+        let folder = folder_item("/tmp/project");
+
+        assert_eq!(
+            open_with_path_for_selection(1, Some(&folder)),
+            Some(std::path::PathBuf::from("/tmp/project"))
+        );
+        assert_eq!(open_with_path_for_selection(2, Some(&folder)), None);
+    }
 
     #[test]
     fn open_with_submenu_avoids_the_main_menu_at_the_right_edge() {
