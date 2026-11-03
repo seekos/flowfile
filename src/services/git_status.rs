@@ -100,6 +100,12 @@ fn set_status_for_path(
 }
 
 fn git_status(path: &Path) -> Option<Vec<([u8; 2], PathBuf)>> {
+    // Porcelain v1 paths are always relative to the worktree root.
+    let worktree_prefix = path
+        .ancestors()
+        .find(|ancestor| metadata_directory(ancestor).is_some())
+        .and_then(|root| path.strip_prefix(root).ok())
+        .unwrap_or_else(|| Path::new(""));
     let output = git_output(
         path,
         &[
@@ -123,11 +129,25 @@ fn git_status(path: &Path) -> Option<Vec<([u8; 2], PathBuf)>> {
             continue;
         }
         let code = [record[0], record[1]];
-        statuses.push((code, path_from_bytes(&record[3..])));
+        let status_path = path_from_bytes(&record[3..]);
+        statuses.push((
+            code,
+            status_path
+                .strip_prefix(worktree_prefix)
+                .unwrap_or(&status_path)
+                .to_path_buf(),
+        ));
         if code.iter().any(|byte| matches!(byte, b'R' | b'C'))
             && let Some(source) = records.next()
         {
-            statuses.push((code, path_from_bytes(source)));
+            let source_path = path_from_bytes(source);
+            statuses.push((
+                code,
+                source_path
+                    .strip_prefix(worktree_prefix)
+                    .unwrap_or(&source_path)
+                    .to_path_buf(),
+            ));
         }
     }
     Some(statuses)
@@ -238,6 +258,13 @@ mod tests {
         assert_eq!(status(&items, "clean.txt"), Some(GitStatus::Clean));
         assert_eq!(status(&items, "folder"), Some(GitStatus::Modified));
         assert_eq!(status(&items, "new.txt"), Some(GitStatus::Modified));
+
+        let mut nested_items = read_items(&root.join("folder"));
+        annotate_directory(&root.join("folder"), &mut nested_items);
+        assert_eq!(
+            status(&nested_items, "tracked.txt"),
+            Some(GitStatus::Modified)
+        );
 
         let mut parent_items = read_items(directory.path());
         annotate_directory(directory.path(), &mut parent_items);

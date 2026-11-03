@@ -2,6 +2,10 @@ use super::{FileEngine, ensure_writable, volume};
 use crate::distribution;
 use anyhow::{Context as _, Result, bail};
 use async_channel::Sender;
+#[cfg(target_os = "macos")]
+use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSActivityOptions, NSObject, NSProcessInfo, NSString};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -26,11 +30,51 @@ use tokio::{
 };
 
 const COPY_BUFFER_SIZE: usize = 256 * 1024;
+const SCAN_PROGRESS_INTERVAL: usize = 128;
 pub(super) const TRANSFER_STAGING_PREFIX: &str = ".flowfile-transfer-";
 static TRANSFER_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static FILE_MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static FILE_MUTATIONS: LazyLock<Mutex<Vec<ActiveFileMutation>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[cfg(target_os = "macos")]
+struct TransferSleepAssertion {
+    activity: Retained<NSObject>,
+}
+
+// NSProcessInfo activity tokens are safe to end from a different worker thread.
+#[cfg(target_os = "macos")]
+unsafe impl Send for TransferSleepAssertion {}
+
+#[cfg(target_os = "macos")]
+impl TransferSleepAssertion {
+    fn begin() -> Self {
+        let activity = unsafe {
+            NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+                NSActivityOptions::NSActivityIdleSystemSleepDisabled,
+                &NSString::from_str("FlowFile 文件传输"),
+            )
+        };
+        Self { activity }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for TransferSleepAssertion {
+    fn drop(&mut self) {
+        unsafe { NSProcessInfo::processInfo().endActivity(&self.activity) };
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+struct TransferSleepAssertion;
+
+#[cfg(not(target_os = "macos"))]
+impl TransferSleepAssertion {
+    fn begin() -> Self {
+        Self
+    }
+}
 
 struct ActiveFileMutation {
     id: u64,
@@ -212,6 +256,7 @@ impl FileOperationEngine {
     ) -> Result<Vec<PathBuf>> {
         self.runtime
             .spawn(async move {
+                let _sleep_assertion = TransferSleepAssertion::begin();
                 execute_transfer_controlled(
                     sources,
                     destination,
@@ -423,8 +468,12 @@ async fn execute_transfer_controlled(
 
     let mut roots = Vec::with_capacity(sources.len());
     let mut reserved_destinations = HashSet::new();
-    for source in sources {
+    for (index, source) in sources.into_iter().enumerate() {
         control.checkpoint().await?;
+        let checked_items = index + 1;
+        if checked_items == 1 || checked_items.is_multiple_of(SCAN_PROGRESS_INTERVAL) {
+            send_preparation_progress(&progress, format!("正在检查 {checked_items} 个项目"));
+        }
         let source_metadata = fs::symlink_metadata(&source)
             .await
             .with_context(|| format!("无法读取 {}", source.display()))?;
@@ -452,6 +501,7 @@ async fn execute_transfer_controlled(
         reserved_destinations.insert(destination_root.clone());
         roots.push((source, destination_root));
     }
+    send_preparation_progress(&progress, format!("正在检查 {} 个项目", roots.len()));
 
     // Only paths touched by this transfer are reserved. Sibling files and
     // unrelated folders remain available for rename, create, delete, and
@@ -463,6 +513,7 @@ async fn execute_transfer_controlled(
     let _guard = begin_file_mutation(mutation_paths)?;
 
     let mut prepared_transfers = Vec::with_capacity(roots.len());
+    let mut scanned_items = 0;
     for (source_root, destination_root) in roots {
         control.checkpoint().await?;
         // A same-volume move is a single filesystem rename and does not need
@@ -478,7 +529,14 @@ async fn execute_transfer_controlled(
             prepared_transfers.push(PreparedTransfer::Renamed(destination_root));
         } else {
             prepared_transfers.push(PreparedTransfer::Planned(
-                build_plan(source_root, destination_root, &control).await?,
+                build_plan(
+                    source_root,
+                    destination_root,
+                    &control,
+                    &progress,
+                    &mut scanned_items,
+                )
+                .await?,
             ));
         }
     }
@@ -601,6 +659,8 @@ async fn build_plan(
     source_root: PathBuf,
     destination_root: PathBuf,
     control: &TransferControl,
+    progress: &Sender<TransferProgress>,
+    scanned_items: &mut usize,
 ) -> Result<TransferPlan> {
     let mut entries = Vec::new();
     let mut stack = vec![(source_root.clone(), PathBuf::new())];
@@ -608,6 +668,10 @@ async fn build_plan(
 
     while let Some((source, relative)) = stack.pop() {
         control.checkpoint().await?;
+        *scanned_items += 1;
+        if *scanned_items == 1 || (*scanned_items).is_multiple_of(SCAN_PROGRESS_INTERVAL) {
+            send_scan_progress(progress, *scanned_items);
+        }
         let metadata = fs::symlink_metadata(&source)
             .await
             .with_context(|| format!("无法读取 {}", source.display()))?;
@@ -642,6 +706,7 @@ async fn build_plan(
             bail!("不支持复制此类型的文件：{}", source.display());
         }
     }
+    send_scan_progress(progress, *scanned_items);
 
     entries.sort_by_key(|entry| entry.kind != PlanEntryKind::Directory);
     Ok(TransferPlan {
@@ -746,6 +811,13 @@ async fn copy_file_streamed(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("文件");
+    send_progress(
+        context.progress,
+        current_file,
+        *context.bytes_done,
+        context.total_bytes,
+        context.started,
+    );
 
     loop {
         context.control.checkpoint().await?;
@@ -765,30 +837,7 @@ async fn copy_file_streamed(
     }
     context.control.checkpoint().await?;
     output.flush().await?;
-    match output.sync_all().await {
-        Ok(()) => {}
-        Err(error)
-            if is_unsupported_file_sync(&error)
-                || context.destination_is_smb && is_smb_metadata_capability_error(&error) =>
-        {
-            // macOS SMB mounts can persist writes correctly while returning
-            // ENOTSUP, EINVAL, or a permission error for fsync. Closing the
-            // flushed file is the strongest durability boundary it provides.
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("无法同步已写入文件 {}", destination.display()));
-        }
-    }
     Ok(())
-}
-
-fn is_unsupported_file_sync(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::Unsupported
-        // ENOTSUP/EOPNOTSUPP on macOS. Rust versions before every platform
-        // mapping was stabilized can still surface it as Uncategorized.
-        || error.raw_os_error() == Some(45)
-        || error.raw_os_error() == Some(102)
 }
 
 async fn unique_transfer_path(destination: &Path) -> Result<PathBuf> {
@@ -947,6 +996,19 @@ fn send_progress(
     });
 }
 
+fn send_scan_progress(sender: &Sender<TransferProgress>, scanned_items: usize) {
+    send_preparation_progress(sender, format!("正在扫描 {scanned_items} 个项目"));
+}
+
+fn send_preparation_progress(sender: &Sender<TransferProgress>, current_file: String) {
+    let _ = sender.force_send(TransferProgress {
+        current_file,
+        bytes_done: 0,
+        total_bytes: 0,
+        speed_bytes_per_second: 0.0,
+    });
+}
+
 async fn available_path(path: &Path) -> Result<PathBuf> {
     available_path_with_reserved(path, &HashSet::new()).await
 }
@@ -1007,10 +1069,12 @@ pub(crate) fn validate_file_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::TransferSleepAssertion;
     use super::{
-        ConflictPolicy, TransferControl, TransferMode, available_path, begin_file_mutation,
-        execute_transfer, execute_transfer_controlled, is_transfer_cancelled,
-        is_unsupported_file_sync, rename_path, send_progress,
+        ConflictPolicy, SCAN_PROGRESS_INTERVAL, TransferControl, TransferMode, available_path,
+        begin_file_mutation, build_plan, execute_transfer, execute_transfer_controlled,
+        is_transfer_cancelled, rename_path, send_progress,
     };
     use std::{
         fs,
@@ -1022,6 +1086,12 @@ mod tests {
         process::Command,
         time::{Duration, Instant},
     };
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn transfer_sleep_assertion_can_be_acquired_and_released() {
+        drop(TransferSleepAssertion::begin());
+    }
 
     #[test]
     fn progress_channel_keeps_the_latest_snapshot() {
@@ -1038,13 +1108,66 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
-    #[test]
-    fn unsupported_macos_file_sync_is_non_fatal() {
-        let error = std::io::Error::from_raw_os_error(45);
-        assert!(is_unsupported_file_sync(&error));
-        assert!(!is_unsupported_file_sync(
-            &std::io::Error::from_raw_os_error(5)
-        ));
+    #[tokio::test]
+    async fn large_plan_reports_scanning_progress() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let source = source_directory.path().join("many-files");
+        fs::create_dir(&source).expect("create source folder");
+        for index in 0..=SCAN_PROGRESS_INTERVAL {
+            fs::write(source.join(format!("{index}.txt")), []).expect("write source file");
+        }
+        let (progress, receiver) = async_channel::bounded(1);
+        let mut scanned_items = 0;
+
+        let plan = build_plan(
+            source,
+            PathBuf::from("/unused-destination"),
+            &TransferControl::default(),
+            &progress,
+            &mut scanned_items,
+        )
+        .await
+        .expect("build transfer plan");
+
+        assert_eq!(plan.entries.len(), SCAN_PROGRESS_INTERVAL + 2);
+        assert_eq!(scanned_items, plan.entries.len());
+        assert_eq!(
+            receiver.try_recv().expect("scan progress").current_file,
+            format!("正在扫描 {scanned_items} 个项目")
+        );
+    }
+
+    #[tokio::test]
+    async fn many_empty_files_finish_without_stalling() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let destination_directory = tempfile::tempdir().expect("destination directory");
+        let source = source_directory.path().join("many-empty-files");
+        fs::create_dir(&source).expect("create source folder");
+        for index in 0..=SCAN_PROGRESS_INTERVAL {
+            fs::write(source.join(format!("{index}.txt")), []).expect("write source file");
+        }
+        let (progress, _receiver) = async_channel::bounded(1);
+
+        let destinations = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_transfer(
+                vec![source],
+                destination_directory.path().to_path_buf(),
+                TransferMode::Copy,
+                ConflictPolicy::AutoRename,
+                progress,
+            ),
+        )
+        .await
+        .expect("many-file transfer timed out")
+        .expect("copy many files");
+
+        assert_eq!(
+            fs::read_dir(&destinations[0])
+                .expect("read copied directory")
+                .count(),
+            SCAN_PROGRESS_INTERVAL + 1
+        );
     }
 
     #[tokio::test]
