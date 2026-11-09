@@ -135,6 +135,7 @@ pub enum ConflictPolicy {
     #[default]
     AutoRename,
     Overwrite,
+    Abort,
 }
 
 impl ConflictPolicy {
@@ -269,6 +270,18 @@ impl FileOperationEngine {
             })
             .await
             .context("文件传输任务异常终止")?
+    }
+
+    pub async fn destination_conflicts(
+        &self,
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+        mode: TransferMode,
+    ) -> Result<Vec<PathBuf>> {
+        self.runtime
+            .spawn(async move { find_destination_conflicts(sources, destination, mode).await })
+            .await
+            .context("同名项目检查任务异常终止")?
     }
 
     pub async fn create_directory(&self, parent: PathBuf, name: String) -> Result<PathBuf> {
@@ -523,8 +536,8 @@ async fn execute_transfer_controlled(
         // move normally. If rename is unavailable (for example, across
         // volumes), fall back to the recursive copy-and-remove path below.
         if mode == TransferMode::Move
-            && conflict_policy == ConflictPolicy::AutoRename
-            && fs::rename(&source_root, &destination_root).await.is_ok()
+            && conflict_policy != ConflictPolicy::Overwrite
+            && rename_without_replacing(&source_root, &destination_root).await
         {
             prepared_transfers.push(PreparedTransfer::Renamed(destination_root));
         } else {
@@ -588,25 +601,53 @@ async fn execute_transfer_controlled(
             let _ = remove_existing(&staging_root).await;
             return Err(error);
         }
-        if let Err(error) = commit_staged_transfer(
+        let backup = match commit_staged_transfer(
             &staging_root,
             &plan.destination_root,
             conflict_policy == ConflictPolicy::Overwrite,
         )
         .await
         {
-            let _ = remove_existing(&staging_root).await;
-            return Err(error);
-        }
+            Ok(backup) => backup,
+            Err(error) => {
+                let _ = remove_existing(&staging_root).await;
+                return Err(error);
+            }
+        };
 
         if mode == TransferMode::Move {
-            control.checkpoint().await?;
-            remove_existing(&plan.source_root).await.with_context(|| {
-                format!(
-                    "目标已完整写入，但无法删除源项目 {}",
-                    plan.source_root.display()
-                )
-            })?;
+            let source_cleanup = async {
+                control.checkpoint().await?;
+                remove_existing(&plan.source_root).await.with_context(|| {
+                    format!(
+                        "目标已完整写入，但无法删除源项目 {}",
+                        plan.source_root.display()
+                    )
+                })
+            }
+            .await;
+            if let Err(error) = source_cleanup {
+                if let Some(backup) = backup.as_deref() {
+                    return match restore_overwritten_destination(&plan.destination_root, backup)
+                        .await
+                    {
+                        Ok(()) => Err(error).context("移动未完成，原目标已恢复"),
+                        Err(restore_error) => Err(anyhow::anyhow!(
+                            "移动未完成，恢复原目标也失败：{error}；{restore_error}；原目标暂存在 {}",
+                            backup.display()
+                        )),
+                    };
+                }
+                return Err(error);
+            }
+        }
+        if let Some(backup) = backup
+            && let Err(error) = remove_existing(&backup).await
+        {
+            eprintln!(
+                "FlowFile: 已提交传输，但无法删除原目标备份 {}：{error}",
+                backup.display()
+            );
         }
         destinations.push(plan.destination_root);
     }
@@ -652,7 +693,79 @@ async fn select_destination_root(
             available_path_with_reserved(&desired_destination, reserved_destinations).await?
         }
         ConflictPolicy::Overwrite => desired_destination,
+        ConflictPolicy::Abort => {
+            if reserved_destinations.contains(&desired_destination)
+                || fs::try_exists(&desired_destination).await?
+            {
+                bail!("目标名称已存在：{}", desired_destination.display());
+            }
+            desired_destination
+        }
     })
+}
+
+async fn find_destination_conflicts(
+    sources: Vec<PathBuf>,
+    destination: PathBuf,
+    mode: TransferMode,
+) -> Result<Vec<PathBuf>> {
+    let destination = fs::canonicalize(&destination)
+        .await
+        .with_context(|| format!("目标目录不存在：{}", destination.display()))?;
+    if !fs::metadata(&destination).await?.is_dir() {
+        bail!("目标不是文件夹：{}", destination.display());
+    }
+
+    let mut destinations = HashSet::new();
+    let mut conflicts = Vec::new();
+    let mut recorded_conflicts = HashSet::new();
+    for source in sources {
+        if mode == TransferMode::Move
+            && let Some(parent) = source.parent()
+            && fs::canonicalize(parent).await.ok().as_deref() == Some(destination.as_path())
+        {
+            bail!("源文件已经位于目标文件夹中");
+        }
+        let file_name = source.file_name().context("无法确定源文件名称")?;
+        let desired_destination = destination.join(file_name);
+        let reserved = !destinations.insert(desired_destination.clone());
+        if (reserved || fs::try_exists(&desired_destination).await?)
+            && recorded_conflicts.insert(desired_destination.clone())
+        {
+            conflicts.push(desired_destination);
+        }
+    }
+    Ok(conflicts)
+}
+
+#[cfg(target_os = "macos")]
+async fn rename_without_replacing(source: &Path, destination: &Path) -> bool {
+    const RENAME_EXCL: u32 = 0x00000004;
+
+    unsafe extern "C" {
+        fn renamex_np(
+            source: *const std::ffi::c_char,
+            destination: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let Ok(source) = CString::new(source.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let Ok(destination) = CString::new(destination.as_os_str().as_bytes()) else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || unsafe {
+        renamex_np(source.as_ptr(), destination.as_ptr(), RENAME_EXCL)
+    })
+    .await
+    .is_ok_and(|status| status == 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn rename_without_replacing(_source: &Path, _destination: &Path) -> bool {
+    false
 }
 
 async fn build_plan(
@@ -855,11 +968,16 @@ async fn unique_transfer_path(destination: &Path) -> Result<PathBuf> {
     }
 }
 
-async fn commit_staged_transfer(staging: &Path, destination: &Path, overwrite: bool) -> Result<()> {
+async fn commit_staged_transfer(
+    staging: &Path,
+    destination: &Path,
+    overwrite: bool,
+) -> Result<Option<PathBuf>> {
     if !fs::try_exists(destination).await? {
-        return fs::rename(staging, destination)
+        fs::rename(staging, destination)
             .await
-            .with_context(|| format!("无法提交已完成的传输到 {}", destination.display()));
+            .with_context(|| format!("无法提交已完成的传输到 {}", destination.display()))?;
+        return Ok(None);
     }
     if !overwrite {
         bail!("目标名称在传输期间已被占用：{}", destination.display());
@@ -881,13 +999,16 @@ async fn commit_staged_transfer(staging: &Path, destination: &Path, overwrite: b
             )),
         };
     }
-    if let Err(error) = remove_existing(&backup).await {
-        eprintln!(
-            "FlowFile: 已提交传输，但无法删除原目标备份 {}：{error}",
-            backup.display()
-        );
-    }
-    Ok(())
+    Ok(Some(backup))
+}
+
+async fn restore_overwritten_destination(destination: &Path, backup: &Path) -> Result<()> {
+    remove_existing(destination)
+        .await
+        .with_context(|| format!("无法移除未完成的新目标 {}", destination.display()))?;
+    fs::rename(backup, destination)
+        .await
+        .with_context(|| format!("无法恢复原目标 {}", destination.display()))
 }
 
 async fn copy_metadata(
@@ -1069,13 +1190,14 @@ pub(crate) fn validate_file_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    use super::TransferSleepAssertion;
     use super::{
         ConflictPolicy, SCAN_PROGRESS_INTERVAL, TransferControl, TransferMode, available_path,
-        begin_file_mutation, build_plan, execute_transfer, execute_transfer_controlled,
-        is_transfer_cancelled, rename_path, send_progress,
+        begin_file_mutation, build_plan, commit_staged_transfer, execute_transfer,
+        execute_transfer_controlled, find_destination_conflicts, is_transfer_cancelled,
+        rename_path, send_progress,
     };
+    #[cfg(target_os = "macos")]
+    use super::{TransferSleepAssertion, rename_without_replacing};
     use std::{
         fs,
         os::unix::{
@@ -1286,6 +1408,93 @@ mod tests {
             "notes (1).txt"
         );
         assert_eq!(fs::read(&destinations[0]).unwrap(), b"flowfile");
+    }
+
+    #[tokio::test]
+    async fn conflict_check_reports_existing_destination_before_transfer() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let destination_directory = tempfile::tempdir().expect("destination directory");
+        let source = source_directory.path().join("notes.txt");
+        let destination = destination_directory.path().join("notes.txt");
+        fs::write(&source, b"new").expect("write source");
+        fs::write(&destination, b"old").expect("write destination");
+
+        let conflicts = find_destination_conflicts(
+            vec![source],
+            destination_directory.path().to_path_buf(),
+            TransferMode::Copy,
+        )
+        .await
+        .expect("check conflicts");
+
+        assert_eq!(
+            conflicts,
+            vec![fs::canonicalize(destination).expect("canonical destination")]
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_policy_never_silently_renames_a_late_conflict() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let destination_directory = tempfile::tempdir().expect("destination directory");
+        let source = source_directory.path().join("notes.txt");
+        let destination = destination_directory.path().join("notes.txt");
+        fs::write(&source, b"new").expect("write source");
+        fs::write(&destination, b"old").expect("write destination");
+        let (progress, _receiver) = async_channel::bounded(8);
+
+        execute_transfer(
+            vec![source.clone()],
+            destination_directory.path().to_path_buf(),
+            TransferMode::Copy,
+            ConflictPolicy::Abort,
+            progress,
+        )
+        .await
+        .expect_err("late conflict must stop transfer");
+
+        assert_eq!(fs::read(source).unwrap(), b"new");
+        assert_eq!(fs::read(destination).unwrap(), b"old");
+        assert!(!destination_directory.path().join("notes (1).txt").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn same_volume_fast_move_never_replaces_an_existing_destination() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let destination_directory = tempfile::tempdir().expect("destination directory");
+        let source = source_directory.path().join("notes.txt");
+        let destination = destination_directory.path().join("notes.txt");
+        fs::write(&source, b"new").expect("write source");
+        fs::write(&destination, b"old").expect("write destination");
+
+        assert!(!rename_without_replacing(&source, &destination).await);
+        assert_eq!(fs::read(source).unwrap(), b"new");
+        assert_eq!(fs::read(destination).unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn failed_overwrite_commit_restores_original_destination() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let destination = directory.path().join("notes.txt");
+        let missing_staging = directory.path().join("missing-staging.txt");
+        fs::write(&destination, b"old contents").expect("write destination");
+
+        let error = commit_staged_transfer(&missing_staging, &destination, true)
+            .await
+            .expect_err("missing staging must fail commit");
+
+        assert!(error.to_string().contains("原目标已恢复"));
+        assert_eq!(fs::read(destination).unwrap(), b"old contents");
+        assert!(
+            fs::read_dir(directory.path())
+                .expect("read destination directory")
+                .all(|entry| !entry
+                    .expect("destination entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".flowfile-transfer-"))
+        );
     }
 
     #[tokio::test]

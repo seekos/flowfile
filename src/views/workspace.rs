@@ -28,7 +28,7 @@ use crate::{
     models::{
         AppPreferences, CreateItemKind, Favorites, FileKind, FileOperationController,
         FileOperationEvent, LayoutMode, Model, MultiPaneModel, Pane, PaneEvent, SessionState,
-        home_directory, is_svg_path,
+        TransferConflict, home_directory, is_svg_path,
     },
     services::{
         AvailableUpdate, FileEngine, FileInspector, FileOperationEngine, PreviewKind,
@@ -242,6 +242,9 @@ enum ModalState {
     PermanentDelete {
         paths: Vec<PathBuf>,
     },
+    TransferConflict {
+        conflict: TransferConflict,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -428,10 +431,16 @@ impl WorkspaceView {
         cx.subscribe_in(
             &operations,
             window,
-            |workspace, operations, event: &FileOperationEvent, _window, cx| {
-                if *event == FileOperationEvent::TransferStarted {
+            |workspace, operations, event: &FileOperationEvent, window, cx| match event {
+                FileOperationEvent::Started => {
                     workspace.open_transfer_progress(operations.clone(), cx);
                 }
+                FileOperationEvent::ConflictDetected => {
+                    if let Some(conflict) = operations.read(cx).pending_transfer_conflict() {
+                        workspace.open_transfer_conflict_modal(conflict, window, cx);
+                    }
+                }
+                FileOperationEvent::Changed => {}
             },
         )
         .detach();
@@ -888,6 +897,11 @@ impl WorkspaceView {
             ModalState::PermanentDelete { paths } => {
                 format!("永久删除确认，将删除 {} 个项目", paths.len())
             }
+            ModalState::TransferConflict { conflict } => format!(
+                "同名项目冲突，{}，共 {} 个冲突",
+                conflict.first_path.display(),
+                conflict.conflict_count
+            ),
         });
         let quick_look = self.quick_look.as_ref().map(|preview| {
             let state = match &preview.content {
@@ -1669,6 +1683,22 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn open_transfer_conflict_modal(
+        &mut self,
+        conflict: TransferConflict,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() {
+            return;
+        }
+        self.modal = Some(ModalState::TransferConflict { conflict });
+        self.modal_cursor_offset = 0;
+        self.modal_error = None;
+        self.modal_focus_handle.focus(window);
+        cx.notify();
+    }
+
     fn on_pane_event(
         &mut self,
         pane: Model<Pane>,
@@ -1963,11 +1993,30 @@ impl WorkspaceView {
                     operations.delete_permanently(paths, cx);
                 });
             }
+            ModalState::TransferConflict { .. } => {
+                self.operations.update(cx, |operations, cx| {
+                    operations.continue_pending_transfer(false, cx);
+                });
+            }
         }
         self.close_modal(window, cx);
     }
 
+    fn overwrite_transfer_conflict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.modal, Some(ModalState::TransferConflict { .. })) {
+            return;
+        }
+        self.operations.update(cx, |operations, cx| {
+            operations.continue_pending_transfer(true, cx);
+        });
+        self.close_modal(window, cx);
+    }
+
     fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.modal, Some(ModalState::TransferConflict { .. })) {
+            self.operations
+                .update(cx, |operations, _| operations.cancel_pending_transfer());
+        }
         self.modal = None;
         self.modal_cursor_offset = 0;
         self.modal_selection = None;
@@ -2777,6 +2826,59 @@ impl WorkspaceView {
                     .child(self.modal_buttons("永久删除", true, cx))
                     .into_any_element()
             }
+            ModalState::TransferConflict { conflict } => {
+                let action = match conflict.mode {
+                    TransferMode::Copy => "复制",
+                    TransferMode::Move => "移动",
+                };
+                let first_name = conflict
+                    .first_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("同名项目");
+                let summary = if conflict.conflict_count == 1 {
+                    format!("目标位置已存在“{first_name}”。")
+                } else {
+                    format!(
+                        "目标位置已有“{first_name}”等 {} 个同名项目。",
+                        conflict.conflict_count
+                    )
+                };
+                div()
+                    .w(px(440.0))
+                    .p_5()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme::border_strong())
+                    .bg(theme::surface())
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_size(theme::font(15.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_primary())
+                            .child(format!("{action}时发现同名项目")),
+                    )
+                    .child(
+                        div()
+                            .mt_3()
+                            .text_size(theme::font(11.0))
+                            .text_color(theme::text_primary())
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_size(theme::font(9.0))
+                            .text_color(theme::text_tertiary())
+                            .child(format!(
+                                "重命名会保留现有项目；覆盖会先备份现有项目，失败时自动恢复。此选择将应用到本次 {} 个项目。",
+                                conflict.item_count
+                            )),
+                    )
+                    .child(self.transfer_conflict_buttons(cx))
+                    .into_any_element()
+            }
         };
 
         Some(
@@ -3357,6 +3459,75 @@ impl WorkspaceView {
                         this.confirm_modal(window, cx);
                     }))
                     .child(confirm_label),
+            )
+    }
+
+    fn transfer_conflict_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .mt_5()
+            .child(
+                div()
+                    .id("conflict-cancel")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(30.0))
+                    .px_4()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme::border())
+                    .bg(theme::surface())
+                    .text_size(theme::font(10.0))
+                    .text_color(theme::text_secondary())
+                    .hover(|style| style.bg(theme::surface_subtle()))
+                    .tooltip(delayed_tooltip("取消本次传输 (Esc)"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_modal(window, cx);
+                    }))
+                    .child("取消"),
+            )
+            .child(
+                div()
+                    .id("conflict-rename")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(30.0))
+                    .px_4()
+                    .rounded_md()
+                    .bg(theme::accent())
+                    .text_size(theme::font(10.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::surface())
+                    .hover(|style| style.bg(theme::accent().opacity(0.86)))
+                    .tooltip(delayed_tooltip("自动生成新名称并继续 (Enter)"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.confirm_modal(window, cx);
+                    }))
+                    .child("重命名"),
+            )
+            .child(
+                div()
+                    .id("conflict-overwrite")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(30.0))
+                    .px_4()
+                    .rounded_md()
+                    .bg(theme::danger())
+                    .text_size(theme::font(10.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::surface())
+                    .hover(|style| style.bg(theme::danger().opacity(0.86)))
+                    .tooltip(delayed_tooltip("覆盖目标中的同名项目"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.overwrite_transfer_conflict(window, cx);
+                    }))
+                    .child("覆盖"),
             )
     }
 }

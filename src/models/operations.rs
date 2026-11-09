@@ -65,8 +65,25 @@ pub struct FileDragPayload {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileOperationEvent {
-    TransferStarted,
-    TransferChanged,
+    Started,
+    Changed,
+    ConflictDetected,
+}
+
+#[derive(Clone, Debug)]
+pub struct TransferConflict {
+    pub first_path: PathBuf,
+    pub conflict_count: usize,
+    pub item_count: usize,
+    pub mode: TransferMode,
+}
+
+#[derive(Clone, Debug)]
+struct PendingTransfer {
+    sources: Vec<PathBuf>,
+    destination: PathBuf,
+    mode: TransferMode,
+    conflicts: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +128,8 @@ pub struct FileOperationController {
     notice_generation: u64,
     transfer_generation: u64,
     transfer_control: Option<TransferControl>,
+    transfer_preflight_running: bool,
+    pending_transfer: Option<PendingTransfer>,
 }
 
 impl EventEmitter<FileOperationEvent> for FileOperationController {}
@@ -128,6 +147,8 @@ impl FileOperationController {
             notice_generation: 0,
             transfer_generation: 0,
             transfer_control: None,
+            transfer_preflight_running: false,
+            pending_transfer: None,
         }
     }
 
@@ -273,7 +294,7 @@ impl FileOperationController {
             control.pause();
             transfer.paused = true;
             transfer.speed_bytes_per_second = 0.0;
-            cx.emit(FileOperationEvent::TransferChanged);
+            cx.emit(FileOperationEvent::Changed);
         }
     }
 
@@ -287,7 +308,7 @@ impl FileOperationController {
         if let Some(control) = &self.transfer_control {
             control.resume();
             transfer.paused = false;
-            cx.emit(FileOperationEvent::TransferChanged);
+            cx.emit(FileOperationEvent::Changed);
         }
     }
 
@@ -303,8 +324,35 @@ impl FileOperationController {
             transfer.paused = false;
             transfer.cancelling = true;
             transfer.speed_bytes_per_second = 0.0;
-            cx.emit(FileOperationEvent::TransferChanged);
+            cx.emit(FileOperationEvent::Changed);
         }
+    }
+
+    pub fn pending_transfer_conflict(&self) -> Option<TransferConflict> {
+        let pending = self.pending_transfer.as_ref()?;
+        Some(TransferConflict {
+            first_path: pending.conflicts.first()?.clone(),
+            conflict_count: pending.conflicts.len(),
+            item_count: pending.sources.len(),
+            mode: pending.mode,
+        })
+    }
+
+    pub fn continue_pending_transfer(&mut self, overwrite: bool, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_transfer.take() else {
+            return;
+        };
+        self.begin_transfer(
+            pending.sources,
+            pending.destination,
+            pending.mode,
+            ConflictPolicy::from_overwrite(overwrite),
+            cx,
+        );
+    }
+
+    pub fn cancel_pending_transfer(&mut self) {
+        self.pending_transfer = None;
     }
 
     pub fn move_selected_to_trash(&mut self, cx: &mut Context<Self>) {
@@ -464,15 +512,60 @@ impl FileOperationController {
         mode: TransferMode,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .transfer
-            .as_ref()
-            .is_some_and(|transfer| transfer.running)
+        if self.transfer_preflight_running
+            || self.pending_transfer.is_some()
+            || self
+                .transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.running)
         {
             self.set_notice("已有文件传输正在进行", true, cx);
             return;
         }
 
+        self.transfer_preflight_running = true;
+        let engine = self.engine.clone();
+        let checked_sources = sources.clone();
+        let checked_destination = destination.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .destination_conflicts(checked_sources, checked_destination, mode)
+                .await;
+            let _ = this.update(cx, |controller, cx| {
+                controller.transfer_preflight_running = false;
+                match result {
+                    Ok(conflicts) if conflicts.is_empty() => controller.begin_transfer(
+                        sources,
+                        destination,
+                        mode,
+                        ConflictPolicy::Abort,
+                        cx,
+                    ),
+                    Ok(conflicts) => {
+                        controller.pending_transfer = Some(PendingTransfer {
+                            sources,
+                            destination,
+                            mode,
+                            conflicts,
+                        });
+                        cx.emit(FileOperationEvent::ConflictDetected);
+                        cx.notify();
+                    }
+                    Err(error) => controller.set_notice(error.to_string(), true, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn begin_transfer(
+        &mut self,
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+        mode: TransferMode,
+        conflict_policy: ConflictPolicy,
+        cx: &mut Context<Self>,
+    ) {
         self.transfer_generation += 1;
         let generation = self.transfer_generation;
         // Progress values are snapshots. A single-slot channel lets the engine
@@ -507,7 +600,7 @@ impl FileOperationController {
             destination: destination.clone(),
         });
         self.notice = None;
-        cx.emit(FileOperationEvent::TransferStarted);
+        cx.emit(FileOperationEvent::Started);
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -526,7 +619,7 @@ impl FileOperationController {
                             return false;
                         }
                         if controller.apply_progress(progress) {
-                            cx.emit(FileOperationEvent::TransferChanged);
+                            cx.emit(FileOperationEvent::Changed);
                         }
                         true
                     })
@@ -544,7 +637,7 @@ impl FileOperationController {
                     sources_for_task,
                     destination,
                     mode,
-                    ConflictPolicy::from_overwrite(false),
+                    conflict_policy,
                     progress_sender,
                     control,
                 )
@@ -597,7 +690,7 @@ impl FileOperationController {
                         }
                     }
                 }
-                cx.emit(FileOperationEvent::TransferChanged);
+                cx.emit(FileOperationEvent::Changed);
             });
         })
         .detach();

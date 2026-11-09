@@ -52,7 +52,7 @@ impl TransferProgressWindow {
             &operations,
             window,
             |_, operations, event: &FileOperationEvent, window, cx| {
-                if *event != FileOperationEvent::TransferChanged {
+                if *event != FileOperationEvent::Changed {
                     return;
                 }
                 let finished = operations

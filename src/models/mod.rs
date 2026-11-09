@@ -12,7 +12,7 @@ pub use file_item::{FileItem, FileKind, GitStatus, SortMode};
 pub(crate) use file_item::{is_image_extension, is_svg_path};
 pub use multi_pane::{LayoutMode, MultiPaneModel};
 pub use operations::{
-    CreateItemKind, FileDragPayload, FileOperationController, FileOperationEvent,
+    CreateItemKind, FileDragPayload, FileOperationController, FileOperationEvent, TransferConflict,
 };
 pub use pane::{ExplorerTab, Pane, PaneEvent, ViewMode, home_directory};
 pub use preferences::{AppPreferences, ThemePreference};
