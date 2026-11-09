@@ -3,7 +3,7 @@ use super::{
     quick_look::is_text_extension, smb, volume,
 };
 use crate::distribution;
-use crate::models::{FileItem, FileKind, SortMode, is_svg_path};
+use crate::models::{AppPreferences, FileItem, FileKind, SortMode, is_svg_path};
 use anyhow::{Context as _, Result};
 use std::{
     collections::HashSet,
@@ -154,7 +154,19 @@ impl FileEngine {
     pub async fn open_path(&self, path: PathBuf) -> Result<()> {
         self.runtime
             .spawn_blocking(move || {
-                if is_unix_executable(&path) && !distribution::allows_direct_executable_launch() {
+                let default_application = (!distribution::is_app_store() && !path.is_dir())
+                    .then(|| {
+                        AppPreferences::load()
+                            .default_application_for_path(&path)
+                            .filter(|application| is_application_bundle(application))
+                            .map(Path::to_path_buf)
+                    })
+                    .flatten();
+                if let Some(application) = default_application {
+                    launch_application_then_open_path(&path, &application)
+                } else if is_unix_executable(&path)
+                    && !distribution::allows_direct_executable_launch()
+                {
                     anyhow::bail!(
                         "Mac App Store 版不会直接执行脚本或二进制文件；请使用“打开方式”查看内容"
                     )
@@ -188,9 +200,33 @@ impl FileEngine {
 
     pub async fn open_path_with(&self, path: PathBuf, application: PathBuf) -> Result<()> {
         self.runtime
-            .spawn_blocking(move || open_path_with_application(&path, &application))
+            .spawn_blocking(move || launch_application_then_open_path(&path, &application))
             .await
             .context("指定应用打开文件任务异常终止")?
+    }
+
+    pub async fn open_path_with_and_set_default(
+        &self,
+        path: PathBuf,
+        application: PathBuf,
+    ) -> Result<()> {
+        self.runtime
+            .spawn_blocking(move || {
+                if !is_application_bundle(&application) {
+                    anyhow::bail!("请选择 macOS 应用程序（.app）");
+                }
+                launch_application_then_open_path(&path, &application)?;
+
+                if !path.is_dir() {
+                    let mut preferences = AppPreferences::load();
+                    if preferences.set_default_application_for_path(&path, application)? {
+                        preferences.save().context("无法保存默认程序设置")?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .context("指定并保存默认应用任务异常终止")?
     }
 
     pub async fn open_path_as_text(&self, path: PathBuf) -> Result<()> {
@@ -263,7 +299,7 @@ fn choose_open_with_application() -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let path = PathBuf::from(path);
-    if !path.is_dir() || path.extension().and_then(|extension| extension.to_str()) != Some("app") {
+    if !is_application_bundle(&path) {
         anyhow::bail!("请选择 macOS 应用程序（.app）");
     }
     Ok(Some(path))
@@ -341,6 +377,26 @@ fn open_path_with_application(path: &Path, application: &Path) -> Result<()> {
         anyhow::bail!("无法使用 {} 打开 {}", application.display(), path.display());
     }
     Ok(())
+}
+
+fn launch_application_then_open_path(path: &Path, application: &Path) -> Result<()> {
+    let status = Command::new("/usr/bin/open")
+        .arg("-a")
+        .arg(application)
+        .status()
+        .with_context(|| format!("无法启动 {}", application.display()))?;
+    if !status.success() {
+        anyhow::bail!("无法启动 {}", application.display());
+    }
+    open_path_with_application(path, application)
+}
+
+fn is_application_bundle(path: &Path) -> bool {
+    path.is_dir()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
 }
 
 #[cfg(target_os = "macos")]
@@ -576,9 +632,9 @@ pub async fn fetch_dir_entries_with_options(
 mod tests {
     use super::{
         FileEngine, OpenWithApplication, discover_volume_paths, ensure_text_editor,
-        fetch_dir_entries, fetch_dir_entries_with_options, is_text_or_unknown_path, is_text_path,
-        is_unix_executable, parse_open_with_applications, promote_notepad_application,
-        rank_applications_for_path,
+        fetch_dir_entries, fetch_dir_entries_with_options, is_application_bundle,
+        is_text_or_unknown_path, is_text_path, is_unix_executable, parse_open_with_applications,
+        promote_notepad_application, rank_applications_for_path,
     };
     use crate::models::SortMode;
     use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf};
@@ -698,6 +754,18 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory");
 
         assert!(!FileEngine::supports_text_opening(directory.path()));
+    }
+
+    #[test]
+    fn custom_default_program_must_be_an_application_bundle() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let application = directory.path().join("Viewer.APP");
+        let ordinary_folder = directory.path().join("Viewer");
+        fs::create_dir(&application).expect("create application bundle");
+        fs::create_dir(&ordinary_folder).expect("create ordinary folder");
+
+        assert!(is_application_bundle(&application));
+        assert!(!is_application_bundle(&ordinary_folder));
     }
 
     #[test]

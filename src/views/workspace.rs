@@ -500,8 +500,9 @@ impl WorkspaceView {
             )
         });
         let focus_handle = cx.focus_handle();
-        let preferences =
-            cx.new(|cx| PreferencesModal::new(model.clone(), focus_handle.clone(), cx));
+        let preferences = cx.new(|cx| {
+            PreferencesModal::new(model.clone(), engine.clone(), focus_handle.clone(), cx)
+        });
         let status_bar = cx.new(|cx| {
             StatusBar::new(
                 model.clone(),

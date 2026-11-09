@@ -362,7 +362,11 @@ impl ContextMenuView {
         let engine = self.engine.clone();
         cx.spawn(async move |_, cx| {
             let result = match engine.choose_open_with_application().await {
-                Ok(Some(application)) => engine.open_path_with(open_with.path, application).await,
+                Ok(Some(application)) => {
+                    engine
+                        .open_path_with_and_set_default(open_with.path, application)
+                        .await
+                }
                 Ok(None) => Ok(()),
                 Err(error) => Err(error),
             };
