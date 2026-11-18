@@ -67,16 +67,18 @@ impl FileItem {
 
         let is_executable = has_unix_execute_bit(&metadata);
         let extension_kind = Self::kind_for(is_dir, extension.as_deref());
-        let kind =
-            if is_script_extension(extension.as_deref()) || (is_executable && has_shebang(&path)) {
-                FileKind::Script
-            } else if extension_kind != FileKind::Other || is_dir {
-                extension_kind
-            } else if is_executable {
-                FileKind::Executable
-            } else {
-                FileKind::Other
-            };
+        let kind = if is_dir {
+            extension_kind
+        } else if is_script_extension(extension.as_deref()) || (is_executable && has_shebang(&path))
+        {
+            FileKind::Script
+        } else if extension_kind != FileKind::Other {
+            extension_kind
+        } else if is_executable {
+            FileKind::Executable
+        } else {
+            FileKind::Other
+        };
 
         Self {
             kind,
@@ -323,6 +325,54 @@ mod tests {
         assert_eq!(item.kind, FileKind::Application);
         assert!(item.is_dir);
         assert_eq!(FileItem::kind_for(true, None), FileKind::Folder);
+    }
+
+    #[test]
+    fn directories_with_script_extensions_have_folder_kind() {
+        let directory = tempdir().expect("create temporary directory");
+        for extension in [
+            "sh",
+            "bash",
+            "zsh",
+            "fish",
+            "command",
+            "py",
+            "pyw",
+            "rb",
+            "pl",
+            "php",
+            "lua",
+            "js",
+            "mjs",
+            "cjs",
+            "ts",
+            "jsx",
+            "tsx",
+            "awk",
+            "sed",
+            "tcl",
+            "expect",
+            "scpt",
+            "applescript",
+        ] {
+            let name = format!("directory.{extension}");
+            let path = directory.path().join(&name);
+            fs::create_dir(&path).expect("create directory");
+
+            let item = FileItem::from_metadata(
+                path.clone(),
+                name,
+                fs::metadata(path).expect("read directory metadata"),
+                false,
+            );
+
+            assert!(item.is_dir, "directory.{extension} should be a directory");
+            assert_eq!(
+                item.kind,
+                FileKind::Folder,
+                "directory.{extension} should have folder kind"
+            );
+        }
     }
 
     #[cfg(unix)]

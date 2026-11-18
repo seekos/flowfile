@@ -62,6 +62,7 @@ pub struct AppPreferences {
     pub search_shortcut: String,
     pub terminal_shortcut: String,
     pub quick_look_shortcut: String,
+    pub default_text_application: Option<PathBuf>,
     pub default_applications: Vec<DefaultApplication>,
     pub dismissed_update_version: Option<String>,
 }
@@ -75,6 +76,7 @@ impl Default for AppPreferences {
             search_shortcut: "cmd-f".to_string(),
             terminal_shortcut: "cmd-`".to_string(),
             quick_look_shortcut: "space".to_string(),
+            default_text_application: None,
             default_applications: Vec::new(),
             dismissed_update_version: None,
         }
@@ -175,7 +177,25 @@ mod tests {
         let preferences: AppPreferences =
             serde_json::from_str("{}").expect("older preferences remain compatible");
 
+        assert!(preferences.default_text_application.is_none());
         assert!(preferences.default_applications.is_empty());
+    }
+
+    #[test]
+    fn text_application_round_trips() {
+        let preferences = AppPreferences {
+            default_text_application: Some(PathBuf::from("/Applications/CotEditor.app")),
+            ..AppPreferences::default()
+        };
+
+        let json = serde_json::to_string(&preferences).expect("serialize preferences");
+        let restored: AppPreferences =
+            serde_json::from_str(&json).expect("deserialize preferences");
+
+        assert_eq!(
+            restored.default_text_application,
+            Some(PathBuf::from("/Applications/CotEditor.app"))
+        );
     }
 
     #[test]

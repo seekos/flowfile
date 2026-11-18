@@ -154,9 +154,10 @@ impl FileEngine {
     pub async fn open_path(&self, path: PathBuf) -> Result<()> {
         self.runtime
             .spawn_blocking(move || {
+                let preferences = AppPreferences::load();
                 let default_application = (!distribution::is_app_store() && !path.is_dir())
                     .then(|| {
-                        AppPreferences::load()
+                        preferences
                             .default_application_for_path(&path)
                             .filter(|application| is_application_bundle(application))
                             .map(Path::to_path_buf)
@@ -174,7 +175,7 @@ impl FileEngine {
                     run_unix_executable(&path)
                 } else if is_svg_path(&path) {
                     open_svg_in_browser(&path)
-                } else if let Some(application) = preferred_text_application(&path) {
+                } else if let Some(application) = preferred_text_application(&path, &preferences) {
                     open_path_with_application(&path, &application)
                 } else if file_kind_for_path(&path) == FileKind::Model
                     && let Ok(Some(application)) = recommended_application_for_path(&path)
@@ -235,8 +236,9 @@ impl FileEngine {
                 if path.is_dir() {
                     anyhow::bail!("文件夹不能以文本方式打开：{}", path.display());
                 }
+                let preferences = AppPreferences::load();
                 let application =
-                    installed_text_editor_application().context("未找到可用的文本编辑器")?;
+                    text_editor_application(&preferences).context("未找到可用的文本编辑器")?;
                 open_path_with_application(&path, &application)
             })
             .await
@@ -325,8 +327,8 @@ fn query_applications_for_path(path: &Path) -> Result<Vec<OpenWithApplication>> 
     rank_applications_for_path(path, &mut applications);
     if !path.is_dir() && is_text_or_unknown_path(path) {
         ensure_text_editor(&mut applications);
-        if let Some(notepad_path) = installed_notepad_application() {
-            promote_notepad_application(&mut applications, notepad_path);
+        if let Some(application) = configured_text_application(&AppPreferences::load()) {
+            promote_text_application(&mut applications, application);
         }
     }
     Ok(applications)
@@ -439,9 +441,9 @@ fn run_unix_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn preferred_text_application(path: &Path) -> Option<PathBuf> {
+fn preferred_text_application(path: &Path, preferences: &AppPreferences) -> Option<PathBuf> {
     is_text_path(path)
-        .then(installed_notepad_application)
+        .then(|| text_editor_application(preferences))
         .flatten()
 }
 
@@ -463,17 +465,6 @@ fn is_text_or_unknown_path(path: &Path) -> bool {
     is_text_extension(&extension) || FileItem::kind_for(false, Some(&extension)) == FileKind::Other
 }
 
-fn installed_notepad_application() -> Option<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from("/Applications/Notepad--.app"),
-        PathBuf::from("/System/Applications/Notepad--.app"),
-    ];
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join("Applications/Notepad--.app"));
-    }
-    candidates.into_iter().find(|path| path.is_dir())
-}
-
 fn installed_text_edit_application() -> Option<PathBuf> {
     [
         PathBuf::from("/System/Applications/TextEdit.app"),
@@ -483,21 +474,32 @@ fn installed_text_edit_application() -> Option<PathBuf> {
     .find(|path| path.is_dir())
 }
 
-fn installed_text_editor_application() -> Option<PathBuf> {
-    installed_notepad_application().or_else(installed_text_edit_application)
+fn configured_text_application(preferences: &AppPreferences) -> Option<PathBuf> {
+    (!distribution::is_app_store())
+        .then(|| {
+            preferences
+                .default_text_application
+                .as_deref()
+                .filter(|application| is_application_bundle(application))
+                .map(Path::to_path_buf)
+        })
+        .flatten()
 }
 
-fn promote_notepad_application(applications: &mut Vec<OpenWithApplication>, path: PathBuf) {
+fn text_editor_application(preferences: &AppPreferences) -> Option<PathBuf> {
+    configured_text_application(preferences).or_else(installed_text_edit_application)
+}
+
+fn promote_text_application(applications: &mut Vec<OpenWithApplication>, path: PathBuf) {
+    let name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("文本编辑器")
+        .to_string();
     applications.retain(|application| {
-        application.path != path && !application.name.eq_ignore_ascii_case("Notepad--")
+        application.path != path && !application.name.eq_ignore_ascii_case(&name)
     });
-    applications.insert(
-        0,
-        OpenWithApplication {
-            name: "Notepad--".to_string(),
-            path,
-        },
-    );
+    applications.insert(0, OpenWithApplication { name, path });
 }
 
 fn ensure_text_editor(applications: &mut Vec<OpenWithApplication>) {
@@ -634,9 +636,12 @@ mod tests {
         FileEngine, OpenWithApplication, discover_volume_paths, ensure_text_editor,
         fetch_dir_entries, fetch_dir_entries_with_options, is_application_bundle,
         is_text_or_unknown_path, is_text_path, is_unix_executable, parse_open_with_applications,
-        promote_notepad_application, rank_applications_for_path,
+        promote_text_application, rank_applications_for_path, text_editor_application,
     };
-    use crate::models::SortMode;
+    use crate::{
+        distribution,
+        models::{AppPreferences, SortMode},
+    };
     use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf};
 
     #[tokio::test]
@@ -769,16 +774,16 @@ mod tests {
     }
 
     #[test]
-    fn notepad_is_promoted_for_text_and_unknown_files() {
-        let notepad_path = PathBuf::from("/Applications/Notepad--.app");
+    fn configured_editor_is_promoted_for_text_and_unknown_files() {
+        let editor_path = PathBuf::from("/Applications/CotEditor.app");
         let mut applications = vec![
             OpenWithApplication {
                 name: "TextEdit".to_string(),
                 path: "/System/Applications/TextEdit.app".into(),
             },
             OpenWithApplication {
-                name: "Notepad--".to_string(),
-                path: notepad_path.clone(),
+                name: "CotEditor".to_string(),
+                path: editor_path.clone(),
             },
         ];
 
@@ -790,11 +795,29 @@ mod tests {
         assert!(!is_text_or_unknown_path(std::path::Path::new(
             "point-cloud.ply"
         )));
-        promote_notepad_application(&mut applications, notepad_path.clone());
+        promote_text_application(&mut applications, editor_path.clone());
 
-        assert_eq!(applications[0].name, "Notepad--");
-        assert_eq!(applications[0].path, notepad_path);
+        assert_eq!(applications[0].name, "CotEditor");
+        assert_eq!(applications[0].path, editor_path);
         assert_eq!(applications.len(), 2);
+    }
+
+    #[test]
+    fn configured_text_editor_respects_distribution_policy() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let application = directory.path().join("CotEditor.app");
+        fs::create_dir(&application).expect("create application bundle");
+        let preferences = AppPreferences {
+            default_text_application: Some(application.clone()),
+            ..AppPreferences::default()
+        };
+
+        let expected = if distribution::is_app_store() {
+            Some(PathBuf::from("/System/Applications/TextEdit.app"))
+        } else {
+            Some(application)
+        };
+        assert_eq!(text_editor_application(&preferences), expected);
     }
 
     #[test]

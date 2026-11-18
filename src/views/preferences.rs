@@ -186,6 +186,7 @@ pub struct PreferencesModal {
     visible: bool,
     selected_tab: PreferencesTab,
     capturing: Option<ShortcutTarget>,
+    choosing_text_application: bool,
     default_application_draft: Option<DefaultApplicationDraft>,
     default_application_extension_selection: Range<usize>,
     default_application_extension_marked_range: Option<Range<usize>>,
@@ -209,6 +210,7 @@ impl PreferencesModal {
             visible: false,
             selected_tab: PreferencesTab::General,
             capturing: None,
+            choosing_text_application: false,
             default_application_draft: None,
             default_application_extension_selection: 0..0,
             default_application_extension_marked_range: None,
@@ -223,6 +225,7 @@ impl PreferencesModal {
         self.visible = true;
         self.selected_tab = PreferencesTab::General;
         self.capturing = None;
+        self.choosing_text_application = false;
         self.default_application_draft = None;
         self.default_application_extension_selection = 0..0;
         self.default_application_extension_marked_range = None;
@@ -243,13 +246,20 @@ impl PreferencesModal {
                 .as_deref()
                 .map(|error| format!("，错误：{error}"))
                 .unwrap_or_default();
+            let text_application = self
+                .preferences
+                .default_text_application
+                .as_deref()
+                .map(application_name)
+                .unwrap_or_else(|| "TextEdit（系统默认）".to_string());
             format!(
-                "当前设置页：{}；版本：{}；主题：{}；默认布局：{}；显示隐藏文件：{}；默认程序规则：{} 条；搜索快捷键：{}；终端快捷键：{}；Quick Look 快捷键：{}{}{}",
+                "当前设置页：{}；版本：{}；主题：{}；默认布局：{}；显示隐藏文件：{}；文本文件默认程序：{}；默认程序规则：{} 条；搜索快捷键：{}；终端快捷键：{}；Quick Look 快捷键：{}{}{}",
                 self.selected_tab.label(),
                 self.version,
                 self.preferences.theme.label(),
                 self.preferences.default_layout.label(),
                 if self.preferences.show_hidden { "是" } else { "否" },
+                text_application,
                 self.preferences.default_applications.len(),
                 display_keystroke(&self.preferences.search_shortcut),
                 display_keystroke(&self.preferences.terminal_shortcut),
@@ -263,6 +273,7 @@ impl PreferencesModal {
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = false;
         self.capturing = None;
+        self.choosing_text_application = false;
         self.default_application_draft = None;
         self.default_application_extension_selection = 0..0;
         self.default_application_extension_marked_range = None;
@@ -333,6 +344,38 @@ impl PreferencesModal {
         self.default_application_extension_marked_range = None;
         self.error = None;
         self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn choose_text_application(&mut self, cx: &mut Context<Self>) {
+        if self.choosing_text_application {
+            return;
+        }
+        self.choosing_text_application = true;
+        self.error = None;
+        cx.notify();
+
+        let engine = self.engine.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine.choose_open_with_application().await;
+            let _ = this.update(cx, |this, cx| {
+                this.choosing_text_application = false;
+                match result {
+                    Ok(Some(application)) => {
+                        this.preferences.default_text_application = Some(application)
+                    }
+                    Ok(None) => {}
+                    Err(error) => this.error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn reset_text_application(&mut self, cx: &mut Context<Self>) {
+        self.preferences.default_text_application = None;
+        self.error = None;
         cx.notify();
     }
 
@@ -836,6 +879,16 @@ impl PreferencesModal {
         }
 
         let applications = self.preferences.default_applications.clone();
+        let text_application = self.preferences.default_text_application.clone();
+        let text_application_name = text_application
+            .as_deref()
+            .map(application_name)
+            .unwrap_or_else(|| "TextEdit".to_string());
+        let text_application_tooltip = text_application
+            .as_deref()
+            .map(|path| format!("当前应用：{}", path.display()))
+            .unwrap_or_else(|| "当前使用系统 TextEdit；点击选择其他应用".to_string());
+        let choosing_text_application = self.choosing_text_application;
         let mut list = div()
             .id("default-applications-scroll")
             .min_h_0()
@@ -955,11 +1008,71 @@ impl PreferencesModal {
             .min_h_0()
             .flex()
             .flex_col()
+            .child(Self::setting_row(
+                "文本文件默认程序",
+                "用于双击文本文件和“以文本方式打开”",
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(text_application.is_some(), |controls| {
+                        controls.child(
+                            div()
+                                .id("reset-text-application")
+                                .h(px(30.0))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .rounded_md()
+                                .text_size(theme::font(9.0))
+                                .text_color(theme::text_secondary())
+                                .hover(|style| style.bg(theme::surface_subtle()))
+                                .tooltip(delayed_tooltip("恢复使用系统 TextEdit"))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.reset_text_application(cx)),
+                                )
+                                .child("恢复默认"),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("choose-text-application")
+                            .w(px(148.0))
+                            .h(px(30.0))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme::border())
+                            .text_size(theme::font(9.0))
+                            .text_color(theme::text_primary())
+                            .opacity(if choosing_text_application { 0.55 } else { 1.0 })
+                            .tooltip(delayed_tooltip(text_application_tooltip))
+                            .when(!choosing_text_application, |button| {
+                                button
+                                    .hover(|style| style.bg(theme::accent_soft()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.choose_text_application(cx)
+                                    }))
+                            })
+                            .child(if choosing_text_application {
+                                "正在选择…".to_string()
+                            } else {
+                                text_application_name
+                            }),
+                    ),
+            ))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .mt_3()
                     .mb_3()
                     .child(
                         div()
@@ -1422,7 +1535,7 @@ impl Render for PreferencesModal {
                             .mt_1()
                             .text_size(theme::font(9.0))
                             .text_color(theme::text_tertiary())
-                            .child("常规设置与按文件后缀指定默认程序"),
+                            .child("常规设置、文本与按文件后缀指定默认程序"),
                     )
                     .child(
                         div()
