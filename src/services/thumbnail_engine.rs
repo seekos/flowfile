@@ -350,7 +350,7 @@ fn render_with_quicklook(
 
 fn dynamic_image_to_render_image(image: DynamicImage) -> Arc<RenderImage> {
     let mut rgba = image.into_rgba8();
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Arc::new(RenderImage::new(smallvec![image::Frame::new(rgba)]))

@@ -229,7 +229,7 @@ FLOWFILE_NOTARY_PROFILE="notary-profile" ./scripts/build.sh
 
 ### Mac App Store 构建
 
-Mac App Store 版本启用 App Sandbox，并只访问应用容器和用户通过系统文件夹选择器明确授权的位置。为符合商店审核要求，该版本不提供系统终端启动、脚本或二进制文件直接执行、脚本化网络卷挂载、NTFS 重新挂载和独立更新检查；网络卷可先在访达中连接，再通过“＋ 授权文件夹”选择。
+Mac App Store 版本启用 App Sandbox，最低支持 macOS 12，并只访问应用容器和用户通过系统文件夹选择器明确授权的位置。为符合商店审核要求，该版本不提供系统终端启动、脚本或二进制文件直接执行、脚本化网络卷挂载、NTFS 重新挂载和独立更新检查；网络卷可先在访达中连接，再通过“＋ 授权文件夹”选择。
 
 生成用于本机功能验证的沙盒应用：
 
@@ -240,10 +240,11 @@ Mac App Store 版本启用 App Sandbox，并只访问应用容器和用户通过
 安装带私钥的 Apple Distribution 和 Mac Installer Distribution 证书后，可生成正式上传包：
 
 ```bash
+FLOWFILE_PROVISIONING_PROFILE="$HOME/Downloads/FlowFile.provisionprofile" \
 ./scripts/build_app_store.sh -v 1.0.0 -b 1
 ```
 
-构建脚本会把 `PrivacyInfo.xcprivacy`、App Sandbox 权限和版本信息写入应用包。上架文案、审核备注和提交检查表位于 `app-store/`。
+构建脚本会使用独立的 App Store 目标目录，生成匹配二进制 UUID 的 dSYM，并把 `PrivacyInfo.xcprivacy`、App Sandbox 权限、macOS 12 最低版本和版本信息写入应用包。上架文案、审核备注和提交检查表位于 `app-store/`。
 
 ## 工程结构
 

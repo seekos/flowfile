@@ -1,13 +1,147 @@
-/target
-*.log
-.DS_Store
-dist/
+# Rust and Cargo
+target/
+**/*.rs.bk
+rust-project.json
+
+# Build and packaged artifacts
+/build/
+/dist/
+/out/
 .flowfile-build-version
-.env
-.env.*
+*.app/
+*.dmg
+*.pkg
+*.mpkg
+*.dSYM/
+*.dSYM.zip
+*.xcarchive/
+*.ipa
+*.deb
+*.rpm
+*.AppImage
+*.msi
+*.msix
+*.exe
+
+# Tests, coverage, and profiling
+/coverage/
+/.nextest/
+/cargo-mutants.out/
+/mutants.out/
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.gcov
+*.lcov
+lcov.info
+cobertura.xml
+tarpaulin-report.html
+junit.xml
+
+# Logs, crashes, and temporary files
+*.log
+*.log.*
+*.pid
+*.pid.lock
+*.tmp
+*.temp
+*.bak
+*.rej
+*.swp
+*.swo
+*.swn
+*~
+.#*
+\#*\#
+*.crash
+*.ips
+*.stackdump
+/core
+/core.*
+/vgcore.*
+
+# macOS
+.DS_Store
+.AppleDouble
+.AppleDB
+.AppleDesktop
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.apdisk
+Network Trash Folder
+Temporary Items
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.Trash-*
+.nfs*
+
+# Editors and local workspace settings
 .idea/
 .vscode/
-*.swp
-*.p12
-*.mobileprovision
+.fleet/
+.zed/
+.history/
+.vs/
+*.iml
+*.iws
+*.ipr
+*.sublime-workspace
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Xcode
+DerivedData/
+xcuserdata/
 *.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.hmap
+Timeline.xctimeline
+
+# Local environment and caches
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.template
+!.env.*.template
+.direnv/
+/.cache/
+/.tmp/
+/tmp/
+/temp/
+.lldb_history
+
+# Signing credentials
+*.p12
+*.p8
+*.pfx
+*.key
+*.pem
+*.jks
+*.keystore
+*.mobileprovision
+*.provisionprofile
+
+# Local App Store working files (already tracked files remain tracked)
+/app-store/

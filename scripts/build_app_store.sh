@@ -8,13 +8,29 @@ resources_dir=${project_dir}/resources
 output_dir=${project_dir}/dist/app-store
 app_path=${output_dir}/FlowFile.app
 pkg_path=${output_dir}/FlowFile.pkg
+dsym_path=${output_dir}/FlowFile.app.dSYM
+target_dir=${FLOWFILE_APP_STORE_TARGET_DIR:-${project_dir}/target/app-store}
+binary_path=${target_dir}/release/flowfile
 entitlements_path=${resources_dir}/FlowFile-AppStore.entitlements
 privacy_manifest_path=${resources_dir}/PrivacyInfo.xcprivacy
 bundle_id=${FLOWFILE_BUNDLE_ID:-cc.bso.flowfile}
+deployment_target=${FLOWFILE_MACOS_DEPLOYMENT_TARGET:-12.0}
 version=""
 build_number=""
 prepare_only=false
 upload=false
+decoded_profile_path=""
+merged_entitlements_path=""
+
+cleanup() {
+    if [[ -n "${decoded_profile_path}" ]]; then
+        /bin/rm -f "${decoded_profile_path}"
+    fi
+    if [[ -n "${merged_entitlements_path}" ]]; then
+        /bin/rm -f "${merged_entitlements_path}"
+    fi
+}
+trap cleanup EXIT
 
 usage() {
     print "Usage: ${0:t} [-v <version>] [-b <build>] [--prepare-only] [--upload]"
@@ -70,19 +86,29 @@ if [[ ! "${bundle_id}" =~ '^[A-Za-z0-9-]+([.][A-Za-z0-9-]+)+$' ]]; then
     print -u2 "Invalid bundle identifier: ${bundle_id}"
     exit 1
 fi
+if [[ ! "${deployment_target}" =~ '^[0-9]+\.[0-9]+$' ]]; then
+    print -u2 "Invalid macOS deployment target: ${deployment_target}"
+    exit 1
+fi
 
 source "${script_dir}/macos_toolchain.sh"
 flowfile_configure_macos_toolchain
 "${script_dir}/build.sh" --icon-only
 
 print "Building sandboxed FlowFile ${version} (${build_number}) for ${bundle_id}"
-cargo build --release --features app-store
+CARGO_TARGET_DIR=${target_dir} MACOSX_DEPLOYMENT_TARGET=${deployment_target} \
+    cargo build --release --features app-store
+
+if [[ -d "${dsym_path}" ]]; then
+    /bin/rm -R "${dsym_path}"
+fi
+xcrun dsymutil "${binary_path}" -o "${dsym_path}"
 
 if [[ -d "${app_path}" ]]; then
     /bin/rm -R "${app_path}"
 fi
 mkdir -p "${app_path}/Contents/MacOS" "${app_path}/Contents/Resources"
-cp "${project_dir}/target/release/flowfile" "${app_path}/Contents/MacOS/flowfile"
+cp "${binary_path}" "${app_path}/Contents/MacOS/flowfile"
 cp "${resources_dir}/FlowFile.icns" "${app_path}/Contents/Resources/FlowFile.icns"
 cp "${privacy_manifest_path}" "${app_path}/Contents/Resources/PrivacyInfo.xcprivacy"
 cp "${resources_dir}/Info.plist" "${app_path}/Contents/Info.plist"
@@ -91,7 +117,13 @@ chmod 755 "${app_path}/Contents/MacOS/flowfile"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${bundle_id}" "${app_path}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${version}" "${app_path}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${build_number}" "${app_path}/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion ${deployment_target}" "${app_path}/Contents/Info.plist"
 
+if [[ "${prepare_only}" == false && -z "${FLOWFILE_PROVISIONING_PROFILE:-}" ]]; then
+    print -u2 "A Mac App Store provisioning profile is required for a signed build."
+    print -u2 "Set FLOWFILE_PROVISIONING_PROFILE to the downloaded .provisionprofile file."
+    exit 1
+fi
 if [[ -n "${FLOWFILE_PROVISIONING_PROFILE:-}" ]]; then
     if [[ ! -f "${FLOWFILE_PROVISIONING_PROFILE}" ]]; then
         print -u2 "Provisioning profile not found: ${FLOWFILE_PROVISIONING_PROFILE}"
@@ -99,6 +131,22 @@ if [[ -n "${FLOWFILE_PROVISIONING_PROFILE:-}" ]]; then
     fi
     cp "${FLOWFILE_PROVISIONING_PROFILE}" \
         "${app_path}/Contents/embedded.provisionprofile"
+
+    decoded_profile_path=$(mktemp "${TMPDIR:-/tmp}/flowfile-profile.XXXXXX")
+    merged_entitlements_path=$(mktemp "${TMPDIR:-/tmp}/flowfile-entitlements.XXXXXX")
+    /usr/bin/security cms -D -i "${FLOWFILE_PROVISIONING_PROFILE}" \
+        > "${decoded_profile_path}"
+    profile_application_identifier=$(/usr/libexec/PlistBuddy -c \
+        "Print :Entitlements:com.apple.application-identifier" "${decoded_profile_path}")
+    if [[ "${profile_application_identifier#*.}" != "${bundle_id}" ]]; then
+        print -u2 "Provisioning profile is for ${profile_application_identifier}, not ${bundle_id}."
+        exit 1
+    fi
+    /usr/libexec/PlistBuddy -x -c "Print :Entitlements" \
+        "${decoded_profile_path}" > "${merged_entitlements_path}"
+    /usr/libexec/PlistBuddy -c "Merge ${entitlements_path}" \
+        "${merged_entitlements_path}"
+    /usr/bin/plutil -lint "${merged_entitlements_path}" >/dev/null
 fi
 
 if [[ "${prepare_only}" == true ]]; then
@@ -114,8 +162,8 @@ else
             /usr/bin/head -n 1)
     fi
     if [[ -z "${installer_identity}" ]]; then
-        installer_identity=$(/usr/bin/security find-certificate -a -c "Mac Installer Distribution" 2>/dev/null |
-            /usr/bin/sed -nE 's/.*"alis"<blob>="([^"]+)".*/\1/p' |
+        installer_identity=$(/usr/bin/security find-identity -v -p basic 2>/dev/null |
+            /usr/bin/sed -nE 's/.*"((Mac Installer Distribution|3rd Party Mac Developer Installer):[^"]+)".*/\1/p' |
             /usr/bin/head -n 1)
     fi
     if [[ -z "${app_identity}" || -z "${installer_identity}" ]]; then
@@ -127,7 +175,7 @@ else
     fi
 
     /usr/bin/codesign --force --timestamp --sign "${app_identity}" \
-        --entitlements "${entitlements_path}" "${app_path}"
+        --entitlements "${merged_entitlements_path}" "${app_path}"
     /usr/bin/codesign --verify --deep --strict --verbose=2 "${app_path}"
     /usr/bin/productbuild --component "${app_path}" /Applications \
         --sign "${installer_identity}" "${pkg_path}"

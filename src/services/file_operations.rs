@@ -331,7 +331,7 @@ impl FileOperationEngine {
                     for path in &paths {
                         ensure_writable(path)?;
                     }
-                    trash::delete_all(paths.iter()).context("无法将所选项目移到废纸篓")
+                    move_paths_to_trash(&paths)
                 })
                 .await
                 .context("废纸篓后台任务异常终止")?
@@ -1162,6 +1162,24 @@ async fn available_path_with_reserved(
     unreachable!()
 }
 
+#[cfg(target_os = "macos")]
+fn native_trash_context() -> trash::TrashContext {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos as _};
+
+    let mut context = trash::TrashContext::default();
+    context.set_delete_method(DeleteMethod::NsFileManager);
+    context
+}
+
+fn move_paths_to_trash(paths: &[PathBuf]) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let result = native_trash_context().delete_all(paths);
+    #[cfg(not(target_os = "macos"))]
+    let result = trash::delete_all(paths);
+
+    result.context("无法将所选项目移到废纸篓")
+}
+
 async fn remove_existing(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
@@ -1197,7 +1215,7 @@ mod tests {
         rename_path, send_progress,
     };
     #[cfg(target_os = "macos")]
-    use super::{TransferSleepAssertion, rename_without_replacing};
+    use super::{TransferSleepAssertion, native_trash_context, rename_without_replacing};
     use std::{
         fs,
         os::unix::{
@@ -1213,6 +1231,17 @@ mod tests {
     #[test]
     fn transfer_sleep_assertion_can_be_acquired_and_released() {
         drop(TransferSleepAssertion::begin());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_trash_uses_native_file_manager() {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos as _};
+
+        assert!(matches!(
+            native_trash_context().delete_method(),
+            DeleteMethod::NsFileManager
+        ));
     }
 
     #[test]
