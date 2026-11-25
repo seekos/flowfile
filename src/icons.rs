@@ -6,7 +6,7 @@ use std::borrow::Cow;
 /// macOS template images. GPUI applies the requested text color to the SVG
 /// alpha mask, so every icon automatically follows light/dark and active
 /// states without shipping separate artwork.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum IconName {
     Sidebar,
     LayoutSingle,
@@ -29,6 +29,17 @@ pub enum IconName {
     Close,
     GitClean,
     GitModified,
+    Home,
+    Download,
+    Desktop,
+    Document,
+    Star,
+    Drive,
+    Server,
+    Eject,
+    Terminal,
+    ViewList,
+    ViewGrid,
 }
 
 impl IconName {
@@ -55,6 +66,17 @@ impl IconName {
             Self::Close => "icons/close.svg",
             Self::GitClean => "icons/git-clean.svg",
             Self::GitModified => "icons/git-modified.svg",
+            Self::Home => "icons/home.svg",
+            Self::Download => "icons/download.svg",
+            Self::Desktop => "icons/desktop.svg",
+            Self::Document => "icons/document.svg",
+            Self::Star => "icons/star.svg",
+            Self::Drive => "icons/drive.svg",
+            Self::Server => "icons/server.svg",
+            Self::Eject => "icons/eject.svg",
+            Self::Terminal => "icons/terminal.svg",
+            Self::ViewList => "icons/view-list.svg",
+            Self::ViewGrid => "icons/view-grid.svg",
         }
     }
 }
@@ -89,6 +111,17 @@ impl AssetSource for IconAssets {
             "icons/close.svg" => Some(CLOSE),
             "icons/git-clean.svg" => Some(GIT_CLEAN),
             "icons/git-modified.svg" => Some(GIT_MODIFIED),
+            "icons/home.svg" => Some(HOME),
+            "icons/download.svg" => Some(DOWNLOAD),
+            "icons/desktop.svg" => Some(DESKTOP),
+            "icons/document.svg" => Some(DOCUMENT),
+            "icons/star.svg" => Some(STAR),
+            "icons/drive.svg" => Some(DRIVE),
+            "icons/server.svg" => Some(SERVER),
+            "icons/eject.svg" => Some(EJECT),
+            "icons/terminal.svg" => Some(TERMINAL),
+            "icons/view-list.svg" => Some(VIEW_LIST),
+            "icons/view-grid.svg" => Some(VIEW_GRID),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
@@ -118,6 +151,17 @@ impl AssetSource for IconAssets {
                 "close.svg".into(),
                 "git-clean.svg".into(),
                 "git-modified.svg".into(),
+                "home.svg".into(),
+                "download.svg".into(),
+                "desktop.svg".into(),
+                "document.svg".into(),
+                "star.svg".into(),
+                "drive.svg".into(),
+                "server.svg".into(),
+                "eject.svg".into(),
+                "terminal.svg".into(),
+                "view-list.svg".into(),
+                "view-grid.svg".into(),
             ])
         } else {
             Ok(Vec::new())
@@ -146,3 +190,14 @@ const SEARCH: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/200
 const CLOSE: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="m5 5 10 10M15 5 5 15" fill="none" stroke="#000" stroke-width="1.8" stroke-linecap="round"/></svg>"##;
 const GIT_CLEAN: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="m4.2 10.4 3.5 3.5 8.1-8.1" fill="none" stroke="#000" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 const GIT_MODIFIED: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="M10 4.1v7.7" fill="none" stroke="#000" stroke-width="2.8" stroke-linecap="round"/><circle cx="10" cy="15.3" r="1.45" fill="#000"/></svg>"##;
+const HOME: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="M3 9.5 10 3.5l7 6" fill="none" stroke="#000" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 8.2v7.3c0 .8.7 1.5 1.5 1.5h7c.8 0 1.5-.7 1.5-1.5V8.2" fill="none" stroke="#000" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+const DOWNLOAD: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><circle cx="10" cy="10" r="7.2" fill="none" stroke="#000" stroke-width="1.6"/><path d="M10 6.2v6.6M7.2 10.2 10 13l2.8-2.8" fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+const DESKTOP: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><rect x="2.5" y="3.5" width="15" height="10.5" rx="2" fill="none" stroke="#000" stroke-width="1.6"/><path d="M7.5 16.5h5M10 14v2.5" fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round"/></svg>"##;
+const DOCUMENT: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="M5 3.2h6.8L15.5 7v9.8c0 .8-.7 1.5-1.5 1.5H5c-.8 0-1.5-.7-1.5-1.5V4.7c0-.8.7-1.5 1.5-1.5Z" fill="none" stroke="#000" stroke-width="1.6" stroke-linejoin="round"/><path d="M11.5 3.4V7h4M6.8 10.5h6.4M6.8 13.7h4.6" fill="none" stroke="#000" stroke-width="1.5" stroke-linecap="round"/></svg>"##;
+const STAR: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="m10 2.8 2.2 4.5 5 .7-3.6 3.5.9 5-4.5-2.4-4.5 2.4.9-5L2.8 8l5-.7L10 2.8Z" fill="none" stroke="#000" stroke-width="1.55" stroke-linejoin="round"/></svg>"##;
+const DRIVE: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="4.5" width="14" height="11" rx="2.4" fill="none" stroke="#000" stroke-width="1.6"/><path d="M3.4 11.5h13.2" fill="none" stroke="#000" stroke-width="1.5"/><circle cx="14" cy="13.6" r=".85" fill="#000"/></svg>"##;
+const SERVER: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><circle cx="10" cy="10" r="7.2" fill="none" stroke="#000" stroke-width="1.55"/><ellipse cx="10" cy="10" rx="3.3" ry="7.2" fill="none" stroke="#000" stroke-width="1.35"/><path d="M3.2 7.8h13.6M3.2 12.2h13.6" fill="none" stroke="#000" stroke-width="1.35"/></svg>"##;
+const EJECT: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="m5.2 11.2 4.8-5.4 4.8 5.4H5.2Z" fill="#000" stroke="#000" stroke-width="1.3" stroke-linejoin="round"/><path d="M5.2 14.5h9.6" fill="none" stroke="#000" stroke-width="1.8" stroke-linecap="round"/></svg>"##;
+const TERMINAL: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><rect x="2.5" y="3.5" width="15" height="13" rx="2.3" fill="none" stroke="#000" stroke-width="1.6"/><path d="m6 7.5 2.8 2.5L6 12.5M10.5 12.5h3.5" fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+const VIEW_LIST: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><path d="M3.5 5.5h1.8M7.5 5.5h9M3.5 10h1.8M7.5 10h9M3.5 14.5h1.8M7.5 14.5h9" fill="none" stroke="#000" stroke-width="1.7" stroke-linecap="round"/></svg>"##;
+const VIEW_GRID: &[u8] = br##"<svg viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="3" width="5.8" height="5.8" rx="1.4" fill="none" stroke="#000" stroke-width="1.6"/><rect x="11.2" y="3" width="5.8" height="5.8" rx="1.4" fill="none" stroke="#000" stroke-width="1.6"/><rect x="3" y="11.2" width="5.8" height="5.8" rx="1.4" fill="none" stroke="#000" stroke-width="1.6"/><rect x="11.2" y="11.2" width="5.8" height="5.8" rx="1.4" fill="none" stroke="#000" stroke-width="1.6"/></svg>"##;

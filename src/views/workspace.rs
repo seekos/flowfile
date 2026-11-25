@@ -2179,15 +2179,19 @@ impl WorkspaceView {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(28.0))
+            .w(px(28.0))
+            .h(px(24.0))
             .rounded(px(5.0))
             .bg(if is_active {
-                theme::accent_soft()
+                theme::surface()
             } else {
                 gpui::transparent_black()
             })
+            .when(is_active, |button| button.shadow_xs())
             .cursor_pointer()
-            .hover(|style| style.bg(theme::accent_soft()))
+            .when(!is_active, |button| {
+                button.hover(|style| style.bg(theme::hover_subtle()))
+            })
             .tooltip(delayed_tooltip(format!("切换为{label}布局")))
             .on_click(move |_, _, cx| {
                 model.update(cx, |model, cx| {
@@ -2197,13 +2201,17 @@ impl WorkspaceView {
             })
             .child(icon(
                 symbol,
-                16.0,
+                15.0,
                 if is_active {
                     theme::accent()
                 } else {
                     theme::text_secondary()
                 },
             ))
+    }
+
+    fn toolbar_divider() -> impl IntoElement {
+        div().w(px(1.0)).h(px(16.0)).mx_1().bg(theme::border())
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2231,24 +2239,23 @@ impl WorkspaceView {
             .flex_1()
             .gap_1()
             .h(px(52.0))
-            .px_2()
-            .bg(theme::surface_subtle())
+            .px_3()
+            .bg(theme::toolbar())
             .child(
                 div()
                     .id("sidebar-toggle")
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(30.0))
-                    .mr_2()
+                    .size(px(28.0))
                     .rounded(px(6.0))
                     .bg(if sidebar_visible {
-                        theme::accent_soft()
+                        theme::hover_subtle()
                     } else {
                         gpui::transparent_black()
                     })
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::accent_soft()))
+                    .hover(|style| style.bg(theme::hover_subtle()))
                     .tooltip(delayed_tooltip(if sidebar_visible {
                         "隐藏侧边栏"
                     } else {
@@ -2261,7 +2268,7 @@ impl WorkspaceView {
                     }))
                     .child(icon(
                         IconName::Sidebar,
-                        17.0,
+                        16.0,
                         if sidebar_visible {
                             theme::accent()
                         } else {
@@ -2269,16 +2276,15 @@ impl WorkspaceView {
                         },
                     )),
             )
+            .child(Self::toolbar_divider())
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(1.0))
+                    .gap(px(2.0))
                     .p(px(2.0))
                     .rounded(px(7.0))
-                    .border_1()
-                    .border_color(theme::border())
-                    .bg(theme::surface())
+                    .bg(theme::control_track())
                     .child(self.layout_button(
                         LayoutMode::Single,
                         IconName::LayoutSingle,
@@ -2299,22 +2305,22 @@ impl WorkspaceView {
                     ))
                     .child(self.layout_button(LayoutMode::Quad, IconName::LayoutGrid, "四格", cx)),
             )
+            .child(Self::toolbar_divider())
             .child(
                 div()
                     .id("hidden-files-toggle")
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(30.0))
-                    .ml_2()
+                    .size(px(28.0))
                     .rounded(px(6.0))
                     .bg(if show_hidden {
-                        theme::accent_soft()
+                        theme::hover_subtle()
                     } else {
                         gpui::transparent_black()
                     })
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::accent_soft()))
+                    .hover(|style| style.bg(theme::hover_subtle()))
                     .tooltip(delayed_tooltip(if show_hidden {
                         "隐藏名称以 . 开头的文件"
                     } else {
@@ -2329,7 +2335,7 @@ impl WorkspaceView {
                         } else {
                             IconName::EyeSlash
                         },
-                        17.0,
+                        16.0,
                         if show_hidden {
                             theme::accent()
                         } else {
@@ -2343,13 +2349,13 @@ impl WorkspaceView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(30.0))
+                    .size(px(28.0))
                     .rounded(px(6.0))
                     .tooltip(delayed_tooltip("将选中项目复制到另一面板"))
                     .when(has_selection && has_other_pane, |button| {
                         button
                             .cursor_pointer()
-                            .hover(|style| style.bg(theme::accent_soft()))
+                            .hover(|style| style.bg(theme::hover_subtle()))
                             .on_click(move |_, _, cx| {
                                 copy_operations.update(cx, |operations, cx| {
                                     operations.transfer_selected_to_other(TransferMode::Copy, cx);
@@ -2358,7 +2364,7 @@ impl WorkspaceView {
                     })
                     .child(icon(
                         IconName::CopyRight,
-                        17.0,
+                        16.0,
                         if has_selection && has_other_pane {
                             theme::accent()
                         } else {
@@ -2372,13 +2378,13 @@ impl WorkspaceView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(30.0))
+                    .size(px(28.0))
                     .rounded(px(6.0))
                     .tooltip(delayed_tooltip("将选中项目移动到另一面板"))
                     .when(has_selection && has_other_pane, |button| {
                         button
                             .cursor_pointer()
-                            .hover(|style| style.bg(theme::accent_soft()))
+                            .hover(|style| style.bg(theme::hover_subtle()))
                             .on_click(move |_, _, cx| {
                                 move_operations.update(cx, |operations, cx| {
                                     operations.transfer_selected_to_other(TransferMode::Move, cx);
@@ -2387,7 +2393,7 @@ impl WorkspaceView {
                     })
                     .child(icon(
                         IconName::MoveRight,
-                        17.0,
+                        16.0,
                         if has_selection && has_other_pane {
                             theme::file_green()
                         } else {
@@ -2401,7 +2407,7 @@ impl WorkspaceView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(30.0))
+                    .size(px(28.0))
                     .rounded(px(6.0))
                     .tooltip(delayed_tooltip("将选中项目移至废纸篓 (⌘⌫)"))
                     .when(has_selection, |button| {
@@ -2416,7 +2422,7 @@ impl WorkspaceView {
                     })
                     .child(icon(
                         IconName::Trash,
-                        17.0,
+                        16.0,
                         if has_selection {
                             theme::danger()
                         } else {
@@ -2431,19 +2437,20 @@ impl WorkspaceView {
                         .flex()
                         .items_center()
                         .gap_1()
-                        .h(px(34.0))
+                        .h(px(28.0))
+                        .ml_1()
                         .px_2()
-                        .rounded_md()
+                        .rounded(px(6.0))
                         .border_1()
-                        .border_color(theme::accent().opacity(0.55))
+                        .border_color(theme::accent().opacity(0.4))
                         .bg(theme::accent_soft())
-                        .text_size(theme::font(9.0))
+                        .text_size(theme::font(9.5))
                         .text_color(theme::accent())
                         .cursor_pointer()
                         .hover(|style| style.bg(theme::accent().opacity(0.18)))
                         .tooltip(delayed_tooltip("选择并持久授权一个文件夹"))
                         .on_click(cx.listener(|this, _, _, cx| this.authorize_folder(cx)))
-                        .child(icon(IconName::FolderAdd, 16.0, theme::accent()))
+                        .child(icon(IconName::FolderAdd, 15.0, theme::accent()))
                         .child("授权文件夹"),
                 )
             })
@@ -2467,16 +2474,15 @@ impl WorkspaceView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(30.0))
-                    .ml_1()
+                    .size(px(28.0))
                     .rounded(px(6.0))
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::accent_soft()))
+                    .hover(|style| style.bg(theme::hover_subtle()))
                     .tooltip(delayed_tooltip("打开设置 (⌘,)"))
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(OpenPreferences), cx);
                     })
-                    .child(icon(IconName::Settings, 17.0, theme::text_secondary())),
+                    .child(icon(IconName::Settings, 16.0, theme::text_secondary())),
             )
     }
 
@@ -2494,7 +2500,14 @@ impl WorkspaceView {
             .flex_shrink_0()
             .w(px(width))
             .h(px(52.0))
-            .bg(theme::sidebar())
+            .bg(if self.sidebar_visible && !window.is_fullscreen() {
+                theme::sidebar()
+            } else {
+                theme::toolbar()
+            })
+            .when(self.sidebar_visible && !window.is_fullscreen(), |bar| {
+                bar.border_r_1().border_color(theme::border())
+            })
             .on_mouse_down(MouseButton::Left, |event, window, _| {
                 if event.click_count >= 2 {
                     window.zoom_window();

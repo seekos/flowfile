@@ -595,23 +595,14 @@ impl Render for SearchBar {
             .flex()
             .items_center()
             .gap_1()
-            .w(px(220.0))
-            .min_w(px(150.0))
-            .h(px(44.0))
+            .w(px(210.0))
+            .min_w(px(140.0))
+            .h(px(38.0))
             .flex_shrink()
-            .px_2()
-            .border_l_1()
+            .pr_2()
             .border_b_1()
-            .border_color(if active {
-                theme::accent()
-            } else {
-                theme::border()
-            })
-            .bg(if active {
-                theme::accent_soft().opacity(0.68)
-            } else {
-                theme::surface_subtle()
-            })
+            .border_color(theme::border())
+            .bg(theme::surface())
             .track_focus(&self.focus_handle)
             .when(active, |bar| {
                 bar.on_action(cx.listener(Self::on_copy_text))
@@ -627,25 +618,28 @@ impl Render for SearchBar {
                     .items_center()
                     .min_w_0()
                     .flex_1()
-                    .h(px(30.0))
+                    .h(px(28.0))
                     .px_2()
-                    .rounded_md()
-                    .border(px(if active { 2.0 } else { 1.0 }))
+                    .rounded(px(6.0))
+                    .border_1()
                     .border_color(if active {
                         theme::accent()
                     } else {
-                        theme::border_strong()
+                        theme::border()
                     })
-                    .bg(theme::surface())
-                    .font_family("SF Mono")
-                    .text_size(theme::font(10.0))
+                    .bg(if active {
+                        theme::surface()
+                    } else {
+                        theme::control_track()
+                    })
+                    .text_size(theme::font(10.5))
                     .text_color(if query_is_empty {
                         theme::text_tertiary()
                     } else {
                         theme::text_primary()
                     })
-                    .hover(|style| style.border_color(theme::accent().opacity(0.72)))
-                    .when(active, |input| input.shadow_sm())
+                    .hover(|style| style.border_color(theme::border_strong()))
+                    .when(active, |input| input.shadow_xs())
                     .cursor_text()
                     .tooltip(delayed_tooltip("搜索当前面板 (⌘F)"))
                     .on_mouse_down(MouseButton::Left, {

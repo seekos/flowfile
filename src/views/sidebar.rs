@@ -1,5 +1,6 @@
 use super::tooltip::delayed_tooltip;
 use crate::{
+    icons::{IconName, icon},
     models::{
         Favorites, FileDragPayload, FileOperationController, Model, MultiPaneModel, home_directory,
     },
@@ -18,12 +19,20 @@ use std::{
 
 #[derive(Clone, Eq, PartialEq)]
 struct SidebarLocation {
-    icon: &'static str,
+    icon: IconName,
     label: String,
     path: PathBuf,
     detail: Option<String>,
     navigation_address: Option<String>,
     eject_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+struct SidebarItemOptions {
+    is_active: bool,
+    is_accent_icon: bool,
+    can_remove_favorite: bool,
+    can_eject: bool,
 }
 
 pub struct SidebarView {
@@ -57,10 +66,10 @@ impl SidebarView {
 
         let home = home_directory();
         let quick_access = [
-            ("⌂", "个人文件夹", home.clone()),
-            ("↓", "下载", home.join("Downloads")),
-            ("▧", "桌面", home.join("Desktop")),
-            ("◇", "文稿", home.join("Documents")),
+            (IconName::Home, "个人文件夹", home.clone()),
+            (IconName::Download, "下载", home.join("Downloads")),
+            (IconName::Desktop, "桌面", home.join("Desktop")),
+            (IconName::Document, "文稿", home.join("Documents")),
         ]
         .into_iter()
         .filter(|(_, _, path)| path.is_dir())
@@ -196,9 +205,9 @@ impl SidebarView {
     fn section_title(title: &'static str) -> impl IntoElement {
         div()
             .px_3()
-            .pt_4()
-            .pb_2()
-            .text_size(theme::font(10.0))
+            .pt_3()
+            .pb_1()
+            .text_size(theme::font(9.5))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme::text_tertiary())
             .child(title)
@@ -307,11 +316,15 @@ impl SidebarView {
         &self,
         id: usize,
         location: SidebarLocation,
-        is_active: bool,
-        can_remove_favorite: bool,
-        can_eject: bool,
+        options: SidebarItemOptions,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let SidebarItemOptions {
+            is_active,
+            is_accent_icon,
+            can_remove_favorite,
+            can_eject,
+        } = options;
         let model = self.model.clone();
         let operations = self.operations.clone();
         let path = location.path.clone();
@@ -334,6 +347,8 @@ impl SidebarView {
         let is_ejecting = self.ejecting_volumes.contains(&eject_identity);
         let hover_group: SharedString = format!("sidebar-location-{id}").into();
 
+        let has_detail = detail.is_some();
+
         div()
             .id(("sidebar-location", id))
             .group(hover_group.clone())
@@ -341,21 +356,24 @@ impl SidebarView {
             .items_center()
             .gap_2()
             .mx_2()
-            .h(px(36.0))
+            .h(px(if has_detail { 38.0 } else { 30.0 }))
             .px_2()
-            .rounded_md()
-            .text_size(theme::font(12.0))
-            .text_color(if is_active {
-                theme::accent()
+            .rounded(px(6.0))
+            .text_size(theme::font(11.5))
+            .text_color(theme::text_primary())
+            .font_weight(if is_active {
+                FontWeight::MEDIUM
             } else {
-                theme::text_primary()
+                FontWeight::NORMAL
             })
             .bg(if is_active {
-                theme::accent_soft()
+                theme::sidebar_active()
             } else {
                 theme::sidebar()
             })
-            .hover(|style| style.bg(theme::surface().opacity(0.8)))
+            .when(!is_active, |item| {
+                item.hover(|style| style.bg(theme::hover_subtle()))
+            })
             .tooltip(delayed_tooltip(tooltip))
             .when(accepts_drop, |item| {
                 item.drag_over::<FileDragPayload>(|style, _, _, _| {
@@ -412,14 +430,19 @@ impl SidebarView {
             })
             .child(
                 div()
-                    .w(px(24.0))
-                    .text_size(theme::font(14.0))
-                    .text_color(if is_active {
-                        theme::accent()
-                    } else {
-                        theme::file_blue()
-                    })
-                    .child(location.icon),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(20.0))
+                    .child(icon(
+                        location.icon,
+                        15.0,
+                        if is_active || is_accent_icon {
+                            theme::accent()
+                        } else {
+                            theme::text_secondary()
+                        },
+                    )),
             )
             .child(
                 div()
@@ -431,7 +454,7 @@ impl SidebarView {
                     .child(div().truncate().child(label))
                     .when_some(detail, |location, detail| {
                         location
-                            .text_size(theme::font(8.0))
+                            .text_size(theme::font(8.5))
                             .text_color(theme::text_tertiary())
                             .child(detail)
                     }),
@@ -440,20 +463,18 @@ impl SidebarView {
                 item.child(
                     div()
                         .id(("sidebar-remove-favorite", id))
-                        .w(px(24.0))
-                        .h(px(24.0))
+                        .w(px(22.0))
+                        .h(px(22.0))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded_md()
+                        .rounded(px(5.0))
                         .cursor_pointer()
                         .invisible()
                         .group_hover(hover_group, |style| style.visible())
-                        .text_size(theme::font(14.0))
-                        .text_color(theme::text_tertiary())
                         .hover(|style| style.bg(theme::surface()).text_color(theme::danger()))
                         .tooltip(delayed_tooltip("取消收藏".to_string()))
-                        .child("×")
+                        .child(icon(IconName::Close, 11.0, theme::text_tertiary()))
                         .on_click(cx.listener(move |sidebar, _, _, cx| {
                             cx.stop_propagation();
                             sidebar.remove_favorite(favorite_path.clone(), cx);
@@ -464,14 +485,14 @@ impl SidebarView {
                 item.child(
                     div()
                         .id(("sidebar-eject", id))
-                        .w(px(24.0))
-                        .h(px(24.0))
+                        .w(px(22.0))
+                        .h(px(22.0))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded_md()
+                        .rounded(px(5.0))
                         .cursor_pointer()
-                        .text_size(theme::font(12.0))
+                        .text_size(theme::font(11.0))
                         .text_color(theme::text_tertiary())
                         .hover(|style| style.bg(theme::surface()).text_color(theme::text_primary()))
                         .tooltip(delayed_tooltip(if is_ejecting {
@@ -479,7 +500,11 @@ impl SidebarView {
                         } else {
                             format!("弹出 {label_text}")
                         }))
-                        .child(if is_ejecting { "…" } else { "⏏" })
+                        .child(if is_ejecting {
+                            div().child("…").into_any_element()
+                        } else {
+                            icon(IconName::Eject, 12.0, theme::text_tertiary()).into_any_element()
+                        })
                         .on_click(cx.listener(move |sidebar, _, _, cx| {
                             cx.stop_propagation();
                             sidebar.eject_location(eject_location.clone(), cx);
@@ -513,7 +538,7 @@ impl Render for SidebarView {
             .iter()
             .filter(|path| path.is_dir())
             .map(|path| SidebarLocation {
-                icon: "★",
+                icon: IconName::Star,
                 label: path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -534,7 +559,7 @@ impl Render for SidebarView {
                 continue;
             }
             volumes.push(SidebarLocation {
-                icon: "◉",
+                icon: IconName::Server,
                 label: smb_server_label(&address),
                 path: PathBuf::from(&address),
                 detail: Some("SMB · 网络服务器".to_string()),
@@ -559,7 +584,17 @@ impl Render for SidebarView {
                     .enumerate()
                     .map(|(index, location)| {
                         let is_active = current_path == location.path;
-                        self.item(index, location, is_active, false, false, cx)
+                        self.item(
+                            index,
+                            location,
+                            SidebarItemOptions {
+                                is_active,
+                                is_accent_icon: true,
+                                can_remove_favorite: false,
+                                can_eject: false,
+                            },
+                            cx,
+                        )
                     }),
             )
             .child(Self::section_title("收藏夹"))
@@ -575,7 +610,17 @@ impl Render for SidebarView {
             })
             .children(favorites.into_iter().enumerate().map(|(index, location)| {
                 let is_active = current_path == location.path;
-                self.item(50 + index, location, is_active, true, false, cx)
+                self.item(
+                    50 + index,
+                    location,
+                    SidebarItemOptions {
+                        is_active,
+                        is_accent_icon: true,
+                        can_remove_favorite: true,
+                        can_eject: false,
+                    },
+                    cx,
+                )
             }))
             .child(Self::section_title("位置"))
             .when(self.volumes_loading, |sidebar| {
@@ -594,20 +639,18 @@ impl Render for SidebarView {
                     .is_some_and(|address| current_smb_server.as_ref() == Some(address))
                     || current_path == location.path;
                 let can_eject = !location.eject_paths.is_empty();
-                self.item(100 + index, location, is_active, false, can_eject, cx)
+                self.item(
+                    100 + index,
+                    location,
+                    SidebarItemOptions {
+                        is_active,
+                        is_accent_icon: false,
+                        can_remove_favorite: false,
+                        can_eject,
+                    },
+                    cx,
+                )
             }))
-            .child(
-                div()
-                    .mt_auto()
-                    .mx_3()
-                    .mb_3()
-                    .pt_3()
-                    .border_t_1()
-                    .border_color(theme::border_strong())
-                    .text_size(theme::font(9.0))
-                    .text_color(theme::text_tertiary())
-                    .child("FlowFile · macOS local filesystem"),
-            )
     }
 }
 
@@ -635,7 +678,7 @@ fn sidebar_locations_for_volumes(
             Vec::new()
         };
         locations.push(SidebarLocation {
-            icon: "◉",
+            icon: IconName::Drive,
             label: volume_label(&volume.path),
             detail: volume.status_label().map(str::to_string),
             path: volume.path,
@@ -648,7 +691,7 @@ fn sidebar_locations_for_volumes(
         mount_paths.sort();
         mount_paths.dedup();
         SidebarLocation {
-            icon: "◉",
+            icon: IconName::Server,
             label: smb_server_label(&address),
             path: PathBuf::from(&address),
             detail: Some("SMB · 网络服务器".to_string()),

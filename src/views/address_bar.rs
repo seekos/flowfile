@@ -14,10 +14,10 @@ use crate::{
 };
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, KeyDownEvent,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    Render, ShapedLine, SharedString, Style, Subscription, TextRun, UTF16Selection, UnderlineStyle,
-    Window, div, fill, point, prelude::*, px, relative, size,
+    Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight, GlobalElementId, IntoElement,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, Render, ShapedLine, SharedString, Style, Subscription, TextRun, UTF16Selection,
+    UnderlineStyle, Window, div, fill, point, prelude::*, px, relative, size,
 };
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
@@ -342,13 +342,13 @@ impl AddressBar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(28.0))
+            .size(px(26.0))
             .rounded(px(6.0))
             .tooltip(delayed_tooltip(tooltip))
             .when(enabled, |button| {
                 button
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::accent_soft()))
+                    .hover(|style| style.bg(theme::hover_subtle()))
                     .on_click(move |_, _, cx| {
                         pane.update(cx, |pane, cx| match action {
                             NavigationAction::Back => pane.go_back(cx),
@@ -360,7 +360,7 @@ impl AddressBar {
             })
             .child(icon(
                 symbol,
-                15.0,
+                14.0,
                 if enabled {
                     theme::text_secondary()
                 } else {
@@ -375,20 +375,42 @@ impl AddressBar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(28.0))
+            .size(px(26.0))
             .rounded(px(6.0))
             .cursor_pointer()
-            .hover(|style| style.bg(theme::accent_soft()))
+            .hover(|style| style.bg(theme::hover_subtle()))
             .tooltip(delayed_tooltip("编辑路径或连接 SMB 服务器"))
             .on_click(cx.listener(|this, _, window, cx| {
                 this.begin_edit(window, cx);
             }))
-            .child(icon(IconName::Edit, 15.0, theme::text_secondary()))
+            .child(icon(IconName::Edit, 14.0, theme::text_secondary()))
     }
 
     fn breadcrumb(&self, path: &Path, cx: &mut Context<Self>) -> AnyElement {
         let pane = self.pane.clone();
-        let nodes = breadcrumb_nodes(path);
+        let raw_nodes = breadcrumb_nodes(path);
+        let nodes = if raw_nodes.len() > 4 {
+            let len = raw_nodes.len();
+            vec![
+                (raw_nodes[0].0.clone(), raw_nodes[0].1.clone(), false),
+                ("…".to_string(), raw_nodes[len - 3].1.clone(), true),
+                (
+                    raw_nodes[len - 2].0.clone(),
+                    raw_nodes[len - 2].1.clone(),
+                    false,
+                ),
+                (
+                    raw_nodes[len - 1].0.clone(),
+                    raw_nodes[len - 1].1.clone(),
+                    false,
+                ),
+            ]
+        } else {
+            raw_nodes
+                .into_iter()
+                .map(|(label, path)| (label, path, false))
+                .collect()
+        };
         let node_count = nodes.len();
         let input_entity = cx.entity();
 
@@ -397,23 +419,23 @@ impl AddressBar {
             .items_center()
             .min_w_0()
             .flex_1()
-            .h(px(30.0))
+            .h(px(28.0))
             .px_1()
-            .rounded_md()
-            .border_1()
-            .border_color(theme::border())
-            .bg(theme::surface())
+            .rounded(px(6.0))
+            .bg(theme::control_track())
             .overflow_hidden()
             .children(
                 nodes
                     .into_iter()
                     .enumerate()
-                    .flat_map(|(index, (label, path))| {
+                    .flat_map(|(index, (label, path, is_ellipsis))| {
                         let pane = pane.clone();
                         let input_entity = input_entity.clone();
                         let is_current = index + 1 == node_count;
                         let tooltip = if is_current {
                             "编辑当前路径".to_string()
+                        } else if is_ellipsis {
+                            format!("返回上层 {}", path.display())
                         } else {
                             format!("前往 {}", path.display())
                         };
@@ -422,14 +444,22 @@ impl AddressBar {
                             .id(("breadcrumb", index))
                             .flex()
                             .items_center()
-                            .h(px(26.0))
-                            .px_2()
-                            .rounded_sm()
-                            .font_family("SF Mono")
-                            .text_size(theme::font(10.0))
-                            .text_color(theme::text_secondary())
+                            .h(px(22.0))
+                            .px(px(6.0))
+                            .rounded(px(4.0))
+                            .text_size(theme::font(10.5))
+                            .font_weight(if is_current {
+                                FontWeight::MEDIUM
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if is_current {
+                                theme::text_primary()
+                            } else {
+                                theme::text_secondary()
+                            })
                             .hover(|style| {
-                                style.bg(theme::accent_soft()).text_color(theme::accent())
+                                style.bg(theme::hover_subtle()).text_color(theme::text_primary())
                             })
                             .tooltip(delayed_tooltip(tooltip))
                             .on_click(move |_, window, cx| {
@@ -450,7 +480,8 @@ impl AddressBar {
                             .into_any_element();
                         let separator = (index > 0).then(|| {
                             div()
-                                .text_size(theme::font(10.0))
+                                .flex()
+                                .items_center()
                                 .text_color(theme::text_tertiary())
                                 .child(icon(IconName::ChevronRight, 10.0, theme::text_tertiary()))
                                 .into_any_element()
@@ -463,7 +494,7 @@ impl AddressBar {
                 div()
                     .id("address-edit-trigger")
                     .h_full()
-                    .min_w(px(24.0))
+                    .min_w(px(20.0))
                     .flex_1()
                     .tooltip(delayed_tooltip("编辑路径或连接 SMB 服务器"))
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -481,14 +512,15 @@ impl AddressBar {
             .items_center()
             .min_w_0()
             .flex_1()
-            .h(px(30.0))
+            .h(px(28.0))
             .px_2()
-            .rounded_md()
+            .rounded(px(6.0))
             .border_1()
             .border_color(theme::accent())
             .bg(theme::surface())
+            .shadow_xs()
             .font_family("SF Mono")
-            .text_size(theme::font(11.0))
+            .text_size(theme::font(10.5))
             .text_color(theme::text_primary())
             .cursor_text()
             .overflow_hidden()
@@ -856,13 +888,13 @@ impl Render for AddressBar {
             } else {
                 theme::border()
             })
-            .bg(theme::surface_subtle())
+            .bg(theme::surface())
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_1()
-                    .h(px(44.0))
+                    .h(px(38.0))
                     .px_2()
                     .child(self.navigation_button(
                         "navigate-back",

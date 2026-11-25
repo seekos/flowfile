@@ -3,12 +3,13 @@ use super::{
     search_bar::SearchBar, tooltip::delayed_tooltip,
 };
 use crate::{
+    icons::{IconName, icon},
     models::{FileDragPayload, FileOperationController, Model, MultiPaneModel, Pane, ViewMode},
     services::{ThumbnailEngine, TransferMode},
     theme,
 };
 use gpui::{
-    AnyElement, Context, Entity, ExternalPaths, IntoElement, Render, Window, div, prelude::*, px,
+    Context, Entity, ExternalPaths, FontWeight, IntoElement, Render, Window, div, prelude::*, px,
 };
 
 pub struct PaneView {
@@ -40,6 +41,7 @@ impl PaneView {
             MainListView::new(
                 index,
                 pane.clone(),
+                multi_pane.clone(),
                 operations.clone(),
                 thumbnails,
                 context_menu,
@@ -85,13 +87,14 @@ impl Render for PaneView {
             .min_h_0()
             .size_full()
             .overflow_hidden()
-            .rounded_sm()
-            .border(px(if is_active { 2.0 } else { 1.0 }))
+            .rounded(px(8.0))
+            .border_1()
             .border_color(if is_active {
-                theme::accent()
-            } else {
                 theme::border_strong()
+            } else {
+                theme::border()
             })
+            .when(is_active, |card| card.shadow_xs())
             .bg(theme::surface())
             .capture_any_mouse_down(move |_, _, cx| {
                 multi_pane.update(cx, |model, cx| {
@@ -148,15 +151,10 @@ impl Render for PaneView {
             .child(
                 div()
                     .flex()
-                    .items_end()
-                    .h(px(34.0))
+                    .items_center()
+                    .h(px(32.0))
                     .px_2()
-                    .pt_1()
-                    .bg(if is_active {
-                        theme::accent_soft()
-                    } else {
-                        theme::surface_subtle()
-                    })
+                    .bg(theme::surface())
                     .border_b_1()
                     .border_color(theme::border())
                     .child(
@@ -164,37 +162,74 @@ impl Render for PaneView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .h(px(29.0))
-                            .max_w(px(196.0))
-                            .px_3()
-                            .rounded_t_md()
-                            .bg(theme::surface())
-                            .text_size(theme::font(11.0))
+                            .h(px(24.0))
+                            .max_w(px(210.0))
+                            .px(px(10.0))
+                            .rounded(px(6.0))
+                            .bg(if is_active {
+                                theme::surface_subtle()
+                            } else {
+                                theme::surface()
+                            })
+                            .border_1()
+                            .border_color(theme::border())
+                            .text_size(theme::font(10.5))
+                            .font_weight(if is_active {
+                                FontWeight::MEDIUM
+                            } else {
+                                FontWeight::NORMAL
+                            })
                             .text_color(if is_active {
-                                theme::accent()
+                                theme::text_primary()
                             } else {
                                 theme::text_secondary()
                             })
-                            .child(if is_loading { "◌" } else { "●" })
+                            .child(
+                                div()
+                                    .size(px(6.0))
+                                    .rounded_full()
+                                    .bg(if is_active {
+                                        theme::accent()
+                                    } else {
+                                        theme::text_tertiary().opacity(0.6)
+                                    }),
+                            )
+                            .when(is_loading, |tab| {
+                                tab.child(
+                                    div()
+                                        .text_size(theme::font(9.5))
+                                        .text_color(theme::text_tertiary())
+                                        .child("◌"),
+                                )
+                            })
                             .child(div().min_w_0().flex_1().truncate().child(active_tab)),
                     )
                     .child(div().flex_1())
-                    .child(view_mode_button(
-                        self.index,
-                        "pane-details",
-                        ViewMode::Details,
-                        view_mode,
-                        self.pane.clone(),
-                        "详细列表",
-                    ))
-                    .child(view_mode_button(
-                        self.index,
-                        "pane-grid",
-                        ViewMode::Grid,
-                        view_mode,
-                        self.pane.clone(),
-                        "大图标网格",
-                    )),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .p(px(2.0))
+                            .rounded(px(6.0))
+                            .bg(theme::control_track())
+                            .child(view_mode_button(
+                                self.index,
+                                "pane-details",
+                                ViewMode::Details,
+                                view_mode,
+                                self.pane.clone(),
+                                "详细列表",
+                            ))
+                            .child(view_mode_button(
+                                self.index,
+                                "pane-grid",
+                                ViewMode::Grid,
+                                view_mode,
+                                self.pane.clone(),
+                                "大图标网格",
+                            )),
+                    ),
             )
             .child(
                 div()
@@ -229,75 +264,39 @@ fn view_mode_button(
     tooltip: &'static str,
 ) -> impl IntoElement {
     let active = target == current;
+    let symbol = match target {
+        ViewMode::Details => IconName::ViewList,
+        ViewMode::Grid => IconName::ViewGrid,
+    };
     div()
         .id((id, pane_index))
         .flex()
         .items_center()
         .justify_center()
-        .size(px(28.0))
-        .mb_1()
-        .ml_1()
-        .rounded_sm()
-        .border_1()
-        .border_color(if active {
-            theme::accent()
-        } else {
-            theme::border()
-        })
+        .w(px(24.0))
+        .h(px(20.0))
+        .rounded(px(4.0))
         .bg(if active {
-            theme::accent_soft()
-        } else {
             theme::surface()
-        })
-        .text_color(if active {
-            theme::accent()
         } else {
-            theme::text_tertiary()
+            gpui::transparent_black()
         })
-        .hover(|style| style.bg(theme::accent_soft()))
+        .when(active, |button| button.shadow_xs())
+        .cursor_pointer()
+        .when(!active, |button| {
+            button.hover(|style| style.bg(theme::hover_subtle()))
+        })
         .tooltip(delayed_tooltip(tooltip))
         .on_click(move |_, _, cx| {
             pane.update(cx, |pane, cx| pane.set_view_mode(target, cx));
         })
-        .child(view_mode_icon(target, active))
-}
-
-fn view_mode_icon(mode: ViewMode, active: bool) -> AnyElement {
-    let color = if active {
-        theme::accent()
-    } else {
-        theme::text_tertiary()
-    };
-    match mode {
-        ViewMode::Details => div()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .gap(px(2.5))
-            .w(px(15.0))
-            .h(px(14.0))
-            .children((0..3).map(move |_| {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(3.0))
-                    .child(div().size(px(2.5)).rounded_full().bg(color))
-                    .child(div().w(px(9.5)).h(px(1.5)).rounded_full().bg(color))
-            }))
-            .into_any_element(),
-        ViewMode::Grid => div()
-            .flex()
-            .flex_wrap()
-            .gap(px(2.0))
-            .size(px(14.0))
-            .children((0..4).map(move |_| {
-                div()
-                    .size(px(6.0))
-                    .rounded(px(1.5))
-                    .border_1()
-                    .border_color(color)
-                    .bg(color.opacity(if active { 0.16 } else { 0.06 }))
-            }))
-            .into_any_element(),
-    }
+        .child(icon(
+            symbol,
+            13.0,
+            if active {
+                theme::accent()
+            } else {
+                theme::text_secondary()
+            },
+        ))
 }

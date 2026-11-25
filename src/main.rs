@@ -39,7 +39,7 @@ fn main() -> Result<()> {
                     titlebar: Some(TitlebarOptions {
                         title: None,
                         appears_transparent: true,
-                        traffic_light_position: Some(point(px(14.0), px(18.0))),
+                        traffic_light_position: Some(point(px(18.0), px(19.0))),
                     }),
                     ..Default::default()
                 },

@@ -49,7 +49,7 @@ impl MultiPaneContainerView {
             .min_w_0()
             .min_h_0()
             .size_full()
-            .gap(px(6.0))
+            .gap(px(8.0))
             .child(
                 div()
                     .flex()
@@ -82,7 +82,7 @@ impl MultiPaneContainerView {
                 .min_w_0()
                 .min_h_0()
                 .size_full()
-                .gap(px(6.0))
+                .gap(px(8.0))
                 .child(div().flex().min_h_0().flex_1().child(self.pane(0)))
                 .child(div().flex().min_h_0().flex_1().child(self.pane(1)))
                 .into_any_element(),
@@ -92,7 +92,7 @@ impl MultiPaneContainerView {
                 .min_w_0()
                 .min_h_0()
                 .size_full()
-                .gap(px(6.0))
+                .gap(px(8.0))
                 .child(div().flex().min_h_0().flex_1().child(self.pair(0, 1)))
                 .child(div().flex().min_h_0().flex_1().child(self.pair(2, 3)))
                 .into_any_element(),
@@ -111,7 +111,7 @@ impl Render for MultiPaneContainerView {
             .min_w_0()
             .min_h_0()
             .size_full()
-            .p(px(6.0))
+            .p(px(8.0))
             .bg(theme::canvas())
             .child(self.layout(mode, active_pane_index))
     }

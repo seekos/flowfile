@@ -7,8 +7,8 @@ use crate::{
     actions::{CopyFiles, CutFiles, PasteFiles, RenameSelected, SelectAllFiles, ToggleQuickLook},
     icons::{self, IconName},
     models::{
-        FileItem, FileKind, FileOperationController, GitStatus, Model, Pane, SortMode, ViewMode,
-        is_svg_path,
+        FileItem, FileKind, FileOperationController, GitStatus, Model, MultiPaneModel, Pane,
+        SortMode, ViewMode, is_svg_path,
     },
     services::{
         ThumbnailEngine, ThumbnailEvent, TransferMode, begin_external_file_drag,
@@ -35,7 +35,7 @@ use std::{
     time::Duration,
 };
 
-const DETAILS_ICON_WIDTH: f32 = 42.0;
+const DETAILS_ICON_WIDTH: f32 = 36.0;
 const GRID_CARD_TARGET_WIDTH: f32 = 112.0;
 const GRID_RENAME_MIN_WIDTH: f32 = 160.0;
 const GRID_RENAME_MAX_WIDTH: f32 = 320.0;
@@ -304,6 +304,7 @@ impl Element for RenameTextElement {
 pub struct MainListView {
     pane_index: usize,
     pane: Model<Pane>,
+    multi_pane: Model<MultiPaneModel>,
     operations: Entity<FileOperationController>,
     thumbnails: Entity<ThumbnailEngine>,
     context_menu: Entity<ContextMenuView>,
@@ -337,12 +338,14 @@ impl MainListView {
     pub fn new(
         pane_index: usize,
         pane: Model<Pane>,
+        multi_pane: Model<MultiPaneModel>,
         operations: Entity<FileOperationController>,
         thumbnails: Entity<ThumbnailEngine>,
         context_menu: Entity<ContextMenuView>,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&pane, |_, _, cx| cx.notify()).detach();
+        cx.observe(&multi_pane, |_, _, cx| cx.notify()).detach();
         cx.observe(&operations, |_, _, cx| cx.notify()).detach();
         cx.subscribe(
             &thumbnails,
@@ -357,6 +360,7 @@ impl MainListView {
         Self {
             pane_index,
             pane,
+            multi_pane,
             operations,
             thumbnails,
             context_menu,
@@ -391,35 +395,36 @@ impl MainListView {
         if item.kind == FileKind::Folder {
             return div()
                 .relative()
-                .w(px(30.0))
-                .h(px(24.0))
+                .w(px(24.0))
+                .h(px(20.0))
                 .child(
                     div()
                         .absolute()
                         .top(px(2.0))
-                        .left(px(2.0))
-                        .w(px(13.0))
-                        .h(px(7.0))
-                        .rounded_t_sm()
-                        .bg(theme::folder().opacity(0.76)),
+                        .left(px(1.5))
+                        .w(px(10.5))
+                        .h(px(6.0))
+                        .rounded_t(px(3.0))
+                        .bg(theme::folder_tab()),
                 )
                 .child(
                     div()
                         .absolute()
                         .bottom(px(1.0))
                         .left(px(1.0))
-                        .w(px(28.0))
-                        .h(px(19.0))
-                        .rounded(px(4.0))
+                        .w(px(22.0))
+                        .h(px(15.0))
+                        .rounded(px(3.5))
                         .border_1()
-                        .border_color(theme::folder().opacity(0.95))
-                        .bg(theme::folder().opacity(0.82))
+                        .border_color(theme::folder_tab())
+                        .bg(theme::folder())
                         .child(
                             div()
-                                .mt(px(3.0))
-                                .mx(px(3.0))
+                                .mt(px(1.5))
+                                .mx(px(2.0))
                                 .h(px(1.0))
-                                .bg(theme::surface().opacity(0.32)),
+                                .rounded_full()
+                                .bg(gpui::white().opacity(0.35)),
                         ),
                 )
                 .into_any_element();
@@ -496,16 +501,26 @@ impl MainListView {
                     div()
                         .relative()
                         .w(px(72.0))
-                        .h(px(55.0))
+                        .h(px(56.0))
                         .child(
                             div()
                                 .absolute()
                                 .top_0()
                                 .left(px(4.0))
                                 .w(px(32.0))
-                                .h(px(13.0))
-                                .rounded_t_sm()
-                                .bg(theme::folder().opacity(0.82)),
+                                .h(px(14.0))
+                                .rounded_t(px(5.0))
+                                .bg(theme::folder_tab()),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top(px(6.0))
+                                .left(px(1.0))
+                                .right(px(1.0))
+                                .h(px(6.0))
+                                .rounded_t(px(4.0))
+                                .bg(theme::folder_tab().opacity(0.85)),
                         )
                         .child(
                             div()
@@ -513,11 +528,26 @@ impl MainListView {
                                 .bottom_0()
                                 .left_0()
                                 .w_full()
-                                .h(px(47.0))
-                                .rounded_sm()
+                                .h(px(46.0))
+                                .rounded(px(7.0))
                                 .border_1()
-                                .border_color(theme::folder().opacity(0.88))
-                                .bg(theme::folder()),
+                                .border_color(theme::folder_tab())
+                                .bg(theme::folder())
+                                .shadow_xs()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(px(2.0))
+                                        .bg(gpui::white().opacity(0.35)),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(39.0))
+                                        .w_full()
+                                        .h(px(4.0))
+                                        .bg(gpui::black().opacity(0.08)),
+                                ),
                         ),
                 )
                 .into_any_element();
@@ -745,6 +775,7 @@ impl MainListView {
         let pane = self.pane.clone();
         let is_active = mode == Some(active_mode);
         let width = self.detail_column_widths.width(column);
+        let is_size_column = column == DetailColumn::Size;
         div()
             .id(("detail-column", column as usize))
             .relative()
@@ -753,18 +784,16 @@ impl MainListView {
             .flex_shrink_0()
             .w(px(width))
             .h_full()
-            .text_left()
             .child(
                 div()
                     .id(("detail-sort", column as usize))
                     .flex()
                     .items_center()
-                    .justify_start()
+                    .when(is_size_column, |header| header.justify_end().pr_3().pl_2())
+                    .when(!is_size_column, |header| header.justify_start().px_2())
                     .gap_1()
                     .size_full()
                     .min_w_0()
-                    .px_2()
-                    .text_left()
                     .text_size(theme::font(10.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(if is_active {
@@ -1212,7 +1241,7 @@ impl MainListView {
                 .px_2()
                 .truncate()
                 .text_left()
-                .text_size(theme::font(12.0))
+                .text_size(theme::font(11.5))
                 .text_color(theme::text_primary())
                 .child(item.name.clone())
                 .into_any_element()
@@ -1224,6 +1253,7 @@ impl MainListView {
         &self,
         index: usize,
         item: FileItem,
+        is_active_pane: bool,
         is_selected: bool,
         is_cut: bool,
         is_dragging: bool,
@@ -1260,6 +1290,18 @@ impl MainListView {
             vec![item.path.clone()]
         };
         let drag_input = input_entity.clone();
+        let row_bg = if is_selected {
+            if is_active_pane {
+                theme::accent_soft()
+            } else {
+                theme::inactive_selection()
+            }
+        } else if index % 2 == 1 {
+            theme::surface_subtle()
+        } else {
+            theme::surface()
+        };
+
         div()
             .on_children_prepainted(move |bounds, _, _| {
                 if let Some(bounds) = bounds.into_iter().reduce(|left, right| left.union(&right)) {
@@ -1269,16 +1311,12 @@ impl MainListView {
             .id(("file-row", index))
             .flex()
             .items_center()
-            .w(px(widths.total(show_absolute_path)))
+            .w_full()
+            .min_w(px(widths.total(show_absolute_path)))
             .flex_shrink_0()
-            .h(px(40.0))
-            .border_b_1()
-            .border_color(theme::surface_subtle())
-            .bg(if is_selected {
-                theme::accent_soft()
-            } else {
-                theme::surface()
-            })
+            .h(px(30.0))
+            .rounded(px(5.0))
+            .bg(row_bg)
             .opacity(if is_dragging {
                 0.0
             } else if is_cut {
@@ -1331,7 +1369,9 @@ impl MainListView {
                     });
                 })
             })
-            .hover(|style| style.bg(theme::accent_soft().opacity(0.7)))
+            .when(!is_selected, |row| {
+                row.hover(|style| style.bg(theme::hover_subtle()))
+            })
             .on_mouse_down(MouseButton::Left, move |event, _, cx| {
                 let visual_origin = drag_visual_origins_for_mouse_down
                     .borrow()
@@ -1386,7 +1426,7 @@ impl MainListView {
                     .flex_shrink_0()
                     .w(px(DETAILS_ICON_WIDTH))
                     .pl_2()
-                    .child(Self::file_visual(&item, thumbnail, 34.0)),
+                    .child(Self::file_visual(&item, thumbnail, 24.0)),
             )
             .child(self.name_cell(&item, renaming, &rename_buffer, widths.name, input_entity))
             .child(
@@ -1396,7 +1436,7 @@ impl MainListView {
                     .px_2()
                     .truncate()
                     .text_left()
-                    .text_size(theme::font(10.0))
+                    .text_size(theme::font(10.5))
                     .text_color(theme::text_secondary())
                     .child(file_type_label(&item)),
             )
@@ -1404,10 +1444,11 @@ impl MainListView {
                 div()
                     .flex_shrink_0()
                     .w(px(widths.size))
-                    .px_2()
+                    .pl_2()
+                    .pr_3()
                     .truncate()
-                    .text_left()
-                    .text_size(theme::font(10.0))
+                    .text_right()
+                    .text_size(theme::font(10.5))
                     .text_color(theme::text_secondary())
                     .child(formatted_size),
             )
@@ -1418,7 +1459,7 @@ impl MainListView {
                     .px_2()
                     .truncate()
                     .text_left()
-                    .text_size(theme::font(10.0))
+                    .text_size(theme::font(10.5))
                     .text_color(theme::text_secondary())
                     .child(item.modified),
             )
@@ -1445,6 +1486,7 @@ impl MainListView {
         &self,
         index: usize,
         item: FileItem,
+        is_active_pane: bool,
         is_selected: bool,
         is_cut: bool,
         is_dragging: bool,
@@ -1481,7 +1523,7 @@ impl MainListView {
             deferred(
                 div()
                     .absolute()
-                    .top(px(100.0))
+                    .top(px(103.0))
                     .left_0()
                     .right_0()
                     .flex()
@@ -1501,24 +1543,32 @@ impl MainListView {
             deferred(
                 div()
                     .absolute()
-                    .top(px(100.0))
+                    .top(px(103.0))
                     .left_0()
                     .right_0()
                     .flex()
                     .justify_center()
                     .child(
                         div()
-                            .w(px(104.0))
-                            .min_h(px(28.0))
-                            .px_1()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(theme::accent_soft().opacity(0.68))
+                            .max_w(px(104.0))
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(px(5.0))
+                            .bg(if is_active_pane {
+                                theme::accent()
+                            } else {
+                                theme::border_strong()
+                            })
                             .whitespace_normal()
                             .text_center()
                             .text_size(theme::font(11.0))
-                            .font_weight(FontWeight::NORMAL)
-                            .text_color(theme::text_primary())
+                            .line_height(px(17.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if is_active_pane {
+                                gpui::white()
+                            } else {
+                                theme::text_primary()
+                            })
                             .child(file_name),
                     ),
             )
@@ -1526,9 +1576,10 @@ impl MainListView {
             .into_any_element()
         } else {
             div()
-                .mt_2()
+                .flex_shrink_0()
+                .mt(px(6.0))
                 .w_full()
-                .h(px(34.0))
+                .h(px(38.0))
                 .overflow_hidden()
                 .whitespace_normal()
                 .line_clamp(2)
@@ -1536,6 +1587,7 @@ impl MainListView {
                 .text_center()
                 .px_1()
                 .text_size(theme::font(11.0))
+                .line_height(px(17.0))
                 .font_weight(FontWeight::NORMAL)
                 .text_color(theme::text_primary())
                 .child(file_name)
@@ -1555,17 +1607,20 @@ impl MainListView {
                 }
             })
             .flex()
+            .flex_shrink_0()
             .items_center()
             .justify_center()
             .size(px(90.0))
-            .rounded_sm()
-            .border_1()
-            .border_color(if is_selected {
-                theme::accent()
+            .rounded(px(8.0))
+            .bg(if is_selected {
+                if is_active_pane {
+                    theme::hover_subtle()
+                } else {
+                    theme::inactive_selection()
+                }
             } else {
-                theme::surface()
+                gpui::transparent_black()
             })
-            .bg(theme::surface())
             .child(Self::file_visual(&item, thumbnail, 86.0));
 
         div()
@@ -1581,15 +1636,15 @@ impl MainListView {
             .items_center()
             .min_w_0()
             .flex_1()
-            .h(px(136.0))
+            .h(px(152.0))
             .px_1()
             .pt_2()
-            .pb_1()
+            .pb_2()
             .mx(px(2.0))
-            .rounded_sm()
+            .rounded(px(8.0))
             .border_1()
-            .border_color(theme::surface())
-            .bg(theme::surface())
+            .border_color(gpui::transparent_black())
+            .bg(gpui::transparent_black())
             .opacity(if is_dragging {
                 0.0
             } else if is_cut {
@@ -1645,7 +1700,7 @@ impl MainListView {
                 })
             })
             .when(!is_selected, |card| {
-                card.hover(|style| style.border_color(theme::accent().opacity(0.42)))
+                card.hover(|style| style.bg(theme::hover_subtle()))
             })
             .on_mouse_down(MouseButton::Left, move |event, _, cx| {
                 let visual_origin = drag_visual_origins_for_mouse_down
@@ -2214,6 +2269,7 @@ impl Render for MainListView {
         // Query NSPasteboard once for this render. Calling changeCount for
         // every visible item makes each rename keystroke cross into AppKit
         // dozens of times in a dense directory.
+        let is_active_pane = self.multi_pane.read(cx).active_pane_index == self.pane_index;
         let cut_paths = self.operations.read(cx).cut_paths();
         if item_count == 0 {
             self.thumbnails.update(cx, |engine, cx| {
@@ -2259,6 +2315,7 @@ impl Render for MainListView {
                                 this.render_row(
                                     index,
                                     item,
+                                    is_active_pane,
                                     is_selected,
                                     is_cut,
                                     is_dragging,
@@ -2299,7 +2356,7 @@ impl Render for MainListView {
                         rows.map(|row| {
                             let first = row * columns;
                             let mut row_element =
-                                div().flex().items_start().w_full().h(px(144.0)).p_1();
+                                div().flex().items_start().w_full().h(px(160.0)).p_1();
                             for index in first..(first + columns) {
                                 let item = this.pane.read(cx).items.get(index).cloned();
                                 if let Some(item) = item {
@@ -2320,6 +2377,7 @@ impl Render for MainListView {
                                     row_element = row_element.child(this.render_grid_card(
                                         index,
                                         item,
+                                        is_active_pane,
                                         is_selected,
                                         is_cut,
                                         is_dragging,
@@ -2387,11 +2445,12 @@ impl Render for MainListView {
                     .flex()
                     .items_center()
                     .w_full()
-                    .min_w(px(details_width))
-                    .h(px(32.0))
+                    .min_w(px(details_width + 16.0))
+                    .h(px(28.0))
+                    .px_2()
                     .border_b_1()
                     .border_color(theme::border())
-                    .bg(theme::surface_subtle())
+                    .bg(theme::surface())
                     .text_left()
                     .child(div().flex_shrink_0().w(px(DETAILS_ICON_WIDTH)).h_full())
                     .child(name)
@@ -2479,7 +2538,7 @@ impl Render for MainListView {
                     .min_h_0()
                     .flex_1()
                     .when(view_mode == ViewMode::Details, |list| {
-                        list.w_full().min_w(px(details_width))
+                        list.w_full().min_w(px(details_width + 16.0)).px_2().pt_1()
                     })
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_marquee))
                     .on_mouse_down(MouseButton::Right, move |event, window, cx| {
@@ -2509,9 +2568,9 @@ impl Render for MainListView {
                     div()
                         .id("detail-list-blank-area")
                         .absolute()
-                        .top(px(32.0))
+                        .top(px(28.0))
                         .bottom_0()
-                        .left(px(details_width))
+                        .left(px(details_width + 16.0))
                         .right_0()
                         .cursor_default()
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_marquee))

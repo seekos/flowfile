@@ -1,5 +1,6 @@
 use super::tooltip::delayed_tooltip;
 use crate::{
+    icons::{IconName, icon},
     models::{FileOperationController, Model, MultiPaneModel},
     services::{FileInspector, SystemTerminal},
     theme,
@@ -41,20 +42,19 @@ impl Render for StatusBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
         let active_index = model.active_pane_index;
-        let layout_label = model.layout_mode.label();
         let pane = model.panes[active_index].read(cx);
         let item_count = pane.items.len();
         let folder_count = pane.items.iter().filter(|item| item.is_dir).count();
         let path = pane.display_path();
         let terminal_path = pane.current_path.clone();
         let selection = match pane.selection_count() {
-            0 => "未选择项目".to_string(),
+            0 => None,
             1 => pane
                 .selected_index
                 .and_then(|index| pane.items.get(index))
-                .map(|item| format!("已选择：{}", item.name))
-                .unwrap_or_else(|| "已选择 1 个项目".to_string()),
-            count => format!("已选择 {count} 个项目"),
+                .map(|item| format!("已选择 {}", item.name))
+                .or_else(|| Some("已选择 1 个项目".to_string())),
+            count => Some(format!("已选择 {count} 个项目")),
         };
         let selected_path = if pane.selection_count() == 1 {
             pane.selected_index
@@ -62,15 +62,6 @@ impl Render for StatusBar {
                 .map(|item| item.path.clone())
         } else {
             None
-        };
-        let activity_label = if pane.is_loading {
-            "正在读取"
-        } else if pane.error_message.is_some() {
-            "读取出错"
-        } else if pane.is_smb_server_root() {
-            "SMB 共享列表"
-        } else {
-            "实时监听"
         };
         if let Some(path) = selected_path {
             self.inspector
@@ -105,7 +96,7 @@ impl Render for StatusBar {
             .flex_shrink_0()
             .border_t_1()
             .border_color(theme::border())
-            .bg(theme::surface_subtle())
+            .bg(theme::surface())
             .child(
                 div()
                     .flex()
@@ -115,13 +106,8 @@ impl Render for StatusBar {
                     .px_3()
                     .text_size(theme::font(10.0))
                     .text_color(theme::text_secondary())
-                    .child(
-                        div()
-                            .text_color(theme::accent())
-                            .child(format!("面板 {}", active_index + 1)),
-                    )
-                    .child(format!("{} 个项目 · {} 个文件夹", item_count, folder_count))
-                    .child(selection)
+                    .child(format!("{item_count} 个项目 · {folder_count} 个文件夹"))
+                    .when_some(selection, |status, selection| status.child(selection))
                     .when_some(inspector_summary, |status, summary| {
                         status.child(
                             div()
@@ -130,38 +116,17 @@ impl Render for StatusBar {
                                 .max_w(px(480.0))
                                 .items_center()
                                 .gap_2()
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(theme::accent())
-                                        .child("检查器"),
-                                )
                                 .child(div().min_w_0().truncate().child(summary)),
                         )
                     })
                     .when(inspector_loading, |status| {
                         status.child(
                             div()
-                                .flex()
                                 .min_w_0()
-                                .max_w(px(240.0))
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(theme::accent())
-                                        .child("检查器"),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_color(theme::text_tertiary())
-                                        .child("正在读取文件元数据…"),
-                                ),
+                                .max_w(px(220.0))
+                                .truncate()
+                                .text_color(theme::text_tertiary())
+                                .child("正在读取元数据…"),
                         )
                     })
                     .when_some(notice, |status, notice| {
@@ -182,28 +147,32 @@ impl Render for StatusBar {
                             .min_w_0()
                             .flex_1()
                             .truncate()
+                            .text_right()
                             .text_color(theme::text_tertiary())
                             .child(path),
                     )
-                    .child(activity_label)
-                    .child(layout_label)
                     .when(self.terminal.is_available(), |status| {
                         status.child(
                             div()
                                 .id("status-open-system-terminal")
                                 .flex()
                                 .items_center()
+                                .gap_1()
                                 .h(px(20.0))
                                 .px_2()
-                                .rounded_sm()
-                                .bg(theme::surface())
+                                .rounded(px(5.0))
+                                .bg(theme::hover_subtle())
                                 .text_color(theme::text_secondary())
-                                .hover(|style| style.bg(theme::accent_soft()))
+                                .cursor_pointer()
+                                .hover(|style| {
+                                    style.bg(theme::accent_soft()).text_color(theme::accent())
+                                })
                                 .tooltip(delayed_tooltip("在系统终端中打开当前文件夹 (⌘`)"))
                                 .on_click(move |_, _, _| {
                                     terminal.open(terminal_path.clone());
                                 })
-                                .child(">_ 系统终端"),
+                                .child(icon(IconName::Terminal, 12.0, theme::text_secondary()))
+                                .child("终端"),
                         )
                     }),
             )
