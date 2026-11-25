@@ -9,10 +9,12 @@ use crate::{
     dispatch_sys::dispatch_async_f, platform::PlatformInputHandler, point, px, size,
 };
 use block::ConcreteBlock;
+#[cfg(not(feature = "app-store"))]
+use cocoa::appkit::NSEvent;
 use cocoa::{
     appkit::{
         NSAppKitVersionNumber, NSAppKitVersionNumber12_0, NSApplication, NSBackingStoreBuffered,
-        NSColor, NSEvent, NSEventModifierFlags, NSFilenamesPboardType, NSPasteboard, NSScreen,
+        NSColor, NSEventModifierFlags, NSFilenamesPboardType, NSPasteboard, NSScreen,
         NSView, NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial,
         NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowButton,
         NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,

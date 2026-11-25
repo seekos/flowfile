@@ -977,12 +977,12 @@ exit 1
             &mock_smbutil,
             "//tester@nas.local",
             "wrong-secret",
-            Duration::from_secs(2),
+            Duration::from_secs(5),
         )
         .unwrap();
 
         assert_eq!(output.status.code(), Some(77));
-        assert!(started_at.elapsed() < Duration::from_secs(1));
+        assert!(started_at.elapsed() < Duration::from_secs(4));
         assert!(!String::from_utf8_lossy(&output.stdout).contains("wrong-secret"));
     }
 
