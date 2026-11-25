@@ -10,7 +10,7 @@ default = []
 # Builds submitted to the Mac App Store use App Sandbox and deliberately
 # disable direct-update, arbitrary executable, terminal, and scripted mount
 # paths that are only appropriate for the Developer ID distribution.
-app-store = []
+app-store = ["gpui/app-store"]
 
 [dependencies]
 anyhow = "1"
@@ -58,6 +58,9 @@ grid = { path = "vendor/grid" }
 tempfile = "3"
 
 [patch.crates-io]
+# GPUI 0.2.2 links private macOS blur APIs unconditionally. The local copy
+# gates that legacy path out of App Store builds while keeping direct builds unchanged.
+gpui = { path = "vendor/gpui" }
 # block 0.1.6 models Objective-C's opaque Class as an uninhabited enum. New
 # Rust versions reject extern statics of that type, so use the API-compatible
 # local copy with an inhabited opaque FFI representation.

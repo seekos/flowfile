@@ -99,6 +99,12 @@ print "Building sandboxed FlowFile ${version} (${build_number}) for ${bundle_id}
 CARGO_TARGET_DIR=${target_dir} MACOSX_DEPLOYMENT_TARGET=${deployment_target} \
     cargo build --release --features app-store
 
+if /usr/bin/strings -a "${binary_path}" |
+    /usr/bin/grep -Eq '_(CGSMainConnectionID|CGSSetWindowBackgroundBlurRadius)'; then
+    print -u2 "App Store build contains private macOS window APIs."
+    exit 1
+fi
+
 if [[ -d "${dsym_path}" ]]; then
     /bin/rm -R "${dsym_path}"
 fi
@@ -147,6 +153,13 @@ if [[ -n "${FLOWFILE_PROVISIONING_PROFILE:-}" ]]; then
     /usr/libexec/PlistBuddy -c "Merge ${entitlements_path}" \
         "${merged_entitlements_path}"
     /usr/bin/plutil -lint "${merged_entitlements_path}" >/dev/null
+fi
+
+/usr/bin/xattr -cr "${app_path}"
+if /usr/bin/xattr -lr "${app_path}" 2>/dev/null |
+    /usr/bin/grep -q 'com.apple.quarantine'; then
+    print -u2 "App Store bundle still contains quarantined files."
+    exit 1
 fi
 
 if [[ "${prepare_only}" == true ]]; then
