@@ -128,8 +128,8 @@ pub(crate) fn connect(input: &str) -> Result<SmbNavigation> {
 
     // The system may already have an authenticated SMB session, including one
     // established by Finder or an existing mount. Ask that session for the
-    // server root without prompting before consulting FlowFile's Keychain item.
-    // If it can list the shares, no password material is needed at all.
+    // server root without prompting before consulting FlowFile's in-memory
+    // credential. If it can list the shares, no password material is needed.
     let root_authentication_required = if location.share.is_none() {
         match unauthenticated_navigation(&location)? {
             navigation @ SmbNavigation::AuthenticationRequired { .. } => Some(navigation),
@@ -139,28 +139,14 @@ pub(crate) fn connect(input: &str) -> Result<SmbNavigation> {
         None
     };
 
-    let cached_credential = match smb_credentials::load(&location.server) {
-        Ok(credential) => credential,
-        Err(error) => {
-            eprintln!(
-                "FlowFile: 无法读取 {} 的 SMB 钥匙串凭证：{error}",
-                location.server
-            );
-            None
-        }
-    };
+    let cached_credential = smb_credentials::load(&location.server);
     if let Some(credential) = cached_credential {
         let suggested_username = credential.username.clone();
         match authenticated_navigation(&location, &credential.username, &credential.password)? {
             Some(navigation) => return Ok(navigation),
             None => {
                 forget_server_shares(&location.server);
-                if let Err(error) = smb_credentials::delete(&location.server) {
-                    eprintln!(
-                        "FlowFile: 无法删除 {} 的失效 SMB 凭证：{error}",
-                        location.server
-                    );
-                }
+                smb_credentials::delete(&location.server);
                 return Ok(authentication_required(&location, Some(suggested_username)));
             }
         }
@@ -181,14 +167,7 @@ pub(crate) fn connect_with_credentials(
     let Some(navigation) = authenticated_navigation(&location, username, password)? else {
         anyhow::bail!("用户名或密码不正确，请重试");
     };
-    if let Err(error) = smb_credentials::save(&location.server, username, password) {
-        // Authentication has already succeeded. Keep the session credential
-        // usable even when macOS declines persistent Keychain storage.
-        eprintln!(
-            "FlowFile: 无法持久保存 {} 的 SMB 凭证，本次运行仍会复用：{error}",
-            location.server
-        );
-    }
+    smb_credentials::save(&location.server, username, password);
     Ok(navigation)
 }
 

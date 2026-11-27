@@ -1,5 +1,6 @@
+use crate::theme;
 use anyhow::Result;
-use gpui::{AssetSource, Hsla, SharedString, Svg, prelude::*, px, svg};
+use gpui::{AssetSource, Hsla, SharedString, Svg, prelude::*, svg};
 use std::borrow::Cow;
 
 /// Monochrome toolbar symbols drawn in the same compact, rounded style as
@@ -82,7 +83,10 @@ impl IconName {
 }
 
 pub fn icon(name: IconName, size: f32, color: Hsla) -> Svg {
-    svg().path(name.path()).size(px(size)).text_color(color)
+    svg()
+        .path(name.path())
+        .size(theme::icon_size(size))
+        .text_color(color)
 }
 
 pub struct IconAssets;

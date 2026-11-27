@@ -43,7 +43,13 @@ fn main() -> Result<()> {
                     }),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| WorkspaceView::new(window, cx)),
+                |window, cx| {
+                    window.on_window_should_close(cx, |_, cx| {
+                        cx.quit();
+                        true
+                    });
+                    cx.new(|cx| WorkspaceView::new(window, cx))
+                },
             )
             .expect("failed to open FlowFile window");
 

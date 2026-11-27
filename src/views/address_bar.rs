@@ -342,7 +342,7 @@ impl AddressBar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(26.0))
+            .size(px(30.0))
             .rounded(px(6.0))
             .tooltip(delayed_tooltip(tooltip))
             .when(enabled, |button| {
@@ -375,7 +375,7 @@ impl AddressBar {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(26.0))
+            .size(px(30.0))
             .rounded(px(6.0))
             .cursor_pointer()
             .hover(|style| style.bg(theme::hover_subtle()))
@@ -419,7 +419,7 @@ impl AddressBar {
             .items_center()
             .min_w_0()
             .flex_1()
-            .h(px(28.0))
+            .h(px(30.0))
             .px_1()
             .rounded(px(6.0))
             .bg(theme::control_track())
@@ -444,7 +444,7 @@ impl AddressBar {
                             .id(("breadcrumb", index))
                             .flex()
                             .items_center()
-                            .h(px(22.0))
+                            .h(px(24.0))
                             .px(px(6.0))
                             .rounded(px(4.0))
                             .text_size(theme::font(10.5))
@@ -512,7 +512,7 @@ impl AddressBar {
             .items_center()
             .min_w_0()
             .flex_1()
-            .h(px(28.0))
+            .h(px(30.0))
             .px_2()
             .rounded(px(6.0))
             .border_1()
@@ -894,7 +894,7 @@ impl Render for AddressBar {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .h(px(38.0))
+                    .h(px(42.0))
                     .px_2()
                     .child(self.navigation_button(
                         "navigate-back",
@@ -926,7 +926,7 @@ impl Render for AddressBar {
             .when_some(error, |bar, error| {
                 bar.child(
                     div()
-                        .h(px(23.0))
+                        .h(px(26.0))
                         .px_3()
                         .flex()
                         .items_center()

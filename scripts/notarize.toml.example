@@ -1,0 +1,7 @@
+# FlowFile 本地公证配置（可选）
+# 默认直接使用钥匙串中的 "flowfile-notary" profile，一般无需创建本文件。
+# 如需自定义 profile 名称或证书，可复制为 scripts/notarize.toml：
+#   cp scripts/notarize.toml.example scripts/notarize.toml
+
+profile = "flowfile-notary"
+# identity = "Developer ID Application: Your Name (TEAMID)"

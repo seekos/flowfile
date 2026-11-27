@@ -10,13 +10,20 @@ dist_dir=${project_dir}/dist
 icon_source=${resources_dir}/FlowFile.svg
 icon_output=${resources_dir}/FlowFile.icns
 version_file=${project_dir}/.flowfile-build-version
+
 icon_only=false
+skip_notarize=false
 version_override=""
+notary_profile="flowfile-notary"
+signing_identity=""
+identity_label=""
+notary_auth_args=()
 
 usage() {
-    print "Usage: ${script_name} [-v <version>] [--icon-only]"
-    print "  -v, --version <version>  Override the package version (for example: v0.1.2)"
-    print "                          Defaults to the last successful build version"
+    print "Usage: ${script_name} [-v <version>] [--skip-notarize] [--icon-only]"
+    print "  -v, --version <version>  Override package version (e.g. v0.1.2)"
+    print "      --skip-notarize      Build and sign locally without Apple notarization"
+    print "      --icon-only          Only regenerate resources/FlowFile.icns"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -29,6 +36,10 @@ while [[ $# -gt 0 ]]; do
             fi
             version_override="$2"
             shift 2
+            ;;
+        --skip-notarize)
+            skip_notarize=true
+            shift
             ;;
         --icon-only)
             icon_only=true
@@ -46,6 +57,50 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+read_toml_key() {
+    local file_path=$1
+    local key=$2
+    /usr/bin/awk -v k="${key}" '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ || /^[[:space:]]*\[/ { next }
+        {
+            sub(/[[:space:]]+#.*$/, "")
+            if (match($0, "^[[:space:]]*" k "[[:space:]]*=")) {
+                v = substr($0, RLENGTH + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                gsub(/^["'\'']|["'\'']$/, "", v)
+                print v
+            }
+        }
+    ' "${file_path}" | /usr/bin/tail -n 1
+}
+
+load_settings() {
+    local toml_path=""
+    if [[ -f "${script_dir}/notarize.toml" ]]; then
+        toml_path=${script_dir}/notarize.toml
+    elif [[ -f "${project_dir}/notarize.toml" ]]; then
+        toml_path=${project_dir}/notarize.toml
+    fi
+
+    if [[ -n "${toml_path}" ]]; then
+        local v=""
+        v=$(read_toml_key "${toml_path}" "profile")
+        if [[ -n "${v}" ]]; then notary_profile=${v}; fi
+        v=$(read_toml_key "${toml_path}" "identity")
+        if [[ -n "${v}" ]]; then signing_identity=${v}; fi
+    fi
+
+    if [[ -n "${FLOWFILE_NOTARY_PROFILE:-}" ]]; then
+        notary_profile=${FLOWFILE_NOTARY_PROFILE}
+    fi
+    if [[ -n "${FLOWFILE_CODESIGN_IDENTITY:-}" ]]; then
+        signing_identity=${FLOWFILE_CODESIGN_IDENTITY}
+    fi
+    if [[ "${FLOWFILE_SKIP_NOTARIZE:-0}" == "1" ]]; then
+        skip_notarize=true
+    fi
+}
+
 build_icon() {
     local work_dir
     work_dir=$(mktemp -d "${TMPDIR:-/tmp}/flowfile-icon.XXXXXX")
@@ -53,7 +108,7 @@ build_icon() {
     mkdir -p "${iconset}"
     /usr/bin/qlmanage -t -s 1024 -o "${work_dir}" "${icon_source}" >/dev/null 2>&1
     local rendered=${work_dir}/FlowFile.svg.png
-    if [[ -z "${rendered}" ]]; then
+    if [[ ! -f "${rendered}" ]]; then
         print -u2 "Quick Look could not render ${icon_source}."
         exit 1
     fi
@@ -77,43 +132,136 @@ build_icon() {
     /bin/rm -R "${work_dir}"
 }
 
-sign_app() {
-    local app_path=$1
-    local identity=${FLOWFILE_CODESIGN_IDENTITY:-}
-    local identity_label=${identity}
+resolve_identity() {
+    local all_ids=""
+    all_ids=$(/usr/bin/security find-identity -v -p codesigning 2>/dev/null || true)
 
-    if [[ -z "${identity}" ]]; then
-        local identity_line
-        identity_line=$(/usr/bin/security find-identity -v -p codesigning 2>/dev/null |
-            /usr/bin/grep -E -m 1 '"(Developer ID Application|Apple Development|Mac Developer):' || true)
-        if [[ -n "${identity_line}" ]]; then
-            identity=$(print -r -- "${identity_line}" |
-                /usr/bin/sed -E 's/^[[:space:]]*[0-9]+\)[[:space:]]+([0-9A-F]+).*/\1/')
-            identity_label=$(print -r -- "${identity_line}" |
-                /usr/bin/sed -E 's/.*"([^"]+)".*/\1/')
+    if [[ -n "${signing_identity}" ]]; then
+        local matched=""
+        matched=$(print -r -- "${all_ids}" | /usr/bin/grep -F -m 1 "${signing_identity}" || true)
+        if [[ -n "${matched}" ]]; then
+            signing_identity=$(print -r -- "${matched}" | /usr/bin/sed -E 's/^[[:space:]]*[0-9]+\)[[:space:]]+([0-9A-F]+).*/\1/')
+            identity_label=$(print -r -- "${matched}" | /usr/bin/sed -E 's/.*"([^"]+)".*/\1/')
+        else
+            identity_label=${signing_identity}
+        fi
+        return 0
+    fi
+
+    local pattern='"(Developer ID Application|Apple Development|Mac Developer):'
+    if [[ "${skip_notarize}" == false ]]; then
+        pattern='"Developer ID Application:'
+    fi
+
+    local line=""
+    line=$(print -r -- "${all_ids}" | /usr/bin/grep -E -m 1 "${pattern}" || true)
+    if [[ -n "${line}" ]]; then
+        signing_identity=$(print -r -- "${line}" | /usr/bin/sed -E 's/^[[:space:]]*[0-9]+\)[[:space:]]+([0-9A-F]+).*/\1/')
+        identity_label=$(print -r -- "${line}" | /usr/bin/sed -E 's/.*"([^"]+)".*/\1/')
+    fi
+}
+
+ensure_notary_ready() {
+    if [[ -z "${signing_identity}" || "${identity_label}" != Developer\ ID\ Application:* ]]; then
+        print -u2 "公证打包需要本机安装 'Developer ID Application' 证书。"
+        print -u2 "如仅做本地免公证测试，请运行: ./scripts/${script_name} --skip-notarize"
+        exit 1
+    fi
+
+    if ! xcrun --find notarytool >/dev/null 2>&1 || ! xcrun --find stapler >/dev/null 2>&1; then
+        print -u2 "公证需要完整 Xcode（含 notarytool 与 stapler）。"
+        exit 1
+    fi
+
+    if [[ -n "${APPLE_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
+        notary_auth_args=(--apple-id "${APPLE_ID}" --password "${APPLE_APP_SPECIFIC_PASSWORD}" --team-id "${APPLE_TEAM_ID}")
+        return 0
+    fi
+
+    local history_out=""
+    set +e
+    history_out=$(xcrun notarytool history --keychain-profile "${notary_profile}" 2>&1)
+    local history_rc=$?
+    set -e
+
+    if [[ ${history_rc} -ne 0 ]]; then
+        if print -r -- "${history_out}" | /usr/bin/grep -q "No Keychain password item found"; then
+            if [[ -t 0 ]]; then
+                print "首次公证需要将 Apple 公证凭据存入钥匙串（profile: ${notary_profile}）。"
+                local team_id=""
+                team_id=$(print -r -- "${identity_label}" | /usr/bin/sed -nE 's/.*\(([A-Z0-9]+)\).*/\1/p')
+                local -a store_args
+                store_args=("${notary_profile}")
+                if [[ -n "${team_id}" ]]; then
+                    store_args+=(--team-id "${team_id}")
+                fi
+                xcrun notarytool store-credentials "${store_args[@]}"
+            else
+                print -u2 "未找到公证钥匙串凭据 '${notary_profile}'。"
+                print -u2 "请先运行一次: xcrun notarytool store-credentials \"${notary_profile}\""
+                exit 1
+            fi
+        else
+            print -u2 "${history_out}"
+            exit 1
         fi
     fi
 
-    if [[ -n "${identity}" ]]; then
+    notary_auth_args=(--keychain-profile "${notary_profile}")
+}
+
+sign_app() {
+    local app_path=$1
+    /usr/bin/xattr -cr "${app_path}"
+
+    if [[ -n "${signing_identity}" ]]; then
         local -a sign_args
-        sign_args=(--force --deep --options runtime --sign "${identity}")
-        if [[ "${identity_label}" == Developer\ ID\ Application:* ||
-              "${FLOWFILE_CODESIGN_TIMESTAMP:-0}" == "1" ]]; then
+        sign_args=(--force --deep --options runtime --sign "${signing_identity}")
+        if [[ "${skip_notarize}" == false || "${identity_label}" == Developer\ ID\ Application:* ]]; then
             sign_args+=(--timestamp)
         fi
-        /usr/bin/codesign "${sign_args[@]}" "${app_path}" >/dev/null 2>&1
-        print "Signed FlowFile with stable identity: ${identity_label}"
+        /usr/bin/codesign "${sign_args[@]}" "${app_path}"
+        print "Signed FlowFile.app: ${identity_label}"
     else
-        if [[ "${FLOWFILE_REQUIRE_STABLE_SIGNING:-0}" == "1" ]]; then
-            print -u2 "No Apple code-signing identity is installed."
-            print -u2 "A stable identity is required so macOS can remember folder permissions."
-            exit 1
-        fi
         /usr/bin/codesign --force --deep --sign - "${app_path}" >/dev/null 2>&1
-        print "Signed FlowFile with an ad-hoc development signature."
+        print "Signed FlowFile.app with ad-hoc signature."
     fi
 
     /usr/bin/codesign --verify --deep --strict "${app_path}"
+}
+
+notarize_dmg() {
+    local dmg_path=$1
+    local app_path=$2
+
+    /usr/bin/codesign --force --timestamp --sign "${signing_identity}" "${dmg_path}"
+    /usr/bin/codesign --verify --strict "${dmg_path}"
+
+    local submit_log
+    submit_log=$(mktemp "${TMPDIR:-/tmp}/flowfile-notary.XXXXXX")
+    print "Submitting ${dmg_path:t} for Apple notarization..."
+    set +e
+    xcrun notarytool submit "${dmg_path}" "${notary_auth_args[@]}" --wait 2>&1 | tee "${submit_log}"
+    local rc=${pipestatus[1]}
+    set -e
+
+    local sub_id=""
+    sub_id=$(/usr/bin/awk '/^[[:space:]]*id:[[:space:]]+/ { print $2; exit }' "${submit_log}")
+    local status=""
+    status=$(/usr/bin/awk '/^[[:space:]]*status:[[:space:]]+/ { val=$2 } END { print val }' "${submit_log}")
+    /bin/rm -f "${submit_log}"
+
+    if [[ ${rc} -ne 0 || "${status}" != "Accepted" ]]; then
+        print -u2 "Notarization failed (status=${status:-unknown})."
+        if [[ -n "${sub_id}" ]]; then
+            xcrun notarytool log "${sub_id}" "${notary_auth_args[@]}" || true
+        fi
+        exit 1
+    fi
+
+    xcrun stapler staple "${dmg_path}"
+    xcrun stapler validate "${dmg_path}"
+    xcrun stapler staple "${app_path}" >/dev/null 2>&1 || true
 }
 
 cd "${project_dir}"
@@ -127,17 +275,24 @@ fi
 version=${version#v}
 if [[ ! "${version}" =~ '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$' ]]; then
     print -u2 "Invalid version: ${version_override:-${version}}"
-    print -u2 "Expected a semantic version such as v0.1.2 or 0.1.2."
     exit 1
 fi
+
 build_icon
 if [[ "${icon_only}" == true ]]; then
     print "Generated ${icon_output}"
     exit 0
 fi
 
+load_settings
+resolve_identity
+
 source "${script_dir}/macos_toolchain.sh"
 flowfile_configure_macos_toolchain
+
+if [[ "${skip_notarize}" == false ]]; then
+    ensure_notary_ready
+fi
 
 print "Packaging FlowFile v${version}"
 
@@ -152,14 +307,9 @@ else
     fi
     mkdir -p "${built_app_path}/Contents/MacOS" "${built_app_path}/Contents/Resources"
     cp "${project_dir}/target/release/flowfile" "${built_app_path}/Contents/MacOS/flowfile"
-    cp "${project_dir}/resources/FlowFile.icns" \
-        "${built_app_path}/Contents/Resources/FlowFile.icns"
+    cp "${project_dir}/resources/FlowFile.icns" "${built_app_path}/Contents/Resources/FlowFile.icns"
     cp "${project_dir}/resources/Info.plist" "${built_app_path}/Contents/Info.plist"
     chmod 755 "${built_app_path}/Contents/MacOS/flowfile"
-fi
-if [[ ! -d "${built_app_path}" ]]; then
-    print -u2 "Expected application bundle not found at ${built_app_path}"
-    exit 1
 fi
 
 mkdir -p "${dist_dir}"
@@ -168,10 +318,8 @@ if [[ -d "${app_path}" ]]; then
     /bin/rm -R "${app_path}"
 fi
 cp -R "${built_app_path}" "${app_path}"
-cp "${resources_dir}/PrivacyInfo.xcprivacy" \
-    "${app_path}/Contents/Resources/PrivacyInfo.xcprivacy"
-/usr/libexec/PlistBuddy -c \
-    "Set :CFBundleShortVersionString ${version}" "${app_path}/Contents/Info.plist"
+cp "${resources_dir}/PrivacyInfo.xcprivacy" "${app_path}/Contents/Resources/PrivacyInfo.xcprivacy"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${version}" "${app_path}/Contents/Info.plist"
 
 sign_app "${app_path}"
 
@@ -183,25 +331,19 @@ if [[ -e "${dmg_path}" ]]; then
     /bin/rm -f "${dmg_path}"
 fi
 if /usr/sbin/diskutil image create from --help >/dev/null 2>&1; then
-    /usr/sbin/diskutil image create from \
-        --format UDZO \
-        --volumeName "FlowFile" \
-        "${dmg_stage}" "${dmg_path}"
+    /usr/sbin/diskutil image create from --format UDZO --volumeName "FlowFile" "${dmg_stage}" "${dmg_path}"
 else
-    /usr/bin/hdiutil create -volname "FlowFile" -srcfolder "${dmg_stage}" \
-        -format UDZO "${dmg_path}"
+    /usr/bin/hdiutil create -volname "FlowFile" -srcfolder "${dmg_stage}" -format UDZO "${dmg_path}"
 fi
 /bin/rm -R "${dmg_stage}"
 
-if [[ -n "${FLOWFILE_NOTARY_PROFILE:-}" ]]; then
-    if ! xcrun --find notarytool >/dev/null 2>&1; then
-        print -u2 "Notarization requires a usable full Xcode installation."
-        print -u2 "Accept its license or set FLOWFILE_DEVELOPER_DIR to that Xcode developer directory."
-        exit 1
+if [[ "${skip_notarize}" == false ]]; then
+    notarize_dmg "${dmg_path}" "${app_path}"
+else
+    if [[ -n "${signing_identity}" ]]; then
+        /usr/bin/codesign --force --timestamp --sign "${signing_identity}" "${dmg_path}"
     fi
-    xcrun notarytool submit "${dmg_path}" \
-        --keychain-profile "${FLOWFILE_NOTARY_PROFILE}" --wait
-    xcrun stapler staple "${dmg_path}"
+    print "Skipped notarization (--skip-notarize)."
 fi
 
 print -r -- "${version}" > "${version_file}"

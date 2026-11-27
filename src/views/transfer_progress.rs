@@ -210,7 +210,7 @@ impl Render for TransferProgressWindow {
                     .child(
                         div()
                             .id("transfer-pause-resume")
-                            .h(px(32.0))
+                            .h(px(34.0))
                             .min_w(px(82.0))
                             .px_4()
                             .flex()
@@ -243,7 +243,7 @@ impl Render for TransferProgressWindow {
                     .child(
                         div()
                             .id("transfer-stop")
-                            .h(px(32.0))
+                            .h(px(34.0))
                             .min_w(px(82.0))
                             .px_4()
                             .flex()

@@ -3,12 +3,19 @@ use gpui::{Hsla, Pixels, WindowAppearance, px, rgb};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static DARK_MODE: AtomicBool = AtomicBool::new(false);
-const UI_TEXT_SCALE: f32 = 1.12;
+const UI_TEXT_SCALE: f32 = 1.30;
+const UI_ICON_SCALE: f32 = 1.20;
 
 /// Keeps the application typography on one coherent scale while matching
 /// native macOS desktop density across panes and sidebars.
 pub fn font(base_size: f32) -> Pixels {
     px(base_size * UI_TEXT_SCALE)
+}
+
+/// Scales monochrome UI icons together with the global typography scale so
+/// toolbar buttons, navigation controls, and sidebar badges stay balanced.
+pub fn icon_size(base_size: f32) -> Pixels {
+    px(base_size * UI_ICON_SCALE)
 }
 
 pub fn apply(preference: ThemePreference, system: WindowAppearance) {

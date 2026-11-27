@@ -2,6 +2,7 @@
 target/
 **/*.rs.bk
 rust-project.json
+app-store/
 
 # Build and packaged artifacts
 /build/
@@ -132,7 +133,7 @@ Timeline.xctimeline
 /temp/
 .lldb_history
 
-# Signing credentials
+# Signing credentials and local notarization config
 *.p12
 *.p8
 *.pfx
@@ -142,6 +143,8 @@ Timeline.xctimeline
 *.keystore
 *.mobileprovision
 *.provisionprofile
+notarize.toml
+scripts/notarize.toml
 
 # Local App Store working files (already tracked files remain tracked)
 /app-store/

@@ -356,7 +356,7 @@ impl SidebarView {
             .items_center()
             .gap_2()
             .mx_2()
-            .h(px(if has_detail { 38.0 } else { 30.0 }))
+            .h(px(if has_detail { 44.0 } else { 34.0 }))
             .px_2()
             .rounded(px(6.0))
             .text_size(theme::font(11.5))
@@ -433,7 +433,7 @@ impl SidebarView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .w(px(20.0))
+                    .w(px(22.0))
                     .child(icon(
                         location.icon,
                         15.0,
@@ -463,8 +463,8 @@ impl SidebarView {
                 item.child(
                     div()
                         .id(("sidebar-remove-favorite", id))
-                        .w(px(22.0))
-                        .h(px(22.0))
+                        .w(px(24.0))
+                        .h(px(24.0))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -485,8 +485,8 @@ impl SidebarView {
                 item.child(
                     div()
                         .id(("sidebar-eject", id))
-                        .w(px(22.0))
-                        .h(px(22.0))
+                        .w(px(24.0))
+                        .h(px(24.0))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -571,7 +571,7 @@ impl Render for SidebarView {
         div()
             .flex()
             .flex_col()
-            .w(px(205.0))
+            .w(px(225.0))
             .h_full()
             .flex_shrink_0()
             .border_r_1()

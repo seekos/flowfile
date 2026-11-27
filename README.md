@@ -21,7 +21,7 @@ FlowFile 是一款使用 Rust 和 [GPUI](https://crates.io/crates/gpui) 构建�
 - 使用 `tokio::fs` 异步读取真实目录和文件元数据。
 - 支持后退、前进、上级目录、刷新、面包屑跳转和可编辑路径栏。
 - 在地址栏输入 `smb://nas` 会直接在当前文件列表中显示服务器上的所有可访问共享文件夹，不弹出共享选择器；需要认证时使用应用内登录模态框，认证成功后继续显示共享列表。输入 `smb://nas/共享目录`、`//nas/共享目录` 或 `\\nas\共享目录` 则挂载并浏览指定共享。
-- SMB 地址不接受内嵌密码；验证成功的用户名和密码保存在 macOS 钥匙串中，后续连接会自动使用，只有凭证缺失或失效时才显示应用内登录模态框。密码不会写入进程命令行、地址历史或会话文件。
+- SMB 地址不接受内嵌密码；验证成功的用户名和密码仅在本次运行内复用，重启后首次连接会再次显示应用内登录模态框。密码不会写入磁盘、进程命令行、地址历史或会话文件。
 - SMB 共享按访达式网络卷处理：共享根目录的“上一级”返回 NAS 共享列表；同一 NAS 的多个共享在侧边栏合并为一个服务器入口，弹出服务器会一次断开其全部共享。
 - 路径输入与搜索输入支持 macOS 中文输入法组合文本。
 - 文件列表默认先按类型分组，同一类型内按名称排列；详细列表支持按名称、类型、大小和修改时间排序。
@@ -192,10 +192,18 @@ FLOWFILE_REQUIRE_STABLE_SIGNING=1 ./scripts/build.sh
 
 ## 构建与发布
 
-生成 Release 应用和 DMG：
+直接运行即可完成编译、Developer ID 签名、DMG 打包、Apple 公证与票据装订：
 
 ```bash
 ./scripts/build.sh
+```
+
+首次运行若钥匙串中尚未保存 `flowfile-notary` 公证凭据，脚本会在终端引导一次录入（也可通过 `FLOWFILE_NOTARY_PROFILE` 或 `scripts/notarize.toml` 指定其他 profile 名称）。
+
+仅本机快速打包、不提交 Apple 公证时，可传入 `--skip-notarize`：
+
+```bash
+./scripts/build.sh --skip-notarize
 ```
 
 可以通过 `-v`（或 `--version`）为本次构建指定版本号；开头的 `v` 可省略：
@@ -211,12 +219,6 @@ FLOWFILE_REQUIRE_STABLE_SIGNING=1 ./scripts/build.sh
 
 - `dist/FlowFile.app`
 - `dist/FlowFile-<version>.dmg`
-
-如已配置公证凭据，可在构建时提交 DMG：
-
-```bash
-FLOWFILE_NOTARY_PROFILE="notary-profile" ./scripts/build.sh
-```
 
 `cargo-bundle` 可选；缺失时构建脚本会使用离线方式组装 `.app`。应用 Bundle ID 为 `cc.bso.flowfile`。
 

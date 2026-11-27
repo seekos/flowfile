@@ -24,7 +24,7 @@ const DEFAULT_WINDOW_WIDTH: f32 = 1040.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 760.0;
 const MIN_WINDOW_WIDTH: f32 = 640.0;
 const MIN_WINDOW_HEIGHT: f32 = 420.0;
-const TOOLBAR_HEIGHT: f32 = 48.0;
+const TOOLBAR_HEIGHT: f32 = 52.0;
 const METADATA_WIDTH: f32 = 280.0;
 const VIEWPORT_PADDING: f32 = 32.0;
 const NAVIGATION_HOVER_WIDTH: f32 = 112.0;
@@ -764,6 +764,7 @@ impl Render for ImageViewerWindow {
                             .min_w_0()
                             .flex_1()
                             .truncate()
+                            .text_size(theme::font(11.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(file_name),
                     )
@@ -784,7 +785,7 @@ impl Render for ImageViewerWindow {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .size(px(28.0))
+                            .size(px(30.0))
                             .rounded_md()
                             .text_color(if can_show_previous {
                                 theme::text_primary()
@@ -807,7 +808,7 @@ impl Render for ImageViewerWindow {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .size(px(28.0))
+                            .size(px(30.0))
                             .rounded_md()
                             .text_color(if can_show_next {
                                 theme::text_primary()
@@ -837,7 +838,7 @@ impl Render for ImageViewerWindow {
                             .id("reset-viewer-image")
                             .flex()
                             .items_center()
-                            .h(px(28.0))
+                            .h(px(30.0))
                             .px_2()
                             .rounded_md()
                             .cursor_pointer()
@@ -855,7 +856,7 @@ impl Render for ImageViewerWindow {
                             .id("toggle-viewer-metadata")
                             .flex()
                             .items_center()
-                            .h(px(28.0))
+                            .h(px(30.0))
                             .px_2()
                             .ml_1()
                             .rounded_md()

@@ -9,8 +9,8 @@ use gpui::{
     Render, Size, Window, anchored, deferred, div, point, prelude::*, px,
 };
 
-const CONTEXT_MENU_WIDTH: Pixels = px(268.0);
-const OPEN_WITH_SUBMENU_WIDTH: Pixels = px(254.0);
+const CONTEXT_MENU_WIDTH: Pixels = px(288.0);
+const OPEN_WITH_SUBMENU_WIDTH: Pixels = px(272.0);
 const SUBMENU_GAP: Pixels = px(6.0);
 const WINDOW_MARGIN: Pixels = px(8.0);
 
@@ -416,7 +416,7 @@ impl ContextMenuView {
             .id(id)
             .flex()
             .items_center()
-            .h(px(33.0))
+            .h(px(36.0))
             .mx_1()
             .px_2()
             .rounded_sm()
@@ -438,7 +438,7 @@ impl ContextMenuView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .w(px(27.0))
+                    .w(px(28.0))
                     .mr_1()
                     .text_size(theme::font(12.0))
                     .child(icon),
@@ -482,7 +482,7 @@ impl ContextMenuView {
             .id("context-open-with")
             .flex()
             .items_center()
-            .h(px(33.0))
+            .h(px(36.0))
             .mx_1()
             .px_2()
             .rounded_sm()
@@ -507,7 +507,7 @@ impl ContextMenuView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .w(px(27.0))
+                    .w(px(28.0))
                     .mr_1()
                     .text_size(theme::font(12.0))
                     .child("▣"),
@@ -559,10 +559,11 @@ impl ContextMenuView {
                         .id(("open-with-application", index))
                         .flex()
                         .items_center()
-                        .h(px(33.0))
+                        .h(px(36.0))
                         .mx_1()
                         .px_2()
                         .rounded_sm()
+                        .text_size(theme::font(11.0))
                         .cursor_pointer()
                         .hover(|style| style.bg(theme::accent()).text_color(theme::surface()))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -573,7 +574,7 @@ impl ContextMenuView {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .size(px(22.0))
+                                .size(px(24.0))
                                 .mr_2()
                                 .rounded_sm()
                                 .border_1()
@@ -651,14 +652,14 @@ impl ContextMenuView {
             menu_x - SUBMENU_GAP - OPEN_WITH_SUBMENU_WIDTH
         };
 
-        point(submenu_x, menu_position.y + px(33.0))
+        point(submenu_x, menu_position.y + px(36.0))
     }
 
     fn submenu_message(message: &'static str) -> AnyElement {
         div()
             .flex()
             .items_center()
-            .h(px(36.0))
+            .h(px(38.0))
             .px_3()
             .text_size(theme::font(10.0))
             .text_color(theme::text_tertiary())
@@ -670,7 +671,7 @@ impl ContextMenuView {
         div()
             .flex()
             .items_center()
-            .h(px(24.0))
+            .h(px(26.0))
             .px_3()
             .text_size(theme::font(9.0))
             .font_weight(FontWeight::SEMIBOLD)
@@ -684,10 +685,11 @@ impl ContextMenuView {
             .id("open-with-custom-application")
             .flex()
             .items_center()
-            .h(px(33.0))
+            .h(px(36.0))
             .mx_1()
             .px_2()
             .rounded_sm()
+            .text_size(theme::font(11.0))
             .cursor_pointer()
             .hover(|style| style.bg(theme::accent()).text_color(theme::surface()))
             .on_click(cx.listener(|this, _, _, cx| {
@@ -698,7 +700,7 @@ impl ContextMenuView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(22.0))
+                    .size(px(24.0))
                     .mr_2()
                     .rounded_sm()
                     .border_1()
@@ -718,10 +720,11 @@ impl ContextMenuView {
             .id("open-as-text")
             .flex()
             .items_center()
-            .h(px(33.0))
+            .h(px(36.0))
             .mx_1()
             .px_2()
             .rounded_sm()
+            .text_size(theme::font(11.0))
             .cursor_pointer()
             .hover(|style| style.bg(theme::accent()).text_color(theme::surface()))
             .on_click(cx.listener(|this, _, _, cx| {
@@ -732,7 +735,7 @@ impl ContextMenuView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(22.0))
+                    .size(px(24.0))
                     .mr_2()
                     .rounded_sm()
                     .border_1()
